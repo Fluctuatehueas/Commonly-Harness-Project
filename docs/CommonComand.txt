@@ -1,0 +1,24 @@
+﻿Docker启动PostgreSQL服务：
+
+Image:
+ docker pull postgres:16
+Container:
+ docker run -d --name harness-postgres 
+ -e POSTGRES_USER=fluctuate_user
+ -e POSTGRES_PASSWORD=123456 
+ -e POSTGRES_DB=fluctuate_db 
+ -p 5432:5432 
+ -v harness_pgdata:/var/lib/postgresql/data 
+ postgres:16
+
+
+本地部署沙箱服务：
+    docker build -t myagent-sandbox:1 sandbox
+    docker run --rm myagent-sandbox:1 python -c "import yaml; print('sandbox ok')"
+
+进入容器
+docker exec -it <容器名或ID> bash
+
+FastMCP
+
+fastmcp inspect mcp_demo_server.py      查看FastMCP信息

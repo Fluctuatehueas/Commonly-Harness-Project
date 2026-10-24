@@ -1,0 +1,8 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "async_subagent": "./src/agent/subagents/async_entry.py:async_subagent_graph"
+  },
+  "env": ".env"
+}
