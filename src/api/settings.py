@@ -1,4 +1,4 @@
-﻿"""模型配置读写接口：支持 .env 热更新。
+"""模型配置读写接口：支持 .env 热更新。
 
 - GET  /settings/model  返回当前模型配置（API Key 只回传是否已设置，不回传值）
 - PUT  /settings/model  更新 .env（api_key 留空则保留原值），并热更新运行中的模型

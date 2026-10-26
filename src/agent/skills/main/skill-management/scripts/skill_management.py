@@ -1,4 +1,4 @@
-﻿"""
+"""
 供 skill-management 技能调用的本地下载、分配、查询和删除实现。
 """
 from __future__ import annotations

@@ -1,4 +1,4 @@
-﻿"""模型与 PostgreSQL 异步持久化的集中配置。"""
+"""模型与 PostgreSQL 异步持久化的集中配置。"""
 
 # ============================================================
 # 模型配置
@@ -22,6 +22,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]  # resolve：转换为绝对�
 # override=False 表示外部环境变量优先于 .env 文件，便于容器/CI 注入配置；
 # 本地开发时 .env 仍会补齐缺失项。
 load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+# 前端上传的上下文附件（图片/文档/文本）落盘位置。
+# 目录布局：<CONTEXT_ROOT>/<user_id>/<file_id>/<原始文件名>
+CONTEXT_ROOT = Path(
+    os.getenv("HARNESS_CONTEXT_DIR") or PROJECT_ROOT / ".harness" / "context"
+).resolve()
 
 
 # ============================================================

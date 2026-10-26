@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 工具/技能/委派 调用卡片
 import { computed, ref, watch } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'

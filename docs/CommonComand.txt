@@ -1,4 +1,4 @@
-﻿Docker启动PostgreSQL服务：
+Docker启动PostgreSQL服务：
 
 Image:
  docker pull postgres:16

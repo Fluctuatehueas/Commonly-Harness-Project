@@ -1,4 +1,4 @@
-﻿"""
+"""
 将 skill-management 技能脚本注册为主 Agent 可调用工具。
 这段代码是一个技能脚本的动态加载与工具注册层。
 它的核心目的是：把存放在 skills/main/skill-management/scripts/skill_management.py 

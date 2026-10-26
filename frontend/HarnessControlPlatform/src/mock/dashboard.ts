@@ -1,4 +1,4 @@
-﻿// 控制台首页 mock 数据（接入后端后可替换为 API 请求）
+// 控制台首页 mock 数据（接入后端后可替换为 API 请求）
 import type { IconName } from '@/components/console/icons'
 
 export interface NavItem {

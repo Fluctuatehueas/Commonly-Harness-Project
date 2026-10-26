@@ -1,4 +1,4 @@
-﻿"""集中定义可由 Agent Protocol 托管的异步子 Agent。
+"""集中定义可由 Agent Protocol 托管的异步子 Agent。
 
 接入方只需要：
 1. 在本文件用 ``register_async_subagent`` 注册一个或多个异步子 Agent；

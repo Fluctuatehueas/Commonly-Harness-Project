@@ -6,6 +6,58 @@
 
 ---
 
+## 快速使用
+首先你需要配置.env,参考.env.example，删除.example后缀，然后填写配置文件
+如下的是建议必填的
+```text
+DEEPSEEK_API_KEY= 
+DEEPSEEK_BASE_URL= 
+DEEPSEEK_MODEL_NAME=
+
+# LangGraph PostgreSQL 持久化
+DB_HOST=  # linux 虚拟机IP
+DB_PORT=5432
+DB_NAME= 
+DB_USER= 
+DB_PASSWORD=123456
+DB_SSLMODE=disable
+```
+
+**.env详细参数解释，见[第三章节](#三环境变量)**
+
+你需要启动如下服务
+
+1. Harness Agent FastAPI后端服务  
+  在当前根目录下执行
+```bash
+python main.py 
+```
+会启动FastAPI服务，端口号8000
+
+2. 启动VUE前端项目
+  在当前项目目录/frontend/HarnessControlPlatform下执行
+```bash
+npm run dev
+```
+如缺少相关依赖，使用npm install等命令安装依赖
+
+3. 在Docker，下，拉去PostgreSQL镜像并启动容器，下面给的在Linux操作系统下执行的。本项目也是在Linux操作系统提供PostgreSQL服务。
+```bash
+// 1. 先拉取镜像
+docker pull postgres:16
+
+// 2. 启动容器，注意环境变量名字要和.env相同，默认端口号5432，可自定义
+docker run -d --name harness-postgres 
+ -e POSTGRES_USER=fluctuate_user
+ -e POSTGRES_PASSWORD=123456 
+ -e POSTGRES_DB=fluctuate_db 
+ -p 5432:5432 
+ -v harness_pgdata:/var/lib/postgresql/data 
+ postgres:16
+
+```
+---
+
 ## 一、 项目文件结构
 
 |目录|作用|
@@ -635,6 +687,13 @@ Agent的文件系统工具调用后端，后端再根据配置将操作路由到
 
 #### 1. 同步子 Agent（跟随主图当前 run）
 
+仓库内置两个可直接参考的同步子 Agent，已在 `SYNC_SUBAGENT_CONFIG_FILES` 注册：
+
+| 配置 | 作用 | 工具 |
+|:--|:--|:--|
+| `document_reader.yaml` | 只读解析 Word，支持 meta / structure / summary / text / range | `read_word_document` |
+| `intent_parsing.yaml` | 自然语言 → 结构化意图 JSON（纯提示词，无业务工具）；已禁用全部写操作 | 无 |
+
 **第一步**：在 `src/agent/subagents/configs/` 新建 YAML。
 
 ```yaml
@@ -681,6 +740,14 @@ SYNC_SUBAGENTS: list[dict[str, Any]] = [
 - YAML 中 `tools` 写的是工具对象的 `.name`。缺一个就会在构图时抛 `ValueError`，不会静默降级。
 - 子 Agent 与主 Agent 共享沙箱和会话状态，适合短任务。
 - YAML 里写 `mcp_servers: [server_name]` 时，必须通过 `SYNC_SUBAGENT_CONFIG_FILES`（内部调用 `aload_subagent`）加载，否则 MCP 工具不会被注入。
+- `permissions` 用来限制子 Agent 能读写哪些虚拟路径。YAML 是普通字典，`main_agent.py` 里的 `_coerce_permissions` 会转换成 DeepAgents 需要的 `FilesystemPermission`；仓库内置的两个子 Agent 都是只读：
+
+```yaml
+permissions:
+  - operations: ["write"]
+    paths: ["/**"]
+    mode: deny
+```
 
 #### 2. 异步子 Agent（独立 thread / run / 状态）
 
@@ -1190,3 +1257,122 @@ curl.exe -N -X POST http://127.0.0.1:8000/chat/stream `
 ```
 
 更完整的端到端接入流程与踩坑清单见 [接入全流程示例与避坑指南](./docs/接入全流程示例与避坑指南.md)。
+
+---
+
+### 五、手动新增工具与技能（word-reader 示例）
+
+仓库自带一个可以直接照抄的完整示例：读取用户上传的 Word 文档。
+
+**1. 工具：写一个 `@tool` 函数**
+
+文件：[src/agent/tools/document_tools.py](./src/agent/tools/document_tools.py)
+
+```python
+from langchain_core.tools import tool
+
+@tool
+async def read_word_document(
+    path: str,
+    mode: str = "summary",
+    max_chars: int = 4000,
+    from_paragraph: int | None = None,
+    to_paragraph: int | None = None,
+) -> str:
+    """读取用户上传的 Word (.docx) 文档，返回 JSON 字符串。
+
+    mode: meta / structure / summary / text / range
+    """
+    ...
+```
+
+然后到 [main_agent.py](./src/agent/main_agent.py) 的 `main_tools` 里注册：
+
+```python
+from agent.tools.document_tools import read_word_document
+
+main_tools = [
+    *mcp_tools,
+    read_word_document,   # 工具对象直接进列表即可
+    ...
+]
+```
+
+规则：
+
+- 函数名就是模型看到的工具名；docstring 是工具说明，会进入提示词。
+- 参数只用简单类型（str / int / bool），复杂结构用 Pydantic 模型。
+- 工具内不要抛裸异常：返回一段可读文本，模型能自行纠正（示例里越界访问就是这么处理的）。
+- 同一 Agent 内工具名不能重复，构图时会做重复校验。
+
+**2. 技能：在 `src/agent/skills/main/` 下建目录**
+
+```text
+src/agent/skills/main/word-reader/
+├── SKILL.md          # frontmatter: name + description
+├── metadata.json     # 与 frontmatter 完全一致，供技能管理工具校验
+└── scripts/
+    └── read_docx.py  # 沙箱内用 `python3 -I` 执行，只依赖标准库
+```
+
+要点：
+
+- `description` 一句话写清"什么时候用"，这是渐进式披露的第一层；正文再写步骤和边界。
+- `metadata.json` 的 `name`、`description` 必须与 `SKILL.md` frontmatter 一字不差，否则 `assign_skill` 会拒绝。
+- 无沙箱模式：`main_agent` 把 `src/agent/skills` 以**只读**方式挂到 `/skills/`，技能照常加载，但 Agent 不能改写宿主上的 SKILL.md。
+- 有沙箱模式：`SandboxSkillsMiddleware` 在每轮开始前把宿主技能增量同步到沙箱，Agent 只读沙箱副本。
+
+**3. 验证**
+
+```powershell
+# 直接调用工具
+.\.venv\Scripts\python.exe -c "import asyncio,sys; sys.path.insert(0,'src'); from agent.tools.document_tools import read_word_document; print(asyncio.run(read_word_document.ainvoke({'path': r'C:\path\a.docx'})))"
+
+# 技能脚本（模拟沙箱隔离执行）
+.\.venv\Scripts\python.exe -I src\agent\skills\main\word-reader\scripts\read_docx.py C:\path\a.docx --json
+```
+
+### 六、上下文附件上传（图片 / Word / PDF / 文本）
+
+聊天输入框左侧的回形针按钮用于上传上下文文件，发送时随消息一起交给模型。
+按钮是一个来源下拉框，支持三种入口：
+
+| 入口 | 行为 |
+|:--|:--|
+| 文件 | 只显示文档 / 文本类扩展名 |
+| 图片 | 只显示图片扩展名，发送时作为多模态 `image_url` 块 |
+| 网络链接 | 输入公网 URL，后端抓取正文并按 Content-Type 推断扩展名后落盘 |
+
+网络链接只允许 http/https 公网地址，每一跳重定向都会重新校验，拒绝内网与本机地址。
+
+**支持的格式配置在哪里**
+
+唯一配置源：[src/api/context.py](./src/api/context.py) 里的 `SUPPORTED_FORMATS`。
+加一行扩展名即可生效，前端通过 `GET /context/formats` 自动同步文件选择框，**不需要改前端代码**。
+
+| 类型 | 扩展名 | 注入方式 |
+|:--|:--|:--|
+| 图片 | png / jpg / jpeg / webp / gif | 多模态 `image_url` 数据块 |
+| 文档 | docx / pdf | 服务端抽取文本。docx 只注入 4000 字预览，完整内容交给 `read_word_document` |
+| 文本 | txt / md / csv / json / yaml / yml / log / xml / html / py / js / ts / java / sql / ini / toml | 直接内联为文本块 |
+
+**限制（环境变量可调）**
+
+| 变量 | 默认 | 说明 |
+|:--|:--|:--|
+| `HARNESS_CONTEXT_MAX_MB` | 20 | 单文件大小上限 |
+| `HARNESS_CONTEXT_MAX_FILES` | 6 | 单条消息附件数上限 |
+| `HARNESS_CONTEXT_MAX_CHARS` | 30000 | 单个文本 / PDF 注入字符上限 |
+| `HARNESS_CONTEXT_DIR` | `<项目>/.harness/context` | 宿主落盘目录 |
+
+**接口**
+
+| 方法 | 路径 | 说明 |
+|:--|:--|:--|
+| GET | `/context/formats` | 返回 accept 串、数量与大小限制 |
+| POST | `/context/upload` | `multipart/form-data`，字段 `file`，查询参数 `user_id` |
+| POST | `/context/url` | JSON `{"url": "https://...", "user_id": "..."}`，抓取公网链接为附件 |
+| DELETE | `/context/{file_id}` | 删除尚未发送的暂存文件 |
+| POST | `/chat`、`/chat/stream` | 请求体新增 `attachments: ["<file_id>"]` |
+
+文件保存在 `<项目>/.harness/context/<user_id>/<file_id>/`，不会自动清理，可定期删除。

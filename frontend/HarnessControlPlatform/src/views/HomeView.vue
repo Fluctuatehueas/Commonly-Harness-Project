@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 总览仪表盘：左主栏 + 右信息栏
 import TopNav from '@/components/console/TopNav.vue'
 import HeroBanner from '@/components/console/HeroBanner.vue'

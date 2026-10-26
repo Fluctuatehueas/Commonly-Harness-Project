@@ -1,4 +1,4 @@
-﻿import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory } from 'vue-router'
 
 import ChatView from '@/views/ChatView.vue'
 import ChatControlView from '@/views/ChatControlView.vue'

@@ -1,4 +1,4 @@
-﻿"""从 FastMCP / 标准 MCP Server 加载 LangChain 工具。
+"""从 FastMCP / 标准 MCP Server 加载 LangChain 工具。
 
 配置文件默认位于项目根目录 ``mcp_servers.yaml``，也可用
 ``HARNESS_MCP_CONFIG_PATH`` 指定。支持两种常用传输：

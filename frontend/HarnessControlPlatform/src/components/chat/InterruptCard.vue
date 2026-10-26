@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // HITL 人工介入卡片：动画浮现；支持补充信息与工具审批两类中断
 import { computed, ref } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'

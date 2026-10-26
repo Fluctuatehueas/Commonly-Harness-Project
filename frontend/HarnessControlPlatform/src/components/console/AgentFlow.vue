@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 智能体协作流程图
 import AppIcon from './AppIcon.vue'
 import { FLOW_KNOWLEDGE, FLOW_MAIN } from '@/mock/dashboard'

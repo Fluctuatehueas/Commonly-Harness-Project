@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 最新活动列表
 import AppIcon from './AppIcon.vue'
 import { ACTIVITIES } from '@/mock/dashboard'

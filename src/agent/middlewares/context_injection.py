@@ -1,4 +1,4 @@
-﻿"""将运行时用户身份注入主 Agent 的系统提示词。"""
+"""将运行时用户身份注入主 Agent 的系统提示词。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 模型管理：选卡片 → 回填参数（含思考能力）→ 保存才写 .env 并热更新
 import { onMounted } from 'vue'
 import TopNav from '@/components/console/TopNav.vue'

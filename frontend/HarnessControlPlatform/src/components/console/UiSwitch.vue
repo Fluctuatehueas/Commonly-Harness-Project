@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 开关控件
 const props = defineProps<{ modelValue: boolean; disabled?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [boolean] }>()

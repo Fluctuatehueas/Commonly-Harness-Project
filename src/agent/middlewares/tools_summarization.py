@@ -1,4 +1,4 @@
-﻿"""
+"""
 一个Demo中间件，使用DeepAgent框架。
 该中间件负责统计罗列Agent的tool
 """

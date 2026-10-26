@@ -1,4 +1,4 @@
-﻿"""Harness Agent API 启动入口。
+"""Harness Agent API 启动入口。
 
 用法：
     .\\.venv\\Scripts\\python.exe main.py
@@ -37,7 +37,7 @@ def main() -> None:
     port = int(os.getenv("HARNESS_API_PORT", "8000"))
     # loop="none" 表示沿用上面已设置的 Selector 事件循环策略。
     uvicorn.run(app, host=host, port=port, loop="none")
-
+    
 
 if __name__ == "__main__":
     main()

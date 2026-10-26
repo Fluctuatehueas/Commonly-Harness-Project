@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 会话栏：从后端读取会话列表，切换/新建/删除，运行中与等待介入动画
 import AppIcon from '@/components/console/AppIcon.vue'
 import { useSessionStore } from '@/stores/sessions'

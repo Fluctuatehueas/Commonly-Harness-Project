@@ -1,7 +1,8 @@
-﻿// 对话测试：SSE 流式状态机 + 演示模式
+// 对话测试：SSE 流式状态机 + 演示模式
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { API_BASE } from '@/api/client'
+import type { ContextFile } from '@/api/context'
 
 export type ToolCategory = 'tool' | 'skill' | 'delegation'
 
@@ -9,6 +10,7 @@ export interface ChatMsg {
   id: string
   kind: 'user' | 'assistant' | 'tool' | 'interrupt' | 'system'
   content?: string
+  attachments?: ContextFile[]
   streaming?: boolean
   toolCallId?: string
   toolName?: string
@@ -207,21 +209,24 @@ export const useChatStore = defineStore('chat', () => {
     return error.message
   }
 
-  function send(text: string) {
+  function send(text: string, attachments: ContextFile[] = []) {
     const trimmed = text.trim()
-    if (!trimmed || sending.value) return
-    push({ id: uid('u'), kind: 'user', content: trimmed })
+    if ((!trimmed && attachments.length === 0) || sending.value) return
+    // 只有附件没有文字时给模型一个明确的默认指令，后端要求 message 非空。
+    const message = trimmed || '请阅读我上传的附件，并简要说明内容。'
+    push({ id: uid('u'), kind: 'user', content: trimmed, attachments })
     sending.value = true
     thinking.value = true
     if (demoMode.value) {
-      void runDemo(trimmed)
+      void runDemo(message)
       return
     }
     void streamPost('/chat/stream', {
-      message: trimmed,
+      message,
       thread_id: threadId.value,
       user_id: 'console_user',
       username: '控制台用户',
+      attachments: attachments.map((item) => item.id),
     }).catch((error: Error) => {
       handleEvent({ type: 'error', message: friendlyError(error) })
     })

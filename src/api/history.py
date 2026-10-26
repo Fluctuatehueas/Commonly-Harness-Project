@@ -1,4 +1,4 @@
-﻿"""会话历史 HTTP 接口。
+"""会话历史 HTTP 接口。
 
 会话正文始终从 LangGraph 的 PostgreSQL checkpoint 恢复；
 会话索引保存在 PostgreSQL Store 的 ``("sessions", user_id)`` 命名空间。
@@ -29,6 +29,19 @@ from api.message_utils import content_to_text, serialize_interrupt
 
 router = APIRouter(prefix="/history", tags=["history"])
 DEFAULT_SESSION_TITLE = "新会话"
+
+
+def _user_display_content(content: Any) -> str:
+    """用户消息只回显原始文本，不把注入的附件正文带进历史列表。
+
+    有附件时 checkpoint 里存的是多模态块列表：第 1 块是用户原话，
+    后续块是服务端注入的文档文本和元信息。
+    """
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text", ""))
+    return content_to_text(content)
 
 
 def _message_value(message: Any, name: str, default: Any = None) -> Any:
@@ -92,7 +105,12 @@ def serialize_messages(messages: list[Any]) -> list[Message]:
     for index, message in enumerate(messages):
         role = _message_role(message)
         message_content = _message_value(message, "content", "")
-        content = content_to_text(message_content)
+        # 用户消息带附件时，只回显原话，避免把注入的文档正文带进历史列表。
+        content = (
+            _user_display_content(message_content)
+            if role == "user"
+            else content_to_text(message_content)
+        )
         if role == "assistant":
             # AIMessage 可同时携带文本和工具调用，必须先保留文本的原始顺序。
             additional_kwargs = _message_value(message, "additional_kwargs", {}) or {}

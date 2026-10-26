@@ -1,4 +1,4 @@
-﻿"""为 Agent Protocol Server 构造已注册的异步子 Agent 图。
+"""为 Agent Protocol Server 构造已注册的异步子 Agent 图。
 
 一个 Agent Protocol 图入口（``async_subagent``）承载全部已注册子 Agent：
 调用方通过 ``context["subagent_name"]`` 指定具体子 Agent，并通过

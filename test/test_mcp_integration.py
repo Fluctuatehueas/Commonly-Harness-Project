@@ -1,4 +1,4 @@
-﻿"""MCP Client 冒烟测试：stdio 与 Streamable HTTP。
+"""MCP Client 冒烟测试：stdio 与 Streamable HTTP。
 
 直接运行：
     .\\.venv\\Scripts\\python.exe test\\test_mcp_integration.py

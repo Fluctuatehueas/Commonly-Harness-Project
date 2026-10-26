@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 系统状态卡片：GPU / 内存环形指标 + 状态行
 import AppIcon from './AppIcon.vue'
 import type { IconName } from './icons'

@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 文件面板：列出当前会话生成的文件，支持预览编辑与下载
 import { ref, watch } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'

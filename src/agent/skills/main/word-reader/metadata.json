@@ -1,0 +1,4 @@
+{
+  "name": "word-reader",
+  "description": "读取、概括和提取用户上传的 Word (.docx) 文档内容，包括标题、正文段落与表格。"
+}

@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 顶部主视觉横幅
 import bg from '@/assets/BG.png'
 </script>

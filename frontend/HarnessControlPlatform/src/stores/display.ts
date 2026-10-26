@@ -1,4 +1,4 @@
-﻿// 对话控制：消息类型可见性设置（持久化到 localStorage）
+// 对话控制：消息类型可见性设置（持久化到 localStorage）
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
 

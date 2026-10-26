@@ -1,4 +1,4 @@
-﻿"""在主 Agent 完成一轮对话后，自动维护用户长期偏好和近期查询。"""
+"""在主 Agent 完成一轮对话后，自动维护用户长期偏好和近期查询。"""
 
 from __future__ import annotations
 

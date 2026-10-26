@@ -1,4 +1,4 @@
-﻿"""需要人工补充上下文时使用的 Human-in-the-Loop 工具。"""
+"""需要人工补充上下文时使用的 Human-in-the-Loop 工具。"""
 from __future__ import annotations
 
 import json

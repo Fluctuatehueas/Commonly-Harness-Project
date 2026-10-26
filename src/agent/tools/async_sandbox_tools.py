@@ -1,4 +1,4 @@
-﻿"""使用调用方共享的沙箱引用启动 Agent Protocol 异步任务。"""
+"""使用调用方共享的沙箱引用启动 Agent Protocol 异步任务。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-﻿// 线程文件：列表 / 读取 / 保存（预览与下载用）
+// 线程文件：列表 / 读取 / 保存（预览与下载用）
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { API_BASE } from '@/api/client'

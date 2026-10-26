@@ -1,4 +1,4 @@
-﻿"""
+"""
 按用户持久化管理 OpenSandbox 的生命周期。
 SandboxManager 是按用户持久化管理 OpenSandbox 生命周期的调度器：
 1. 它用 LangGraph Store 持久化每个用户的 sandbox_id，用进程内 _proxies 缓存稳定代理、

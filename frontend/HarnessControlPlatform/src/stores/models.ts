@@ -1,4 +1,4 @@
-﻿// 模型管理：目录数据 + .env 配置读写（保存才落盘）
+// 模型管理：目录数据 + .env 配置读写（保存才落盘）
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import { API_BASE } from '@/api/client'

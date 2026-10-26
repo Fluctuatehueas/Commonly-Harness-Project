@@ -1,4 +1,4 @@
-﻿"""SubAgent YAML 配置目录。
+"""SubAgent YAML 配置目录。
 
 在 ``configs/`` 下新增 ``<name>.yaml``，再在 ``async_registry.py`` 注册即可。
 配置的必填字段：name、description、system_prompt、tools。

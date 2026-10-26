@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 底部探索横幅
 import { useRouter } from 'vue-router'
 import AppIcon from './AppIcon.vue'

@@ -1,4 +1,4 @@
-﻿"""FastMCP 服务端的监听配置。"""
+"""FastMCP 服务端的监听配置。"""
 
 import os
 

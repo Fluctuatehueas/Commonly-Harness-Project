@@ -18,6 +18,11 @@ fastapi==0.141.1
 fastmcp==3.2.4
 httpx==0.28.1
 uvicorn==0.53.0
+python-multipart==0.0.32  # /context/upload 表单上传
+
+# 文档解析（上下文附件与 word-reader 技能）
+python-docx==1.2.0
+pypdf==6.21.2
 
 # 数据库、配置和模型
 opensandbox==0.1.16

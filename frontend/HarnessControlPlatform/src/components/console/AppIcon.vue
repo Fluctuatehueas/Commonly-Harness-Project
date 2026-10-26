@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 统一线性图标
 import { ICONS, type IconName } from './icons'
 

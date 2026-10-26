@@ -1,4 +1,4 @@
-﻿# 本地密钥和环境配置
+# 本地密钥和环境配置
 .env
 .env.*
 !.env.example
@@ -34,6 +34,7 @@ yarn-error.log*
 
 # 应用运行状态、临时文件和日志
 runtime/
+.harness/
 .langgraph_api/
 *.log
 *.sqlite

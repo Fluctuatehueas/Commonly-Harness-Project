@@ -1,4 +1,4 @@
-﻿// 会话列表：从后端 Store（/history）读取，支持切换与运行中标识
+// 会话列表：从后端 Store（/history）读取，支持切换与运行中标识
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { API_BASE } from '@/api/client'

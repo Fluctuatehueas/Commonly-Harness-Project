@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 模型概览卡片
 import AppIcon from './AppIcon.vue'
 import { MODELS } from '@/mock/dashboard'

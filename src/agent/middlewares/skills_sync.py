@@ -1,4 +1,4 @@
-﻿"""在 DeepAgents 读取技能元数据前完成沙箱技能同步。"""
+"""在 DeepAgents 读取技能元数据前完成沙箱技能同步。"""
 
 from __future__ import annotations
 

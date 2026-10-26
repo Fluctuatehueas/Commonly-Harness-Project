@@ -1,4 +1,4 @@
-﻿"""Harness 自定义中间件。"""
+"""Harness 自定义中间件。"""
 
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware

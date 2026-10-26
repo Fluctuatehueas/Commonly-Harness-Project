@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 快捷入口九宫格
 import { useRouter } from 'vue-router'
 import AppIcon from './AppIcon.vue'

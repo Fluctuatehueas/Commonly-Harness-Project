@@ -1,4 +1,4 @@
-﻿"""构造 Agent 共用的上下文压缩和调用次数保护中间件。"""
+"""构造 Agent 共用的上下文压缩和调用次数保护中间件。"""
 
 from __future__ import annotations
 

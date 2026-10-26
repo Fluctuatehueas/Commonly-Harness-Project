@@ -1,4 +1,4 @@
-﻿"""通用的同步子 Agent 配置加载器。
+"""通用的同步子 Agent 配置加载器。
 
 ``load_subagent`` 用于已经拿到全部工具的同步场景；
 ``aload_subagent`` 额外读取 YAML 中的 ``mcp_servers`` 并加载 MCP 工具，

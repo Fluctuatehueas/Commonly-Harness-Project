@@ -1,1 +1,1 @@
-﻿"""Harness Agent 内核。"""
+"""Harness Agent 内核。"""

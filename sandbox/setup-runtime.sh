@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # 以 root 身份安装到 Debian Python sandbox。必须由操作人员明确选择已有的
 # sandbox ID；此脚本不会替换已有 sandbox。
 # 可选的第一个参数：包含已验证 Debian 软件包和 wheel 的目录。

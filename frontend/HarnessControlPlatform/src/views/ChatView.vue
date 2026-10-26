@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 首页：对话测试（顶栏菜单 + 左侧会话栏 + SSE 流式 + 文件预览）
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import TopNav from '@/components/console/TopNav.vue'
@@ -8,7 +8,16 @@ import ToolCallCard from '@/components/chat/ToolCallCard.vue'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
+import MarkdownView from '@/components/chat/MarkdownView.vue'
 import { API_BASE } from '@/api/client'
+import {
+  deleteContextFile,
+  fetchContextFormats,
+  importContextUrl,
+  uploadContextFile,
+  type ContextFile,
+  type ContextFormats,
+} from '@/api/context'
 import { categoryOf, useChatStore, type ChatMsg } from '@/stores/chat'
 import { USER_ID, useSessionStore } from '@/stores/sessions'
 import { useDisplayStore } from '@/stores/display'
@@ -23,6 +32,25 @@ const showFiles = ref(false)
 const fileRefreshKey = ref(0)
 // null=检测中 true=在线 false=离线（离线时保持演示模式）
 const backendOnline = ref<boolean | null>(null)
+
+// ---------- 上下文附件 ----------
+const formats = ref<ContextFormats>({
+  accept: '',
+  max_files: 6,
+  max_file_mb: 20,
+  groups: {},
+})
+const pendingFiles = ref<ContextFile[]>([])
+const previews = ref<Record<string, string>>({})
+const uploading = ref(false)
+const uploadError = ref('')
+const fileInput = ref<HTMLInputElement | null>(null)
+// 附件来源下拉：文件 / 图片 / 网络链接
+const attachMenu = ref(false)
+const fileAccept = ref('')
+const urlMode = ref(false)
+const urlDraft = ref('')
+const urlLoading = ref(false)
 
 const SUGGESTIONS = [
   '介绍一下 Harness 架构的六层设计',
@@ -41,8 +69,122 @@ onMounted(async () => {
   if (backendOnline.value) {
     chat.demoMode = false
     void sessions.refresh()
+    formats.value = await fetchContextFormats()
   }
 })
+
+// ---------- 上传交互 ----------
+// 下拉里的三种来源分别对应不同的 accept，避免选择框里出现无关文件
+function attachAccept(source: 'file' | 'image'): string {
+  const groups = formats.value.groups || {}
+  if (source === 'image') {
+    return (groups.image || []).join(',') || '.png,.jpg,.jpeg,.webp,.gif'
+  }
+  const exts = [...(groups.document || []), ...(groups.text || [])]
+  return exts.join(',') || formats.value.accept
+}
+
+async function pickAttach(source: 'file' | 'image') {
+  if (uploading.value || chat.sending) return
+  attachMenu.value = false
+  fileAccept.value = attachAccept(source)
+  // 浏览器要求点击必须发生在用户手势里，等 input 的 accept 更新后再触发
+  await nextTick()
+  fileInput.value?.click()
+}
+
+function openUrlMode() {
+  attachMenu.value = false
+  uploadError.value = ''
+  urlMode.value = true
+}
+
+async function submitUrl() {
+  const url = urlDraft.value.trim()
+  if (!url || urlLoading.value) return
+  if (!/^https?:\/\//i.test(url)) {
+    uploadError.value = '链接需要以 http:// 或 https:// 开头'
+    return
+  }
+  if (pendingFiles.value.length >= formats.value.max_files) {
+    uploadError.value = `一次最多上传 ${formats.value.max_files} 个文件`
+    return
+  }
+  uploadError.value = ''
+  urlLoading.value = true
+  try {
+    const record = await importContextUrl(url, USER_ID)
+    pendingFiles.value.push(record)
+    urlDraft.value = ''
+    urlMode.value = false
+  } catch (error) {
+    uploadError.value = (error as Error).message
+  } finally {
+    urlLoading.value = false
+  }
+}
+
+function clearPending() {
+  for (const file of pendingFiles.value) {
+    const url = previews.value[file.id]
+    if (url) URL.revokeObjectURL(url)
+    void deleteContextFile(file.id, USER_ID)
+  }
+  pendingFiles.value = []
+  previews.value = {}
+  uploadError.value = ''
+}
+
+async function onFilesPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  input.value = ''
+  uploadError.value = ''
+  if (files.length === 0) return
+
+  const limit = formats.value.max_file_mb * 1024 * 1024
+  const allowed = formats.value.accept
+    ? formats.value.accept.split(',').map((item) => item.trim()).filter(Boolean)
+    : []
+
+  for (const file of files) {
+    if (pendingFiles.value.length >= formats.value.max_files) {
+      uploadError.value = `一次最多上传 ${formats.value.max_files} 个文件`
+      break
+    }
+    if (file.size > limit) {
+      uploadError.value = `${file.name} 超过 ${formats.value.max_file_mb} MB`
+      continue
+    }
+    const ext = `.${(file.name.split('.').pop() || '').toLowerCase()}`
+    if (allowed.length && !allowed.includes(ext)) {
+      uploadError.value = `不支持的文件类型 ${ext}`
+      continue
+    }
+    uploading.value = true
+    try {
+      const record = await uploadContextFile(file, USER_ID)
+      pendingFiles.value.push(record)
+      if (record.kind === 'image') {
+        previews.value[record.id] = URL.createObjectURL(file)
+      }
+    } catch (error) {
+      uploadError.value = (error as Error).message
+    } finally {
+      uploading.value = false
+    }
+  }
+}
+
+async function removePending(id: string) {
+  pendingFiles.value = pendingFiles.value.filter((file) => file.id !== id)
+  const url = previews.value[id]
+  if (url) {
+    URL.revokeObjectURL(url)
+    delete previews.value[id]
+  }
+  await deleteContextFile(id, USER_ID)
+}
 
 // ---------- 会话切换 ----------
 interface HistoryMessage {
@@ -59,6 +201,7 @@ interface HistoryMessage {
 
 async function selectSession(threadId: string) {
   if (sessions.activeThreadId === threadId) return
+  clearPending()
   sessions.activeThreadId = threadId
   try {
     const res = await fetch(
@@ -106,6 +249,7 @@ async function selectSession(threadId: string) {
 }
 
 async function createSession() {
+  clearPending()
   const id = await sessions.createSession()
   sessions.activeThreadId = id
   chat.newChat()
@@ -184,9 +328,13 @@ async function scrollBottom() {
 watch(() => [chat.messages.length, shown.value.map((m) => (m.content || '') + (m.result || '') + (m.status || ''))], scrollBottom, { deep: true })
 
 function submit() {
-  if (!draft.value.trim()) return
-  chat.send(draft.value)
+  if (!draft.value.trim() && pendingFiles.value.length === 0) return
+  const files = pendingFiles.value
+  chat.send(draft.value, files)
   draft.value = ''
+  // 已发送的附件不再重复引用；预览 URL 保留给消息气泡显示。
+  pendingFiles.value = []
+  uploadError.value = ''
 }
 </script>
 
@@ -243,13 +391,23 @@ function submit() {
 
           <template v-for="msg in shown" :key="msg.id">
             <div v-if="msg.kind === 'user'" class="row user">
-              <div class="bubble user-bubble">{{ msg.content }}</div>
+              <div class="bubble user-bubble">
+                <div v-if="msg.attachments?.length" class="bubble-atts">
+                  <span v-for="att in msg.attachments" :key="att.id" class="bubble-att">
+                    <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
+                    <AppIcon v-else name="file" :size="11" />
+                    <span>{{ att.name }}</span>
+                  </span>
+                </div>
+                <span v-if="msg.content">{{ msg.content }}</span>
+              </div>
             </div>
 
             <div v-else-if="msg.kind === 'assistant'" class="row">
               <div class="avatar ai">AI</div>
               <div class="bubble ai-bubble">
-                {{ msg.content }}<span v-if="msg.streaming" class="cursor"></span>
+                <MarkdownView v-if="msg.content" :content="msg.content" />
+                <span v-if="msg.streaming" class="cursor"></span>
               </div>
             </div>
 
@@ -279,19 +437,103 @@ function submit() {
         </div>
 
         <footer class="input-bar">
-          <textarea
-            v-model="draft"
-            rows="1"
-            placeholder="输入消息，Enter 发送 / Shift+Enter 换行"
-            :disabled="chat.sending"
-            @keydown.enter.exact.prevent="submit"
-          ></textarea>
-          <button v-if="chat.sending" class="stop" type="button" title="中止" @click="chat.stop()">
-            <AppIcon name="stop" :size="15" />
-          </button>
-          <button v-else class="send" type="button" :disabled="!draft.trim()" @click="submit">
-            <AppIcon name="send" :size="15" />
-          </button>
+          <div v-if="pendingFiles.length" class="pending-row">
+            <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
+              <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
+              <AppIcon v-else name="file" :size="12" />
+              <span class="p-name">{{ att.name }}</span>
+              <button type="button" title="移除" @click="removePending(att.id)">
+                <AppIcon name="close" :size="10" />
+              </button>
+            </span>
+          </div>
+          <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
+
+          <div v-if="urlMode" class="url-row">
+            <AppIcon name="globe" :size="14" />
+            <input
+              v-model="urlDraft"
+              type="url"
+              placeholder="https://example.com/article"
+              :disabled="urlLoading"
+              @keydown.enter.prevent="submitUrl"
+              @keydown.esc="urlMode = false"
+            />
+            <button
+              class="url-ok"
+              type="button"
+              :disabled="urlLoading || !urlDraft.trim()"
+              @click="submitUrl"
+            >
+              {{ urlLoading ? '抓取中…' : '导入' }}
+            </button>
+            <button class="url-cancel" type="button" title="取消" @click="urlMode = false">
+              <AppIcon name="close" :size="11" />
+            </button>
+          </div>
+
+          <div class="input-row">
+            <div class="attach-wrap">
+              <button
+                class="attach"
+                :class="{ active: attachMenu }"
+                type="button"
+                :disabled="uploading || chat.sending"
+                title="添加上下文：文件 / 图片 / 网络链接"
+                @click="attachMenu = !attachMenu"
+              >
+                <AppIcon name="paperclip" :size="17" />
+                <span v-if="uploading" class="attach-spin"></span>
+              </button>
+              <Transition name="pop">
+                <div v-if="attachMenu" class="attach-menu">
+                  <button type="button" @click="pickAttach('file')">
+                    <AppIcon name="file" :size="14" />
+                    <span>文件</span>
+                    <small>文档 / 文本</small>
+                  </button>
+                  <button type="button" @click="pickAttach('image')">
+                    <AppIcon name="image" :size="14" />
+                    <span>图片</span>
+                    <small>随消息多模态发送</small>
+                  </button>
+                  <button type="button" @click="openUrlMode">
+                    <AppIcon name="globe" :size="14" />
+                    <span>网络链接</span>
+                    <small>抓取网页正文</small>
+                  </button>
+                </div>
+              </Transition>
+            </div>
+            <div v-if="attachMenu" class="menu-mask" @click="attachMenu = false"></div>
+            <input
+              ref="fileInput"
+              class="file-input"
+              type="file"
+              multiple
+              :accept="fileAccept || formats.accept"
+              @change="onFilesPicked"
+            />
+            <textarea
+              v-model="draft"
+              rows="1"
+              placeholder="输入消息，可附图片/文档/网页链接；Enter 发送 / Shift+Enter 换行"
+              :disabled="chat.sending"
+              @keydown.enter.exact.prevent="submit"
+            ></textarea>
+            <button v-if="chat.sending" class="stop" type="button" title="中止" @click="chat.stop()">
+              <AppIcon name="stop" :size="15" />
+            </button>
+            <button
+              v-else
+              class="send"
+              type="button"
+              :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading"
+              @click="submit"
+            >
+              <AppIcon name="send" :size="15" />
+            </button>
+          </div>
         </footer>
       </section>
 
@@ -567,6 +809,8 @@ function submit() {
   border: 1px solid var(--line);
   background: var(--bg-card);
   border-top-left-radius: 4px;
+  /* Markdown 渲染后由块级元素控制换行，不能再沿用 pre-wrap */
+  white-space: normal;
 }
 
 .user-bubble {
@@ -622,14 +866,284 @@ function submit() {
 
 .input-bar {
   display: flex;
-  align-items: flex-end;
-  gap: 10px;
+  flex-direction: column;
+  gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--line);
   background: rgba(8, 16, 34, 0.6);
 }
 
-.input-bar textarea {
+.input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* 附件选择：原生 input 隐藏，按钮触发 */
+.file-input {
+  display: none;
+}
+
+.attach {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  color: var(--text-2);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: rgba(6, 13, 28, 0.7);
+  transition: all 0.18s;
+}
+
+/* 附件下拉容器：菜单向上弹出，避免遮挡输入框 */
+.attach-wrap {
+  position: relative;
+  flex: none;
+}
+
+.attach.active {
+  color: var(--accent-cyan);
+  border-color: var(--accent);
+  background: rgba(53, 224, 255, 0.1);
+}
+
+.attach-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 210px;
+  padding: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: rgba(10, 22, 44, 0.97);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(12px);
+}
+
+.attach-menu button {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  text-align: left;
+  color: var(--text-2);
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  transition: all 0.15s;
+}
+
+.attach-menu button:hover {
+  color: var(--text-1);
+  background: rgba(53, 224, 255, 0.09);
+}
+
+.attach-menu button svg,
+.attach-menu button :deep(svg) {
+  grid-row: 1 / span 2;
+  color: var(--accent-cyan);
+}
+
+.attach-menu button span {
+  font-size: 12.5px;
+}
+
+.attach-menu button small {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* 点击空白关闭下拉 */
+.menu-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+/* 网络链接输入行 */
+.url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  color: var(--accent-cyan);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: rgba(6, 13, 28, 0.78);
+}
+
+.url-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 4px;
+  font-size: 12.5px;
+  font-family: inherit;
+  color: var(--text-1);
+  border: none;
+  background: transparent;
+  outline: none;
+}
+
+.url-row input::placeholder {
+  color: var(--text-3);
+}
+
+.url-ok {
+  flex: none;
+  padding: 4px 12px;
+  font-size: 11.5px;
+  color: #fff;
+  border: none;
+  border-radius: 7px;
+  background: linear-gradient(120deg, #3b78ff, #2a5cd6);
+}
+
+.url-ok:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.url-cancel {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  color: var(--text-3);
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+}
+
+.url-cancel:hover {
+  color: #ff6b6b;
+  background: rgba(255, 93, 93, 0.14);
+}
+
+.pop-enter-active,
+.pop-leave-active {
+  transition: all 0.16s ease;
+}
+
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(6px) scale(0.97);
+}
+
+.attach:hover:not(:disabled) {
+  color: var(--accent-cyan);
+  border-color: var(--accent);
+  background: rgba(53, 224, 255, 0.08);
+}
+
+.attach:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.attach-spin {
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  border: 2px solid transparent;
+  border-top-color: var(--accent-cyan);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.pending-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pending-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 6px;
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(16, 32, 64, 0.55);
+}
+
+.pending-chip img {
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.pending-chip .p-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-chip button {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+}
+
+.pending-chip button:hover {
+  color: #ff6b6b;
+  background: rgba(255, 93, 93, 0.14);
+}
+
+.upload-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--amber);
+}
+
+.bubble-atts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.bubble-att {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 4px;
+  font-size: 10.5px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.bubble-att img {
+  width: 26px;
+  height: 26px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.input-row textarea {
   flex: 1;
   max-height: 120px;
   padding: 10px 14px;
@@ -643,7 +1157,7 @@ function submit() {
   outline: none;
 }
 
-.input-bar textarea:focus {
+.input-row textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.15);
 }

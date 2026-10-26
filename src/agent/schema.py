@@ -1,4 +1,4 @@
-﻿"""Harness 运行时、对话和会话历史共用的数据模型。
+"""Harness 运行时、对话和会话历史共用的数据模型。
 
 本文件只描述通用概念：用户身份、会话、消息和异步任务。
 业务字段应放在接入方的工具参数或 YAML 配置中，不要写进这里。
@@ -55,6 +55,10 @@ class ChatRequest(BaseModel):
     user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
     username: Optional[str] = Field(None, min_length=1, description="用户名")
     name: Optional[str] = Field(None, min_length=1, description="username 的兼容字段")
+    attachments: List[str] = Field(
+        default_factory=list,
+        description="上下文附件 ID 列表（先调用 /context/upload 获得）",
+    )
 
     @model_validator(mode="after")
     def set_username(self) -> "ChatRequest":

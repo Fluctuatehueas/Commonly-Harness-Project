@@ -1,4 +1,4 @@
-﻿"""Harness Agent 的最小对话 HTTP 接口。
+"""Harness Agent 的最小对话 HTTP 接口。
 
 对外协议：
 - ``POST /chat``：非流式对话
@@ -33,6 +33,8 @@ from agent.tools.async_sandbox_tools import START_ASYNC_TASK_TOOL_NAME
 from api.agent_loader import agent_loader
 from api.async_tasks import extract_async_task_id
 from api.async_tasks import router as async_tasks_router
+from api.context import build_user_content
+from api.context import router as context_router
 from api.files import router as files_router
 from api.history import router as history_router
 from api.settings import router as settings_router
@@ -259,7 +261,13 @@ async def _run_chat_unlocked(request: ChatRequest, thread_id: str) -> ChatRespon
     context = HarnessContext(user_id=request.user_id, username=username)
 
     try:
-        agent_input = {"messages": [{"role": "user", "content": request.message}]}
+        # 有附件时组装成多模态内容块（文本 + 图片 + 文档抽取文本）。
+        user_content = await build_user_content(
+            user_id=request.user_id,
+            message=request.message,
+            attachment_ids=request.attachments,
+        )
+        agent_input = {"messages": [{"role": "user", "content": user_content}]}
         result = await agent.ainvoke(
             agent_input,
             config=config,
@@ -575,7 +583,13 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     thread_id = request.thread_id or str(uuid.uuid4())
     if request.thread_id:
         await agent_loader.require_session(request.user_id, thread_id)
-    agent_input = {"messages": [{"role": "user", "content": request.message}]}
+    # 有附件时组装成多模态内容块；解析失败会抛 4xx，不会静默丢附件。
+    user_content = await build_user_content(
+        user_id=request.user_id,
+        message=request.message,
+        attachment_ids=request.attachments,
+    )
+    agent_input = {"messages": [{"role": "user", "content": user_content}]}
     return StreamingResponse(
         _stream_response(
             request,
@@ -612,3 +626,4 @@ app.include_router(history_router)
 app.include_router(async_tasks_router)
 app.include_router(settings_router)
 app.include_router(files_router)
+app.include_router(context_router)
