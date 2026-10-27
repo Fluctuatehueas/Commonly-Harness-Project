@@ -87,11 +87,15 @@ def _task_description(args: Any) -> str:
     return str(description).strip() if description else ""
 
 
-def serialize_messages(messages: list[Any]) -> list[Message]:
+def serialize_messages(
+    messages: list[Any],
+    usage_by_message: dict[str, dict[str, int]] | None = None,
+) -> list[Message]:
     """将 checkpoint 消息转换为与 SSE 流式过程一致的前端展示消息。
 
     助手消息中的工具调用先转为“执行中”占位消息；随后到达的工具结果按
     ``tool_call_id`` 回填该占位消息，避免历史记录和实时展示的顺序不一致。
+    ``usage_by_message`` 以最终回答消息 ID 为键提供单轮 Token 消耗。
     """
     serialized: list[Message] = []
     tool_messages: dict[str, Message] = {}
@@ -127,6 +131,13 @@ def serialize_messages(messages: list[Any]) -> list[Message]:
                         source=source,
                         async_task_id=additional_kwargs.get("async_task_id"),
                         created_at=now,
+                        tokens=(
+                            usage_by_message.get(
+                                str(_message_value(message, "id", "") or "")
+                            )
+                            if usage_by_message
+                            else None
+                        ),
                     )
                 )
             for call_index, tool_call in enumerate(
@@ -255,12 +266,26 @@ async def get_session_messages(
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
     state = await agent_loader.get_thread_state(thread_id)
     interrupts = state.interrupts
+    # 单轮消耗按最终回答消息 ID 回填；累计值直接透传给发送栏展示。
+    usage_data = await agent_loader.get_thread_usage(user_id, thread_id)
+    usage_by_message = {
+        str(entry.get("message_id", "")): {
+            "input": int(entry.get("input") or 0),
+            "output": int(entry.get("output") or 0),
+            "total": int(entry.get("total") or 0),
+        }
+        for entry in usage_data.get("rounds", [])
+        if entry.get("message_id")
+    }
     return SessionMessagesResponse(
         thread_id=thread_id,
-        messages=serialize_messages(list(state.values.get("messages", []))),
+        messages=serialize_messages(
+            list(state.values.get("messages", [])), usage_by_message
+        ),
         interrupt=(
             serialize_interrupt(interrupts[0], thread_id) if interrupts else None
         ),
+        session_usage=usage_data.get("session", {}),
     )
 
 

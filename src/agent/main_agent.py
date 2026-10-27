@@ -6,6 +6,7 @@
 checkpoint；长期记忆则经由 ``/memories/`` 路由到该用户的 PostgreSQL Store。
 """
 
+
 from __future__ import annotations
 
 from collections import Counter
@@ -26,6 +27,7 @@ from agent.config import (
     MAIN_AGENT_MODEL_RUN_LIMIT,
     MAIN_AGENT_TOOL_RUN_LIMIT,
     MAIN_SKILLS_PATH,
+    MODEL_CONTEXT_LIMIT,
     SKILLS_ROOT,
     get_main_model,
     get_summary_model,
@@ -33,8 +35,11 @@ from agent.config import (
 from agent.memory.prompts import system_prompt
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware
+from agent.middlewares.context_window_monitor import ContextWindowMonitorMiddleWare
 from agent.middlewares.memory_update import MemoryUpdateMiddleware
 from agent.middlewares.skills_sync import SandboxSkillsMiddleware
+from agent.middlewares.token_usage import TokenUsageMiddleware
+from agent.middlewares.trajectory import TrajectoryMiddleware
 from agent.schema import HarnessContext
 from agent.subagents.async_registry import (
     get_async_subagent_instructions,
@@ -47,7 +52,7 @@ from agent.tools.document_tools import read_word_document
 from agent.tools.hitl_tool import request_additional_info
 from agent.tools.mcp_client import load_main_mcp_tools
 from agent.tools.skill_tools import create_skill_management_tools
-
+from agent.tools.commom_tools import get_basic_tools
 
 # 同步子 Agent 扩展点：
 # - 已经拿到工具对象的静态配置放进 SYNC_SUBAGENTS；
@@ -211,6 +216,7 @@ async def create_main_agent(
     main_tools = [
         *mcp_tools,
         *async_tools,
+        *get_basic_tools(),
         request_additional_info,
         read_word_document,
         *skill_management_tools,
@@ -235,6 +241,11 @@ async def create_main_agent(
         subagents=[*sync_subagents, *async_subagents],
         middleware=[
             ContextInjectionMiddleware(),
+            # 只读观测：上下文占用日志 + 过程轨迹落库，不修改 state。
+            ContextWindowMonitorMiddleWare(),
+            # after_agent 把最终回答的 Token 消耗累计写入 Store（会话统计）。
+            TokenUsageMiddleware(),
+            TrajectoryMiddleware(context_limit=MODEL_CONTEXT_LIMIT),
             *skill_middleware,
             # 自动摘要 + 主动压缩 + 模型/工具调用上限。
             *build_agent_protection_middleware(

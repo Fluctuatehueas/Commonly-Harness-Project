@@ -48,10 +48,13 @@ body {
     -apple-system,
     sans-serif;
   color: var(--text-1);
+  /* 星辰宇宙全局背景：深色渐变压暗 + BG_Chat 星域图 */
   background:
+    linear-gradient(rgba(4, 9, 20, 0.72), rgba(4, 9, 20, 0.82)),
     radial-gradient(1200px 600px at 75% -10%, rgba(46, 96, 200, 0.22), transparent 60%),
-    radial-gradient(900px 500px at -10% 110%, rgba(24, 68, 160, 0.18), transparent 55%),
+    url('../assets/BG_Chat.png') center / cover no-repeat fixed,
     var(--bg-deep);
+  background-color: var(--bg-deep);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -73,6 +76,16 @@ body {
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   backdrop-filter: blur(8px);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* 全局星辰交互：面板悬停时泛起星云辉光 */
+.panel:hover {
+  border-color: var(--line-strong);
+  box-shadow:
+    0 0 0 1px rgba(53, 224, 255, 0.08),
+    0 8px 32px rgba(12, 30, 70, 0.45),
+    0 0 46px rgba(63, 122, 255, 0.12);
 }
 
 /* 页面骨架：顶部导航布局，主内容占满宽度 */
@@ -128,4 +141,59 @@ a {
 button {
   font-family: inherit;
   cursor: pointer;
+}
+
+/* ============================================================
+   星辰宇宙：全局粒子 / 辉光交互工具类
+   ============================================================ */
+@keyframes cosmic-shine {
+  from { transform: translateX(-130%) skewX(-18deg); }
+  to   { transform: translateX(230%)  skewX(-18deg); }
+}
+
+@keyframes cosmic-twinkle {
+  0%, 100% { opacity: 0.25; }
+  50%      { opacity: 1; }
+}
+
+@keyframes cosmic-pulse {
+  0%, 100% { box-shadow: 0 0 10px rgba(53, 224, 255, 0.25); }
+  50%      { box-shadow: 0 0 22px rgba(53, 224, 255, 0.55); }
+}
+
+/* 所有按钮：悬停时掠过一道星尘光带 */
+button {
+  position: relative;
+  overflow: hidden;
+  transition: color 0.18s, border-color 0.18s, background 0.18s, box-shadow 0.18s, filter 0.18s;
+}
+
+button::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    105deg,
+    transparent 35%,
+    rgba(160, 225, 255, 0.3) 50%,
+    transparent 65%
+  );
+  transform: translateX(-130%) skewX(-18deg);
+}
+
+button:hover:not(:disabled)::before {
+  opacity: 1;
+  animation: cosmic-shine 0.7s ease;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* 开关的滑块不属于按钮内容光效范围 */
+.switch::before {
+  display: none;
 }

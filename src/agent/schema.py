@@ -22,6 +22,10 @@ class HarnessContext:
 
     user_id: str  # 必填，用户唯一标识，决定记忆隔离范围
     username: str  # 必填，用户姓名或登录名
+    # 轨迹记录需要知道当前会话；同一用户的不同 thread 可能并发执行。
+    thread_id: str = ""
+    # 中间件在每轮开始时生成，用于把同一次 run 的事件归到一个轨迹分组。
+    trajectory_run_id: str = ""
 
 
 @dataclass
@@ -126,6 +130,8 @@ class Message(BaseModel):
     text: Optional[str] = Field(None, description="工具结果文本")
     args: Optional[str] = Field(None, description="工具调用参数")
     async_task_id: Optional[str] = Field(None, description="可继续轮询的远程异步任务 ID")
+    # 助手消息：本轮最终回答的 Token 消耗（来自 TokenUsageMiddleware 统计）。
+    tokens: Optional[Dict[str, int]] = Field(None, description="单轮 Token 消耗 input/output/total")
 
 
 class Session(BaseModel):
@@ -150,6 +156,9 @@ class SessionMessagesResponse(BaseModel):
     thread_id: str = Field(..., description="会话 ID")
     messages: List[Message] = Field(default_factory=list, description="按原顺序排列的消息")
     interrupt: Optional[Dict[str, Any]] = Field(None, description="等待恢复的中断")
+    session_usage: Dict[str, int] = Field(
+        default_factory=dict, description="会话累计 Token 消耗 input/output/total"
+    )
 
 
 class DeleteSessionResponse(BaseModel):

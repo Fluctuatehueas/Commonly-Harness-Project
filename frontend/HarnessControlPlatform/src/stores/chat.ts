@@ -6,12 +6,20 @@ import type { ContextFile } from '@/api/context'
 
 export type ToolCategory = 'tool' | 'skill' | 'delegation'
 
+export interface MessageTokens {
+  input: number
+  output: number
+  total: number
+  rounds?: number
+}
+
 export interface ChatMsg {
   id: string
   kind: 'user' | 'assistant' | 'tool' | 'interrupt' | 'system'
   content?: string
   attachments?: ContextFile[]
   streaming?: boolean
+  tokens?: MessageTokens
   toolCallId?: string
   toolName?: string
   category?: ToolCategory
@@ -59,6 +67,10 @@ export const useChatStore = defineStore('chat', () => {
   const pendingInterrupt = ref<ChatMsg | null>(null)
   const demoMode = ref(true) // 后端未启动时也能完整预览 UI
   const lastError = ref('')
+  // 会话轮次上限：由后端 done 事件下发（MAIN_AGENT_MODEL_RUN_LIMIT），默认 50
+  const roundLimit = ref(50)
+  // 本会话累计 Token 消耗：后端 TokenUsageMiddleware 持久化在 Store，done/历史接口下发
+  const sessionTokens = ref<MessageTokens | null>(null)
   let ctrl: AbortController | null = null
 
   const isEmpty = computed(() => messages.value.length === 0)
@@ -139,6 +151,34 @@ export const useChatStore = defineStore('chat', () => {
       }
       case 'done': {
         if (evt.thread_id) threadId.value = String(evt.thread_id)
+        if (typeof evt.round_limit === 'number' && evt.round_limit > 0) {
+          roundLimit.value = evt.round_limit
+        }
+        // usage = 本轮最终回答的单次调用消耗，挂到最后一条正式回答上；
+        // session_usage = 会话累计（Store 持久化，恢复历史时同样准确）。
+        const usage = evt.usage as Partial<MessageTokens> | undefined
+        if (usage && typeof usage.total === 'number' && usage.total > 0) {
+          for (let i = messages.value.length - 1; i >= 0; i--) {
+            const msg = messages.value[i]
+            if (msg && msg.kind === 'assistant' && msg.content) {
+              msg.tokens = {
+                input: usage.input || 0,
+                output: usage.output || 0,
+                total: usage.total,
+              }
+              break
+            }
+          }
+        }
+        const session = evt.session_usage as Partial<MessageTokens> | undefined
+        if (session && typeof session.total === 'number') {
+          sessionTokens.value = {
+            input: session.input || 0,
+            output: session.output || 0,
+            total: session.total,
+            rounds: session.rounds || 0,
+          }
+        }
         for (const m of messages.value) if (m.streaming) m.streaming = false
         if (evt.interrupted) {
           // 中断卡片保持可操作
@@ -265,19 +305,44 @@ export const useChatStore = defineStore('chat', () => {
     threadId.value = null
     pendingInterrupt.value = null
     lastError.value = ''
+    sessionTokens.value = null
+    demoSessionTokens = { input: 0, output: 0, total: 0 }
   }
 
   // 切换会话：载入历史消息（由视图层从 /history 映射而来）
-  function loadHistory(msgs: ChatMsg[], tid: string) {
+  function loadHistory(msgs: ChatMsg[], tid: string, sessionUsage?: MessageTokens | null) {
     stop()
     messages.value = msgs
     threadId.value = tid
     pendingInterrupt.value = msgs.find((m) => m.kind === 'interrupt' && !m.resolved) || null
     lastError.value = ''
+    sessionTokens.value = sessionUsage && sessionUsage.total > 0 ? sessionUsage : null
   }
 
   // ---------- 演示模式：脚本化 SSE 事件，覆盖全部卡片类型 ----------
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+  // 演示模式本地累计，模拟后端 Store 的会话统计
+  let demoSessionTokens: MessageTokens = { input: 0, output: 0, total: 0, rounds: 0 }
+
+  function demoDone(interrupted: boolean, usage: MessageTokens) {
+    // 与后端口径一致：input 取最近一轮，output 累加历轮生成。
+    demoSessionTokens = {
+      input: usage.input,
+      output: demoSessionTokens.output + usage.output,
+      total: usage.input + demoSessionTokens.output + usage.output,
+      rounds: (demoSessionTokens.rounds || 0) + 1,
+    }
+    handleEvent({
+      type: 'done',
+      thread_id: threadId.value || 'demo-thread',
+      user_id: 'console_user',
+      username: '控制台用户',
+      content: '',
+      interrupted,
+      usage,
+      session_usage: { ...demoSessionTokens },
+    })
+  }
 
   async function typeOut(text: string) {
     push({ id: uid('a'), kind: 'assistant', content: '', streaming: true })
@@ -330,7 +395,7 @@ export const useChatStore = defineStore('chat', () => {
       information_needed: '请确认输出格式：Markdown 还是表格？',
       context: '已生成初稿，等待格式确认后交付。',
     })
-    handleEvent({ type: 'done', thread_id: threadId.value || 'demo-thread', user_id: 'console_user', username: '控制台用户', content: '', interrupted: true })
+    demoDone(true, { input: 6056, output: 42, total: 6098 })
   }
 
   async function runDemoResume(markAs: 'answered' | 'approved' | 'rejected') {
@@ -347,7 +412,7 @@ export const useChatStore = defineStore('chat', () => {
           '# Harness 多智能体实践结论\n\n1. **先可观测再优化**：没有 trace 与评估集，任何改动都是盲改。\n2. **上下文分层**：卸载 → 摘要 → 主动压缩，三层共用同一状态。\n3. **HITL 落 checkpoint**：等待人 = 可恢复，而不是阻塞。',
       })
     }
-    handleEvent({ type: 'done', thread_id: threadId.value || 'demo-thread', user_id: 'console_user', username: '控制台用户', content: '', interrupted: false })
+    demoDone(false, { input: 6122, output: 58, total: 6180 })
   }
 
   return {
@@ -358,6 +423,8 @@ export const useChatStore = defineStore('chat', () => {
     pendingInterrupt,
     demoMode,
     lastError,
+    roundLimit,
+    sessionTokens,
     isEmpty,
     send,
     resume,

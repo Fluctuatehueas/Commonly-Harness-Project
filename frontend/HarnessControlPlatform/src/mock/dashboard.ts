@@ -14,7 +14,7 @@ export const NAV_ITEMS: NavItem[] = [
   { key: 'models', label: '模型管理', icon: 'cube', path: '/models' },
   { key: 'chat-control', label: '对话控制', icon: 'sliders', path: '/chat-control' },
   { key: 'kb', label: '知识库', icon: 'book', path: '/kb' },
-  { key: 'workflow', label: '工作流', icon: 'workflow', path: '/workflow' },
+  { key: 'workflow', label: '轨迹', icon: 'workflow', path: '/workflow' },
   { key: 'plugins', label: '插件市场', icon: 'plug', path: '/plugins' },
   { key: 'settings', label: '系统设置', icon: 'gear', path: '/settings' },
 ]

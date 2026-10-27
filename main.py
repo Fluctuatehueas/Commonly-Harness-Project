@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -25,6 +26,13 @@ if str(SRC_DIR) not in sys.path:
 # 必须在导入 api.chat 之前切换事件循环策略。
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Agent 侧的观测日志（上下文监控 / 轨迹）默认走 INFO；
+# 根 logger 已有 handler 时 basicConfig 不会重复配置。
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
 import uvicorn  # noqa: E402
 

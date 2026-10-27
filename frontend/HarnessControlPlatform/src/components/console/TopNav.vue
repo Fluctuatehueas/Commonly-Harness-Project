@@ -102,12 +102,17 @@ onBeforeUnmount(() => window.clearInterval(timer))
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: none;
   padding: 7px 12px;
   font-size: 12.5px;
   color: var(--text-2);
   border-radius: 999px;
   white-space: nowrap;
   transition: all 0.18s;
+}
+
+.menu-item span {
+  white-space: nowrap;
 }
 
 .menu-item:hover {
@@ -130,6 +135,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
   padding: 5px 12px;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
   color: var(--text-1);
   border: 1px solid var(--line);
   border-radius: 999px;

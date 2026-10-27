@@ -82,16 +82,18 @@ src/
 │   ├── schema.py              HarnessContext / Chat / Session 数据模型
 │   ├── main_agent.py          主 Agent 组合根（工具、子 Agent、中间件）
 │   ├── history_reader.py      只读 checkpoint 恢复
+│   ├── trajectory_store.py    轨迹事件 Store 读写（namespace/truncate/delete）
 │   ├── backends/              OpenSandbox 适配器、代理、管理器、技能同步
 │   ├── memory/                主 Agent system prompt 与 AGENTS.md
-│   ├── middlewares/           上下文注入、技能同步、调用保护、记忆更新
+│   ├── middlewares/           上下文注入/监控、技能同步、调用保护、记忆更新、轨迹
 │   ├── subagents/             SubAgent 注册、YAML 加载、Agent Protocol 入口
 │   ├── skills/                技能目录（main/ 与 subagents/）
-│   └── tools/                 HITL、异步任务、技能管理、MCP 工具加载
+│   └── tools/                 HITL、异步任务、技能管理、Word 读取、MCP 工具加载
 ├── api/
 │   ├── agent_loader.py        按用户缓存 Agent、会话索引、异步任务投递
 │   ├── chat.py                FastAPI 应用与 SSE 对话接口
 │   ├── history.py             会话历史接口
+│   ├── trajectory.py          轨迹查询接口（按 run 聚合）
 │   ├── async_tasks.py         异步任务轮询接口
 │   └── message_utils.py       文本与中断协议转换
 ├── mcp_server/                FastMCP 服务端（工具注册与 stdio/HTTP 启动）
@@ -503,12 +505,15 @@ DeepAgent的中间件
 | # | 中间件 | 来源 | 使用的钩子 | 职责 |
 | :---: | :--- | :--- | :--- | :--- |
 | 1 | ContextInjectionMiddleware | 自定义 | wrap_model_call / awrap_model_call | 注入 user_id / username 与偏好文件路径 |
-| 2 | SandboxSkillsMiddleware | 自定义（继承 SkillsMiddleware） | abefore_agent | 本地技能增量同步到沙箱，并刷新技能索引 |
-| 3 | SummarizationMiddleware | DeepAgents | before_model | 上下文达到阈值时自动摘要 |
-| 4 | SummarizationToolMiddleware | DeepAgents | wrap_model_call | 提供 compact_conversation 主动压缩工具 |
-| 5 | ModelCallLimitMiddleware | LangChain | before_model / after_model | 单次 run 模型调用超过上限即终止 |
-| 6 | ToolCallLimitMiddleware | LangChain | before_agent / after_agent / before_model / after_model / wrap_tool_call | 单次 run 工具调用超过上限即终止 |
-| 7 | MemoryUpdateMiddleware | 自定义 | aafter_agent | 提取本轮 query / preferred 写回 `/memories/` |
+| 2 | ContextWindowMonitorMiddleWare | 自定义 | abefore_agent / aafter_agent | 统计上下文 Token 占用并写日志；只读，不修改 state |
+| 3 | TrajectoryMiddleware | 自定义 | abefore_agent / aafter_agent / awrap_model_call / awrap_tool_call | 记录模型、工具、技能、委派、HITL 轨迹到 Store |
+| 4 | TokenUsageMiddleware | 自定义 | aafter_agent | 只统计本轮最终回答调用，累计写入会话 Token 统计 |
+| 5 | SandboxSkillsMiddleware | 自定义（继承 SkillsMiddleware） | abefore_agent | 本地技能增量同步到沙箱，并刷新技能索引 |
+| 6 | SummarizationMiddleware | DeepAgents | before_model | 上下文达到阈值时自动摘要 |
+| 7 | SummarizationToolMiddleware | DeepAgents | wrap_model_call | 提供 compact_conversation 主动压缩工具 |
+| 8 | ModelCallLimitMiddleware | LangChain | before_model / after_model | 单次 run 模型调用超过上限即终止 |
+| 9 | ToolCallLimitMiddleware | LangChain | before_agent / after_agent / before_model / after_model / wrap_tool_call | 单次 run 工具调用超过上限即终止 |
+| 10 | MemoryUpdateMiddleware | 自定义 | aafter_agent | 提取本轮 query / preferred 写回 `/memories/` |
 
 装配位置见 [main_agent.py](./src/agent/main_agent.py)，调用预算见 [config.py](./src/agent/config.py)。
 
@@ -539,7 +544,55 @@ DeepAgent的中间件
 DeepAgent官方文档[中间件](https://docs.langchain.com/oss/python/langchain/middleware/built-in#context-editing)内部含有很多的中间件，可以根据自己喜好配置。  
 
 
-### 11. 异步后台的子智能体（AsyncSubAgent）
+### 11. 轨迹（Trajectory）与上下文监控
+
+**上下文监控（只读）**
+
+[context_window_monitor.py](./src/agent/middlewares/context_window_monitor.py) 在 `before_agent` / `after_agent` 统计消息 Token：
+
+- `HARNESS_MODEL_CONTEXT_LIMIT`：上下文窗口上限，默认 `128000`，只用于占比计算；
+- `HARNESS_CONTEXT_ALERT_THRESHOLD`：告警阈值，默认 `0.85`，只写 `WARNING` 日志。
+- 该中间件不修改 state。告警本身不会改变 Agent 行为，真正的压缩由 `SummarizationMiddleware` / `compact_conversation` 负责；日志和阈值用于外部监控、前端展示和问题定位。
+
+**轨迹记录**
+
+[trajectory.py](./src/agent/middlewares/trajectory.py) 的 `TrajectoryMiddleware` 在每轮执行中记录：
+
+| 事件类型 | 记录内容 |
+|:--|:--|
+| `run` | 本轮开始 / 结束、上下文快照、汇总耗时 |
+| `model` | 模型每次调用耗时、Token 用量、上下文占用、思考内容、决策调用的工具 |
+| `tool` | 工具名、参数、返回结果、耗时、状态 |
+| `skill` | 技能管理工具调用（`assign_skill` / `download_skill` 等） |
+| `delegation` | `task` / `start_async_task` 委派及子 Agent 名称 |
+| `hitl` | `request_additional_info` 触发的人工介入 |
+
+存储位置：PostgreSQL `store` 表，命名空间 `("trajectory", user_id, thread_id)`，每个事件单独一行，key 形如 `<run_id>:<started_at>:<event_id>`。写入是 best-effort，失败只告警，不影响 Agent 主流程。会话删除时轨迹同步清理。
+
+查询接口：`GET /trajectory/{thread_id}?user_id=...`，按 run 聚合后返回甘特图与列表所需的事件、汇总和 Token 数据。
+
+**会话 Token 统计（TokenUsageMiddleware）**
+
+[token_usage.py](./src/agent/middlewares/token_usage.py) 在每轮 `after_agent` 只记录**最终回答那一次模型调用**的 `usage_metadata`：
+
+- 只有“最后一条消息是不带 `tool_calls` 且带文本的 AI 消息”时才写入，工具循环中的中间决策轮不会重复计数；
+- 逐轮记录按消息 ID 幂等写入 Store：`("usage", user_id, thread_id)/session`；
+- 会话汇总口径：`output` = 历轮生成 Token 之和，`input` = 最近一轮输入 Token（即当前上下文占用），**不把每轮 input 相加**——system prompt / 工具 schema / 技能 / 记忆每轮都会重复送入，逐轮求和会让数字成倍虚高；
+- 对话页发送栏底部展示「本会话输出 N tok · 当前上下文 M tok · K 轮」，不再在每条 AI 气泡下展示单轮 Token。
+
+> 为什么一句“你好”也会看到约 6k input：这是系统提示词、工具 schema、技能索引和 `AGENTS.md` 记忆的固定开销，真实 answer 的 output 通常只有几个 Token。该数字由模型服务返回，不是本地估算。
+
+**控制台页面**
+
+- 对话页：一轮中只有最后一条助手文本是正式回答；中间思考、工具、技能、委派折叠成一条透明「轨迹」条，条上只显示最新的过程记录，点击跳到轨迹页。
+- 轨迹页（顶部菜单「轨迹」，路径 `/workflow`，别名 `/trajectory`）：
+  - 顶部甘特图：按 Run / 模型 / 工具 / 技能 / 委派 / 人工介入分行展示占用时间；
+  - 中部日志：按时间顺次排列，可选中；
+  - 右侧详情：参数、返回结果、Token 消耗、上下文占用、Call ID、子 Agent 等。
+- 轨迹只记录升级后新产生的 run，旧会话不会补记历史过程。
+
+
+### 12. 异步后台的子智能体（AsyncSubAgent）
 **一、核心思想**  
 1. 主智能仍然运行在FastAPI中
 2. 耗时的子Agent不再由Agent同步等待
@@ -658,7 +711,8 @@ Agent的文件系统工具调用后端，后端再根据配置将操作路由到
 - [x] MCP：FastMCP 服务端 + stdio/Streamable HTTP 客户端工具加载
 - [x] Context Engineering：卸载、自动摘要、主动压缩、记忆隔离
 - [x] HTTP/SSE API：对话、流式、恢复、历史、异步任务轮询
-- [ ] 评估与观测：trace / 评估集接入（建议优先补 Langfuse 或 LangSmith + DeepEval）
+- [x] 基础观测：上下文 Token 监控 + Agent 轨迹（甘特图 / 日志 / 详情）
+- [ ] 外部 Trace 与评估集：建议接入 Langfuse / LangSmith + DeepEval
 - [ ] 多 worker 部署：会话互斥目前只在单进程内有效
 
 
@@ -904,6 +958,7 @@ servers:
 | GET | `/history` | 会话列表 | 否 |
 | GET | `/history/{thread_id}/messages` | 会话消息与待处理中断 | 否 |
 | DELETE | `/history/{thread_id}` | 删除会话 | 否 |
+| GET | `/trajectory/{thread_id}` | 读取会话轨迹（按 run 聚合） | 否 |
 | GET | `/async-tasks/{task_id}` | 查询异步任务并回写结果 | 否 |
 | GET | `/settings/model` | 读取当前模型配置（API Key 只回传是否已设置） | 否 |
 | PUT | `/settings/model` | 更新 .env 并热更新模型（api_key 留空则保留原值） | 否 |
@@ -1195,6 +1250,9 @@ SSE 流内错误不会改变 HTTP 状态码，统一通过 `{"type":"error"}` �
 | `HARNESS_API_HOST` | `127.0.0.1` | 否 | FastAPI 监听地址 |
 | `HARNESS_API_PORT` | `8000` | 否 | FastAPI 监听端口 |
 | `HARNESS_CORS_ORIGINS` | 空 | 否 | 允许的浏览器来源，逗号分隔；为空时不开启 CORS |
+| `HARNESS_MODEL_CONTEXT_LIMIT` | `128000` | 否 | 上下文窗口上限，仅用于 Token 占比计算 |
+| `HARNESS_CONTEXT_ALERT_THRESHOLD` | `0.85` | 否 | 上下文占用告警阈值（0~1，只写日志） |
+| `HARNESS_TRAJECTORY_MAX_TEXT` | `4000` | 否 | 轨迹事件中单个参数/结果字段的最大保留字符数 |
 | `HARNESS_MCP_CONFIG_PATH` | `mcp_servers.yaml` | 否 | MCP Server 配置文件路径 |
 | `MCP_SERVER_NAME` | `harness-mcp` | 否 | FastMCP 服务端名称 |
 | `MCP_HOST` | `127.0.0.1` | 否 | FastMCP HTTP 监听地址 |

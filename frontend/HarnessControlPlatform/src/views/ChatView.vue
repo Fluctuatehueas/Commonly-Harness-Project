@@ -1,14 +1,16 @@
 <script setup lang="ts">
 // 首页：对话测试（顶栏菜单 + 左侧会话栏 + SSE 流式 + 文件预览）
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import UiSwitch from '@/components/console/UiSwitch.vue'
-import ToolCallCard from '@/components/chat/ToolCallCard.vue'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
+import TrajectoryBar from '@/components/chat/TrajectoryBar.vue'
+import RoundLimitToast from '@/components/chat/RoundLimitToast.vue'
 import { API_BASE } from '@/api/client'
 import {
   deleteContextFile,
@@ -25,6 +27,7 @@ import { useDisplayStore } from '@/stores/display'
 const chat = useChatStore()
 const display = useDisplayStore()
 const sessions = useSessionStore()
+const router = useRouter()
 
 const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
@@ -197,6 +200,7 @@ interface HistoryMessage {
   text?: string
   args?: string
   source?: string
+  tokens?: { input: number; output: number; total: number }
 }
 
 async function selectSession(threadId: string) {
@@ -211,11 +215,12 @@ async function selectSession(threadId: string) {
     const data = (await res.json()) as {
       messages: HistoryMessage[]
       interrupt: Record<string, unknown> | null
+      session_usage?: { input: number; output: number; total: number }
     }
     const msgs: ChatMsg[] = data.messages.map((m, i) => {
       if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content }
       if (m.role === 'assistant') {
-        return { id: m.id || `h-a-${i}`, kind: 'assistant', content: m.content }
+        return { id: m.id || `h-a-${i}`, kind: 'assistant', content: m.content, tokens: m.tokens }
       }
       const name = m.tool_name || 'tool'
       return {
@@ -241,7 +246,7 @@ async function selectSession(threadId: string) {
         payload: data.interrupt,
       })
     }
-    chat.loadHistory(msgs, threadId)
+    chat.loadHistory(msgs, threadId, data.session_usage ?? null)
     fileRefreshKey.value++
   } catch {
     chat.newChat()
@@ -312,6 +317,67 @@ function visible(msg: ChatMsg): boolean {
 
 const shown = computed(() => chat.messages.filter(visible))
 
+// ---------- 过程消息折叠 ----------
+// 一轮里只有「最后一条助手文本」算正式回答；其余模型中间话术、工具、
+// 技能、委派都收进一条透明轨迹条，header 只展示最新的过程记录。
+function isFinalAssistant(index: number): boolean {
+  const msg = shown.value[index]
+  if (!msg || msg.kind !== 'assistant' || !msg.content) return false
+  for (let i = index + 1; i < shown.value.length; i++) {
+    const next = shown.value[i]
+    if (!next) continue
+    if (next.kind === 'user') return true
+    if (next.kind === 'tool' || next.kind === 'interrupt') return false
+    if (next.kind === 'assistant' && (next.content || next.streaming)) return false
+  }
+  return true
+}
+
+interface RenderItem {
+  key: string
+  items: ChatMsg[]
+  msg: ChatMsg
+}
+
+const renderItems = computed<RenderItem[]>(() => {
+  const items: RenderItem[] = []
+  let group: ChatMsg[] = []
+
+  const flush = () => {
+    if (group.length === 0) return
+    const first = group[0]
+    const latest = group[group.length - 1]
+    if (!first || !latest) return
+    items.push({
+      key: `traj-${first.id}`,
+      items: group,
+      msg: latest,
+    })
+    group = []
+  }
+
+  shown.value.forEach((msg, index) => {
+    const process =
+      msg.kind === 'tool' ||
+      (msg.kind === 'assistant' && !isFinalAssistant(index))
+    if (process) {
+      group.push(msg)
+      return
+    }
+    flush()
+    items.push({ key: msg.id, items: [], msg })
+  })
+  flush()
+  return items
+})
+
+function openTrajectory(threadId: string | null) {
+  router.push({
+    path: '/workflow',
+    query: threadId ? { thread: threadId } : {},
+  })
+}
+
 const backendStatusLabel = computed(
   () => (backendOnline.value === null ? '检测后端…' : backendOnline.value ? '后端在线' : '后端离线'),
 )
@@ -323,6 +389,69 @@ async function scrollBottom() {
   await nextTick()
   const el = scroller.value
   if (el) el.scrollTop = el.scrollHeight
+}
+
+// ---------- 消息复制 ----------
+const copiedId = ref('')
+let copyTimer: number | undefined
+
+async function copyMessage(msg: ChatMsg) {
+  const text = msg.content || ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 非安全上下文（http://IP）没有 clipboard API，退回 execCommand
+    const area = document.createElement('textarea')
+    area.value = text
+    document.body.appendChild(area)
+    area.select()
+    document.execCommand('copy')
+    area.remove()
+  }
+  copiedId.value = msg.id
+  if (copyTimer) window.clearTimeout(copyTimer)
+  copyTimer = window.setTimeout(() => (copiedId.value = ''), 1600)
+}
+
+function formatExact(total: number): string {
+  return total.toLocaleString('zh-CN')
+}
+
+// ---------- 会话轮次达上限提醒 ----------
+const roundNotice = ref(false)
+// 每个 thread 只提醒一次；关闭或新开会话后不再对旧会话重复弹出
+const noticeShownFor = ref<string | null>(null)
+let noticeTimer: number | undefined
+
+const userRounds = computed(() => chat.messages.filter((m) => m.kind === 'user').length)
+
+watch(
+  () => [chat.sending, chat.threadId, userRounds.value] as const,
+  ([sending, tid, rounds]) => {
+    if (!tid) {
+      roundNotice.value = false
+      return
+    }
+    if (sending || noticeShownFor.value === tid) return
+    if (rounds >= chat.roundLimit) {
+      roundNotice.value = true
+      noticeShownFor.value = tid
+      // 15 秒后自动渐隐，用户也可以手动关闭或新开会话
+      if (noticeTimer) window.clearTimeout(noticeTimer)
+      noticeTimer = window.setTimeout(() => (roundNotice.value = false), 15000)
+    }
+  },
+)
+
+function dismissRoundNotice() {
+  roundNotice.value = false
+  if (noticeTimer) window.clearTimeout(noticeTimer)
+}
+
+function newChatFromNotice() {
+  dismissRoundNotice()
+  void createSession()
 }
 
 watch(() => [chat.messages.length, shown.value.map((m) => (m.content || '') + (m.result || '') + (m.status || ''))], scrollBottom, { deep: true })
@@ -351,6 +480,18 @@ function submit() {
         </span>
       </template>
     </TopNav>
+
+    <!-- 轮次达上限：顶部渐隐渐现提醒卡 -->
+    <Transition name="toast">
+      <div v-if="roundNotice" class="toast-slot">
+        <RoundLimitToast
+          :rounds="userRounds"
+          :limit="chat.roundLimit"
+          @new-chat="newChatFromNotice"
+          @close="dismissRoundNotice"
+        />
+      </div>
+    </Transition>
 
     <div class="chat-layout">
       <SessionPanel
@@ -389,46 +530,81 @@ function submit() {
             </div>
           </div>
 
-          <template v-for="msg in shown" :key="msg.id">
-            <div v-if="msg.kind === 'user'" class="row user">
-              <div class="bubble user-bubble">
-                <div v-if="msg.attachments?.length" class="bubble-atts">
-                  <span v-for="att in msg.attachments" :key="att.id" class="bubble-att">
-                    <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
-                    <AppIcon v-else name="file" :size="11" />
-                    <span>{{ att.name }}</span>
-                  </span>
+          <template v-for="item in renderItems" :key="item.key">
+            <div v-if="item.items.length" class="row indent">
+              <TrajectoryBar
+                :items="item.items"
+                :thread-id="chat.threadId"
+                @open="openTrajectory"
+              />
+            </div>
+
+            <div v-else-if="item.msg.kind === 'user'" class="row user">
+              <div class="msg-col user">
+                <div class="bubble user-bubble">
+                  <div v-if="item.msg.attachments?.length" class="bubble-atts">
+                    <span v-for="att in item.msg.attachments" :key="att.id" class="bubble-att">
+                      <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
+                      <AppIcon v-else name="file" :size="11" />
+                      <span>{{ att.name }}</span>
+                    </span>
+                  </div>
+                  <span v-if="item.msg.content">{{ item.msg.content }}</span>
                 </div>
-                <span v-if="msg.content">{{ msg.content }}</span>
+                <div v-if="item.msg.content" class="msg-meta user">
+                  <button
+                    class="copy-mini"
+                    type="button"
+                    :class="{ copied: copiedId === item.msg.id }"
+                    :title="copiedId === item.msg.id ? '已复制' : '复制文本'"
+                    @click="copyMessage(item.msg)"
+                  >
+                    <AppIcon :name="copiedId === item.msg.id ? 'check' : 'copy'" :size="10" />
+                    <span>{{ copiedId === item.msg.id ? '已复制' : '复制' }}</span>
+                  </button>
+                </div>
               </div>
             </div>
 
-            <div v-else-if="msg.kind === 'assistant'" class="row">
+            <div v-else-if="item.msg.kind === 'assistant'" class="row">
               <div class="avatar ai">AI</div>
-              <div class="bubble ai-bubble">
-                <MarkdownView v-if="msg.content" :content="msg.content" />
-                <span v-if="msg.streaming" class="cursor"></span>
+              <div class="msg-col ai">
+                <div class="bubble ai-bubble">
+                  <MarkdownView v-if="item.msg.content" :content="item.msg.content" />
+                  <span v-if="item.msg.streaming" class="cursor"></span>
+                </div>
+                <div v-if="item.msg.content && !item.msg.streaming" class="msg-meta ai">
+                  <button
+                    class="copy-mini"
+                    type="button"
+                    :class="{ copied: copiedId === item.msg.id }"
+                    :title="copiedId === item.msg.id ? '已复制' : '复制回答'"
+                    @click="copyMessage(item.msg)"
+                  >
+                    <AppIcon :name="copiedId === item.msg.id ? 'check' : 'copy'" :size="10" />
+                    <span>{{ copiedId === item.msg.id ? '已复制' : '复制' }}</span>
+                  </button>
+                </div>
               </div>
             </div>
 
-            <div v-else-if="msg.kind === 'tool'" class="row indent">
-              <ToolCallCard :msg="msg" />
-            </div>
-
-            <div v-else-if="msg.kind === 'interrupt'" class="row indent">
-              <InterruptCard :msg="msg" />
+            <div v-else-if="item.msg.kind === 'interrupt'" class="row indent">
+              <InterruptCard :msg="item.msg" />
             </div>
 
             <div v-else class="row center">
-              <span class="system-note">{{ msg.content }}</span>
+              <span class="system-note">{{ item.msg.content }}</span>
             </div>
           </template>
 
-          <div v-if="chat.thinking && display.prefs.showReasoning" class="row">
-            <div class="avatar ai">AI</div>
-            <div class="bubble thinking-bubble">
-              <i class="s-dot"></i><i class="s-dot"></i><i class="s-dot"></i>
-              <span>模型推理中…</span>
+          <div v-if="chat.thinking && display.prefs.showReasoning" class="row indent">
+            <div class="thinking-trace">
+              <span class="tt-icon"><AppIcon name="workflow" :size="12" /></span>
+              <span class="tt-tag">轨迹</span>
+              <span class="tt-text">模型推理中…</span>
+              <span class="tt-dots">
+                <i class="s-dot"></i><i class="s-dot"></i><i class="s-dot"></i>
+              </span>
             </div>
           </div>
           <div v-else-if="chat.thinking" class="row center">
@@ -534,6 +710,21 @@ function submit() {
               <AppIcon name="send" :size="15" />
             </button>
           </div>
+
+          <!-- 本会话统计：输出为历轮生成之和，上下文取最近一轮输入（含系统提示词/工具/技能） -->
+          <div
+            v-if="chat.sessionTokens"
+            class="session-usage"
+            :title="`按最终回答统计：输出 ${chat.sessionTokens.output} tok（历轮生成之和）；当前上下文 ${chat.sessionTokens.input} tok（最近一轮输入，含系统提示词/工具/技能/记忆）`"
+          >
+            <AppIcon name="cpu" :size="10" />
+            <span>本会话输出</span>
+            <b>{{ formatExact(chat.sessionTokens.output) }} tok</b>
+            <em>·</em>
+            <span>当前上下文</span>
+            <b>{{ formatExact(chat.sessionTokens.input) }} tok</b>
+            <em v-if="chat.sessionTokens.rounds">· {{ chat.sessionTokens.rounds }} 轮</em>
+          </div>
         </footer>
       </section>
 
@@ -615,14 +806,17 @@ function submit() {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex: none;
 }
 
 .status-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: none;
   padding: 4px 11px;
   font-size: 11px;
+  white-space: nowrap;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: rgba(16, 32, 64, 0.5);
@@ -658,17 +852,21 @@ function submit() {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex: none;
 }
 
 .demo-toggle em {
   font-style: normal;
   font-size: 11.5px;
+  white-space: nowrap;
   color: var(--text-2);
 }
 
 .chip {
+  flex: none;
   padding: 4px 10px;
   font-size: 10.5px;
+  white-space: nowrap;
   color: var(--text-2);
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -679,8 +877,10 @@ function submit() {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  flex: none;
   padding: 6px 12px;
   font-size: 12px;
+  white-space: nowrap;
   color: var(--text-2);
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -796,6 +996,7 @@ function submit() {
 }
 
 .bubble {
+  position: relative;
   max-width: 72%;
   padding: 10px 14px;
   font-size: 13px;
@@ -803,6 +1004,101 @@ function submit() {
   border-radius: 14px;
   white-space: pre-wrap;
   word-break: break-word;
+  transition: box-shadow 0.25s ease, border-color 0.25s ease;
+}
+
+/* 悬停气泡时泛起星尘辉光 */
+.bubble:hover {
+  box-shadow:
+    0 0 22px rgba(63, 122, 255, 0.18),
+    0 0 6px rgba(53, 224, 255, 0.22);
+}
+
+/* 气泡 + 下方 meta 行的纵向容器 */
+.msg-col {
+  display: flex;
+  flex-direction: column;
+  max-width: 72%;
+  min-width: 0;
+}
+
+.msg-col.user {
+  align-items: flex-end;
+}
+
+.msg-col.ai {
+  align-items: flex-start;
+}
+
+.msg-col .bubble {
+  max-width: 100%;
+}
+
+/* 气泡正下方：复制按钮 / Token 消耗 */
+.msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.copy-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(8, 18, 38, 0.55);
+  transition: all 0.18s;
+}
+
+.copy-mini:hover {
+  color: var(--accent-cyan);
+  border-color: rgba(53, 224, 255, 0.45);
+  box-shadow: 0 0 12px rgba(53, 224, 255, 0.28);
+}
+
+.copy-mini.copied {
+  color: var(--green);
+  border-color: rgba(61, 220, 132, 0.5);
+  box-shadow: 0 0 12px rgba(61, 220, 132, 0.3);
+}
+
+/* 发送栏底部居中：本会话统计 */
+.session-usage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  align-self: center;
+  padding: 2px 12px;
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(8, 18, 38, 0.5);
+}
+
+.session-usage :deep(svg) {
+  color: var(--accent-cyan);
+}
+
+.session-usage b {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  background: linear-gradient(100deg, #dff3ff, #7cc4ff 55%, #35e0ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.session-usage em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
 }
 
 .ai-bubble {
@@ -835,12 +1131,54 @@ function submit() {
   50% { opacity: 0; }
 }
 
-.thinking-bubble {
-  display: inline-flex;
+.thinking-trace {
+  display: flex;
   align-items: center;
-  gap: 5px;
-  color: var(--text-2);
-  font-size: 12px;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  color: var(--text-3);
+  border: 1px dashed var(--line);
+  border-radius: 9px;
+  background: transparent;
+}
+
+.tt-icon {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 6px;
+  color: var(--accent-cyan);
+  background: rgba(79, 140, 255, 0.1);
+  animation: tt-glow 1.4s ease-in-out infinite;
+}
+
+@keyframes tt-glow {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+
+.tt-tag {
+  flex: none;
+  padding: 1px 6px;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  color: var(--accent-cyan);
+  border: 1px solid rgba(53, 224, 255, 0.25);
+  border-radius: 999px;
+}
+
+.tt-text {
+  flex: 1;
+  font-size: 11.5px;
+}
+
+.tt-dots {
+  display: inline-flex;
+  gap: 4px;
+  flex: none;
 }
 
 .s-dot {
@@ -1199,5 +1537,33 @@ function submit() {
 .slide-leave-to {
   opacity: 0;
   transform: translateX(16px);
+}
+
+/* 轮次提醒卡：固定顶部居中，渐显下浮 / 渐隐上收 */
+.toast-slot {
+  position: fixed;
+  top: calc(var(--topbar-h) + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 80;
+  width: min(720px, calc(100vw - 36px));
+}
+
+.toast-enter-active {
+  transition: opacity 0.45s ease, transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.toast-leave-active {
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+
+.toast-enter-from {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-18px) scale(0.97);
+}
+
+.toast-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-10px);
 }
 </style>

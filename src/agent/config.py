@@ -99,6 +99,19 @@ def reload_model_config() -> None:
     _MAIN_MODEL = None
     _SUMMARY_MODEL = None
 
+
+# ============================================================
+# 上下文窗口监控与轨迹记录
+# ============================================================
+# 模型上下文窗口上限（tokens）。只用于监控和占比展示，不影响模型调用本身；
+# 不同模型可按需通过环境变量覆盖。
+MODEL_CONTEXT_LIMIT = int(os.getenv("HARNESS_MODEL_CONTEXT_LIMIT", "128000"))
+# 上下文占用告警阈值（0~1）；只写日志，不改变 Agent 状态。
+CONTEXT_ALERT_THRESHOLD = float(os.getenv("HARNESS_CONTEXT_ALERT_THRESHOLD", "0.85"))
+# 轨迹事件中单字段（参数 / 结果 / 模型输出）最大保留字符数，防止 Store 行膨胀。
+TRAJECTORY_MAX_TEXT = int(os.getenv("HARNESS_TRAJECTORY_MAX_TEXT", "4000"))
+
+
 # ============================================================
 # Agent 运行保护
 # ============================================================

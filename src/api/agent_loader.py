@@ -32,6 +32,8 @@ from agent.config import (
 )
 from agent.history_reader import ThreadHistoryReader
 from agent.schema import AsyncTaskBinding, UserGroup
+from agent.trajectory_store import delete_trajectory, list_trajectory_events
+from agent.usage_store import delete_usage, read_usage
 
 
 logger = logging.getLogger(__name__)
@@ -274,6 +276,24 @@ class AgentLoader:
         assert self._history_reader is not None
         return await self._history_reader.get_state(thread_id)
 
+    async def list_trajectory(
+        self, user_id: str, thread_id: str,
+    ) -> list[dict[str, Any]]:
+        """读取某个会话的轨迹事件，供 /trajectory 接口聚合。"""
+        await self.initialize()
+        assert self._store is not None
+        return await list_trajectory_events(
+            self._store,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+
+    async def get_thread_usage(self, user_id: str, thread_id: str) -> dict[str, Any]:
+        """读取会话 Token 统计：逐轮明细 + 累计值（由 TokenUsageMiddleware 写入）。"""
+        await self.initialize()
+        assert self._store is not None
+        return await read_usage(self._store, user_id=user_id, thread_id=thread_id)
+
     async def bind_async_task(
         self,
         task_id: str,
@@ -396,6 +416,9 @@ class AgentLoader:
         # 先删除正文 checkpoint，再删除索引，避免侧边栏指向不存在的会话。
         await self._checkpointer.adelete_thread(thread_id)
         await self._store.adelete((*SESSION_NAMESPACE_PREFIX, user_id), thread_id)
+        # 轨迹与 checkpoint 同生命周期，会话删除后不再保留过程记录。
+        await delete_trajectory(self._store, user_id=user_id, thread_id=thread_id)
+        await delete_usage(self._store, user_id=user_id, thread_id=thread_id)
         group = self._user_groups.get(user_id)
         if group is not None:
             group.thread_ids.discard(thread_id)

@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
+from agent.config import MAIN_AGENT_MODEL_RUN_LIMIT
 from agent.schema import (
     ChatRequest,
     ChatResponse,
@@ -38,6 +39,7 @@ from api.context import router as context_router
 from api.files import router as files_router
 from api.history import router as history_router
 from api.settings import router as settings_router
+from api.trajectory import router as trajectory_router
 from api.message_utils import (
     content_to_text,
     make_session_title,
@@ -258,7 +260,11 @@ async def _run_chat_unlocked(request: ChatRequest, thread_id: str) -> ChatRespon
         user_id=request.user_id,
         username=username,
     )
-    context = HarnessContext(user_id=request.user_id, username=username)
+    context = HarnessContext(
+        user_id=request.user_id,
+        username=username,
+        thread_id=thread_id,
+    )
 
     try:
         # 有附件时组装成多模态内容块（文本 + 图片 + 文档抽取文本）。
@@ -401,7 +407,11 @@ async def _stream_response_unlocked(
             user_id=request.user_id,
             username=username,
         )
-        context = HarnessContext(user_id=request.user_id, username=username)
+        context = HarnessContext(
+            user_id=request.user_id,
+            username=username,
+            thread_id=thread_id,
+        )
         # 必须使用异步流式调用：MCP StructuredTool 不支持同步 invoke/stream。
         # values 流用于捕获 interrupt；同时订阅子图以保证审批和补充信息能冒泡，
         # 但普通子 Agent 事件仅是内部执行细节，不发送给用户界面。
@@ -550,6 +560,10 @@ async def _stream_response_unlocked(
             yield _create_sse_message(event)
         for tool_call_id in pending_tool_ids:
             yield _create_sse_message({"type": "tool_end", "tool_call_id": tool_call_id})
+        # Token 统计唯一数据源是 TokenUsageMiddleware 写入的 Store：
+        # rounds 最后一条 = 本轮最终回答的消耗；session = 会话累计。
+        usage_data = await agent_loader.get_thread_usage(request.user_id, thread_id)
+        rounds = usage_data.get("rounds", [])
         yield _create_sse_message(
             {
                 "type": "done",
@@ -558,6 +572,9 @@ async def _stream_response_unlocked(
                 "username": username,
                 "content": "".join(answer_parts),
                 "interrupted": bool(pending_interrupts),
+                "usage": rounds[-1] if rounds else {},
+                "session_usage": usage_data.get("session", {}),
+                "round_limit": MAIN_AGENT_MODEL_RUN_LIMIT,
             }
         )
     except Exception as exc:
@@ -627,3 +644,4 @@ app.include_router(async_tasks_router)
 app.include_router(settings_router)
 app.include_router(files_router)
 app.include_router(context_router)
+app.include_router(trajectory_router)
