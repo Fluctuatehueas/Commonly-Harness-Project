@@ -225,6 +225,7 @@ class AgentLoader:
         now = datetime.now(timezone.utc).isoformat()
         value = dict(existing.value) if existing is not None else {}
         existing_title = value.get("title")
+        value.setdefault("pinned", False)
         value.update(
             {
                 "thread_id": thread_id,
@@ -249,11 +250,38 @@ class AgentLoader:
             limit=1_000,
         )
         sessions = [dict(item.value) for item in items]
+        # 置顶优先；组内按最后消息时间倒序。
         return sorted(
             sessions,
-            key=lambda session: session.get("updated_at", ""),
+            key=lambda session: (
+                bool(session.get("pinned")),
+                session.get("updated_at", ""),
+            ),
             reverse=True,
         )
+
+    async def update_session(
+        self,
+        user_id: str,
+        thread_id: str,
+        *,
+        title: str | None = None,
+        pinned: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """更新会话标题 / 置顶状态；只改元数据，不动消息与 updated_at。"""
+        await self.initialize()
+        assert self._store is not None
+        namespace = (*SESSION_NAMESPACE_PREFIX, user_id)
+        item = await self._store.aget(namespace, thread_id)
+        if item is None:
+            return None
+        value = dict(item.value)
+        if title is not None:
+            value["title"] = title
+        if pinned is not None:
+            value["pinned"] = bool(pinned)
+        await self._store.aput(namespace, thread_id, value, index=False)
+        return value
 
     async def get_session(
         self, user_id: str, thread_id: str,

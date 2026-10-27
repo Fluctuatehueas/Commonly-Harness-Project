@@ -9,6 +9,7 @@ export interface SessionItem {
   created_at: string
   updated_at: string
   message_count: number
+  pinned: boolean
 }
 
 export const USER_ID = 'console_user'
@@ -38,6 +39,14 @@ export const useSessionStore = defineStore('sessions', () => {
     waitingThreads.value = new Set(set)
   }
 
+  // 置顶优先，组内按最后消息时间倒序
+  function sortSessions() {
+    sessions.value = [...sessions.value].sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1
+      return String(b.updated_at).localeCompare(String(a.updated_at))
+    })
+  }
+
   async function refresh() {
     loading.value = true
     try {
@@ -46,7 +55,11 @@ export const useSessionStore = defineStore('sessions', () => {
       })
       if (!res.ok) throw new Error(String(res.status))
       const data = (await res.json()) as { sessions: SessionItem[] }
-      sessions.value = data.sessions
+      sessions.value = data.sessions.map((item) => ({
+        ...item,
+        pinned: Boolean(item.pinned),
+      }))
+      sortSessions()
       offline.value = false
     } catch {
       offline.value = true
@@ -60,11 +73,52 @@ export const useSessionStore = defineStore('sessions', () => {
       const res = await fetch(`${API_BASE}/history?user_id=${USER_ID}`, { method: 'POST' })
       if (!res.ok) return null
       const session = (await res.json()) as SessionItem
-      sessions.value.unshift(session)
+      sessions.value.unshift({ ...session, pinned: Boolean(session.pinned) })
+      sortSessions()
       return session.thread_id
     } catch {
       return null
     }
+  }
+
+  async function patchSession(
+    threadId: string,
+    body: { title?: string; pinned?: boolean },
+  ): Promise<boolean> {
+    try {
+      const res = await fetch(
+        `${API_BASE}/history/${threadId}?user_id=${USER_ID}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+      if (!res.ok) return false
+      const updated = (await res.json()) as SessionItem
+      const index = sessions.value.findIndex((item) => item.thread_id === threadId)
+      if (index >= 0) {
+        sessions.value[index] = {
+          ...sessions.value[index]!,
+          ...updated,
+          pinned: Boolean(updated.pinned),
+        }
+      }
+      sortSessions()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function renameSession(threadId: string, title: string): Promise<boolean> {
+    const value = title.trim()
+    if (!value) return false
+    return patchSession(threadId, { title: value })
+  }
+
+  async function setPinned(threadId: string, pinned: boolean): Promise<boolean> {
+    return patchSession(threadId, { pinned })
   }
 
   async function removeSession(threadId: string) {
@@ -87,6 +141,8 @@ export const useSessionStore = defineStore('sessions', () => {
     refresh,
     createSession,
     removeSession,
+    renameSession,
+    setPinned,
     markRunning,
     markWaiting,
   }

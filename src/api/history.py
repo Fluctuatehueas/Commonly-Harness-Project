@@ -20,6 +20,7 @@ from agent.schema import (
     Session,
     SessionListResponse,
     SessionMessagesResponse,
+    SessionUpdateRequest,
 )
 from agent.tools.async_sandbox_tools import START_ASYNC_TASK_TOOL_NAME
 from api.agent_loader import agent_loader
@@ -222,6 +223,7 @@ def _session_from_index(item: dict[str, Any], message_count: int) -> Session:
         created_at=datetime.fromisoformat(item["created_at"]),
         updated_at=datetime.fromisoformat(item["updated_at"]),
         message_count=message_count,
+        pinned=bool(item.get("pinned", False)),
     )
 
 
@@ -287,6 +289,29 @@ async def get_session_messages(
         ),
         session_usage=usage_data.get("session", {}),
     )
+
+
+@router.patch("/{thread_id}", response_model=Session)
+async def update_session(
+    thread_id: str,
+    body: SessionUpdateRequest,
+    user_id: str = Query("anonymous", min_length=1),
+) -> Session:
+    """重命名会话或切换置顶状态。"""
+    if await agent_loader.get_session(user_id, thread_id) is None:
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    title = body.title.strip() if isinstance(body.title, str) else None
+    if title is not None and not title:
+        raise HTTPException(status_code=422, detail="标题不能为空")
+    updated = await agent_loader.update_session(
+        user_id,
+        thread_id,
+        title=title,
+        pinned=body.pinned,
+    )
+    assert updated is not None
+    messages = await agent_loader.get_thread_messages(thread_id)
+    return _session_from_index(updated, message_count=len(serialize_messages(messages)))
 
 
 @router.delete("/{thread_id}", response_model=DeleteSessionResponse)

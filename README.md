@@ -54,7 +54,7 @@ docker run -d --name harness-postgres
  -p 5432:5432 
  -v harness_pgdata:/var/lib/postgresql/data 
  postgres:16
-
+docker run -d --name harness-postgres -e POSTGRES_USER=fluctuate_user -e POSTGRES_PASSWORD=123456 -e POSTGRES_DB=fluctuate_db -p 5432:5432 -v harness_pgdata:/var/lib/postgresql/data postgres:16
 ```
 ---
 
@@ -958,10 +958,13 @@ servers:
 | GET | `/history` | 会话列表 | 否 |
 | GET | `/history/{thread_id}/messages` | 会话消息与待处理中断 | 否 |
 | DELETE | `/history/{thread_id}` | 删除会话 | 否 |
+| PATCH | `/history/{thread_id}` | 重命名 / 置顶会话，JSON `{"title": "...", "pinned": true}` | 否 |
 | GET | `/trajectory/{thread_id}` | 读取会话轨迹（按 run 聚合） | 否 |
 | GET | `/async-tasks/{task_id}` | 查询异步任务并回写结果 | 否 |
 | GET | `/settings/model` | 读取当前模型配置（API Key 只回传是否已设置） | 否 |
 | PUT | `/settings/model` | 更新 .env 并热更新模型（api_key 留空则保留原值） | 否 |
+
+> 会话元数据（title / pinned）保存在 PostgreSQL Store 的 `("sessions", user_id)` 命名空间；`GET /history` 返回时置顶优先、组内按 `updated_at` 倒序。控制台前端按 thread 维护独立的 SSE 缓冲区，切换会话不会 abort 正在运行的任务；只有关闭浏览器标签页或显式“停止”才会断开连接并终止该 run。若需要浏览器关闭后仍继续执行，请使用 `start_async_task`（Agent Protocol）而不是普通 SSE。
 
 #### 3. `POST /chat` 非流式对话
 

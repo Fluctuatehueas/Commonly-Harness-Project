@@ -142,6 +142,16 @@ class Session(BaseModel):
     created_at: datetime = Field(..., description="会话创建时间")
     updated_at: datetime = Field(..., description="最后一次消息写入时间")
     message_count: int = Field(0, ge=0, description="会话中的展示消息数")
+    pinned: bool = Field(False, description="是否置顶")
+
+
+class SessionUpdateRequest(BaseModel):
+    """会话重命名 / 置顶请求；None 表示不修改该字段。"""
+
+    title: Optional[str] = Field(
+        None, min_length=1, max_length=120, description="新的会话标题"
+    )
+    pinned: Optional[bool] = Field(None, description="是否置顶")
 
 
 class SessionListResponse(BaseModel):

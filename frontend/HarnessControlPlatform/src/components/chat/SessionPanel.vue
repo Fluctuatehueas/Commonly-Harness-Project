@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// 会话栏：从后端读取会话列表，切换/新建/删除，运行中与等待介入动画
+// 会话栏：读取会话列表，支持切换/新建/重命名/置顶/删除
+import { nextTick, ref } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
-import { useSessionStore } from '@/stores/sessions'
+import { useSessionStore, type SessionItem } from '@/stores/sessions'
 
 const sessions = useSessionStore()
 
@@ -9,7 +10,12 @@ const emit = defineEmits<{
   select: [threadId: string]
   create: []
   remove: [threadId: string]
+  rename: [threadId: string, title: string]
+  pin: [threadId: string, pinned: boolean]
 }>()
+
+const editingId = ref<string | null>(null)
+const editTitle = ref('')
 
 function fmtTime(iso: string) {
   try {
@@ -20,6 +26,29 @@ function fmtTime(iso: string) {
     return `${d.getMonth() + 1}/${d.getDate()}`
   } catch {
     return ''
+  }
+}
+
+async function startRename(session: SessionItem) {
+  editingId.value = session.thread_id
+  editTitle.value = session.title || '新会话'
+  await nextTick()
+  const input = document.querySelector<HTMLInputElement>('.rename-input')
+  input?.focus()
+  input?.select()
+}
+
+function cancelRename() {
+  editingId.value = null
+}
+
+function commitRename(session: SessionItem) {
+  // blur 与 Enter 可能同时触发，用 editingId 保证只提交一次
+  if (editingId.value !== session.thread_id) return
+  const title = editTitle.value.trim()
+  editingId.value = null
+  if (title && title !== session.title) {
+    emit('rename', session.thread_id, title)
   }
 }
 </script>
@@ -50,32 +79,72 @@ function fmtTime(iso: string) {
         v-for="s in sessions.sessions"
         :key="s.thread_id"
         class="session-item"
-        :class="{ active: sessions.activeThreadId === s.thread_id }"
+        :class="{
+          active: sessions.activeThreadId === s.thread_id,
+          running: sessions.runningThreads.has(s.thread_id),
+        }"
         role="button"
         tabindex="0"
         @click="emit('select', s.thread_id)"
         @keydown.enter="emit('select', s.thread_id)"
       >
-        <span class="s-icon" :class="{ running: sessions.runningThreads.has(s.thread_id) }">
-          <AppIcon :name="sessions.runningThreads.has(s.thread_id) ? 'play' : 'message'" :size="13" />
+        <!-- 左侧固定占位：仅置顶会话展示 Pin，其余保持空白但不塌陷 -->
+        <span class="s-slot" aria-hidden="true">
+          <AppIcon v-if="s.pinned" name="pin" :size="12" />
         </span>
+
         <div class="s-meta">
-          <strong>{{ s.title || '新会话' }}</strong>
-          <span>{{ fmtTime(s.updated_at) }} · {{ s.message_count }} 条</span>
+          <input
+            v-if="editingId === s.thread_id"
+            v-model="editTitle"
+            class="rename-input"
+            type="text"
+            maxlength="120"
+            @click.stop
+            @keydown.enter.stop.prevent="commitRename(s)"
+            @keydown.esc.stop.prevent="cancelRename"
+            @blur="commitRename(s)"
+          />
+          <strong v-else>{{ s.title || '新会话' }}</strong>
+          <span>
+            <i v-if="sessions.runningThreads.has(s.thread_id)" class="run-dot"></i>
+            {{ fmtTime(s.updated_at) }} · {{ s.message_count }} 条
+          </span>
         </div>
+
         <span
           v-if="sessions.waitingThreads.has(s.thread_id)"
           class="wait-tag"
           title="等待人工介入"
         ><i class="dot"></i></span>
-        <button
-          class="del"
-          type="button"
-          title="删除会话"
-          @click.stop="emit('remove', s.thread_id)"
-        >
-          <AppIcon name="close" :size="11" />
-        </button>
+
+        <div class="s-actions">
+          <button
+            class="act"
+            type="button"
+            title="重命名"
+            @click.stop="startRename(s)"
+          >
+            <AppIcon name="edit" :size="11" />
+          </button>
+          <button
+            class="act"
+            type="button"
+            :title="s.pinned ? '取消置顶' : '置顶会话'"
+            :class="{ pinned: s.pinned }"
+            @click.stop="emit('pin', s.thread_id, !s.pinned)"
+          >
+            <AppIcon :name="s.pinned ? 'unpin' : 'pin'" :size="11" />
+          </button>
+          <button
+            class="act del"
+            type="button"
+            title="删除会话"
+            @click.stop="emit('remove', s.thread_id)"
+          >
+            <AppIcon name="close" :size="11" />
+          </button>
+        </div>
       </div>
     </div>
   </aside>
@@ -163,8 +232,8 @@ function fmtTime(iso: string) {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 9px 10px;
+  gap: 7px;
+  padding: 8px 8px 8px 6px;
   border: 1px solid transparent;
   border-radius: 10px;
   cursor: pointer;
@@ -180,26 +249,26 @@ function fmtTime(iso: string) {
   background: rgba(47, 100, 200, 0.16);
 }
 
-.s-icon {
+/* 运行中：边框呼吸，不再用左侧图标表达 */
+.session-item.running {
+  border-color: rgba(53, 224, 255, 0.3);
+  box-shadow: inset 0 0 14px rgba(53, 224, 255, 0.08);
+  animation: running-glow 1.6s ease-in-out infinite;
+}
+
+@keyframes running-glow {
+  0%, 100% { box-shadow: inset 0 0 10px rgba(53, 224, 255, 0.06); }
+  50% { box-shadow: inset 0 0 18px rgba(53, 224, 255, 0.16); }
+}
+
+/* 固定占位：置顶显示 Pin，其余完全空白 */
+.s-slot {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  color: var(--text-2);
-  background: rgba(20, 38, 74, 0.6);
+  width: 16px;
+  height: 24px;
   flex: none;
-}
-
-/* 运行中：图标呼吸 + 旋转描边 */
-.s-icon.running {
   color: var(--accent-cyan);
-  animation: pulse 1.1s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(53, 224, 255, 0.5); }
-  50% { box-shadow: 0 0 0 5px rgba(53, 224, 255, 0); }
 }
 
 .s-meta {
@@ -219,8 +288,42 @@ function fmtTime(iso: string) {
 }
 
 .s-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
   font-size: 10.5px;
   color: var(--text-3);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.run-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  box-shadow: 0 0 6px var(--accent-cyan);
+  animation: dot-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.rename-input {
+  width: 100%;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text-1);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: rgba(6, 13, 28, 0.9);
+  outline: none;
 }
 
 .wait-tag .dot {
@@ -230,23 +333,55 @@ function fmtTime(iso: string) {
   border-radius: 50%;
   background: var(--amber);
   box-shadow: 0 0 7px var(--amber);
-  animation: pulse 1.4s infinite;
+  animation: dot-pulse 1.4s infinite;
 }
 
-.del {
-  display: none;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  border: none;
-  border-radius: 6px;
-  color: var(--text-3);
-  background: transparent;
+/* 右侧操作区：透明背景，低透明度常驻，悬停提亮 */
+.s-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
   flex: none;
 }
 
-.session-item:hover .del {
+.act {
   display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: var(--text-3);
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  opacity: 0.55;
+  transition: all 0.15s;
+}
+
+/* 删除按钮默认不占位，仅悬停/选中时出现 */
+.del {
+  display: none;
+}
+
+.session-item:hover .act,
+.session-item.active .act,
+.act.pinned {
+  opacity: 1;
+}
+
+.session-item:hover .del,
+.session-item.active .del {
+  display: grid;
+  opacity: 1;
+}
+
+.act:hover {
+  color: var(--accent-cyan);
+  background: rgba(53, 224, 255, 0.12);
+}
+
+.act.pinned {
+  color: var(--accent-cyan);
 }
 
 .del:hover {

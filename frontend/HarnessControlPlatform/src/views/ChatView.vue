@@ -204,9 +204,11 @@ interface HistoryMessage {
 }
 
 async function selectSession(threadId: string) {
-  if (sessions.activeThreadId === threadId) return
   clearPending()
   sessions.activeThreadId = threadId
+  chat.activateThread(threadId)
+  // 后台仍在运行的会话：保留实时缓冲，不能用 checkpoint 历史覆盖
+  if (chat.isThreadSending(threadId)) return
   try {
     const res = await fetch(
       `${API_BASE}/history/${threadId}/messages?user_id=${USER_ID}`,
@@ -215,7 +217,7 @@ async function selectSession(threadId: string) {
     const data = (await res.json()) as {
       messages: HistoryMessage[]
       interrupt: Record<string, unknown> | null
-      session_usage?: { input: number; output: number; total: number }
+      session_usage?: { input: number; output: number; total: number; rounds?: number }
     }
     const msgs: ChatMsg[] = data.messages.map((m, i) => {
       if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content }
@@ -249,54 +251,79 @@ async function selectSession(threadId: string) {
     chat.loadHistory(msgs, threadId, data.session_usage ?? null)
     fileRefreshKey.value++
   } catch {
-    chat.newChat()
+    chat.activateThread(threadId)
   }
 }
 
 async function createSession() {
   clearPending()
   const id = await sessions.createSession()
+  if (!id) {
+    sessions.activeThreadId = null
+    chat.newChat()
+    return
+  }
   sessions.activeThreadId = id
-  chat.newChat()
+  chat.activateThread(id)
   fileRefreshKey.value++
 }
 
 async function removeSession(threadId: string) {
   await sessions.removeSession(threadId)
+  chat.releaseThread(threadId)
   if (sessions.activeThreadId === threadId) {
     sessions.activeThreadId = null
-    chat.newChat()
   }
 }
 
-// 运行中 / 等待介入 标识同步到会话栏
+async function renameSession(threadId: string, title: string) {
+  await sessions.renameSession(threadId, title)
+}
+
+async function togglePin(threadId: string, pinned: boolean) {
+  await sessions.setPinned(threadId, pinned)
+}
+
+// 运行中 / 等待介入 标识按 thread 同步到会话栏
 watch(
-  () => [chat.sending, sessions.activeThreadId, chat.threadId] as const,
-  ([sending, active, tid]) => {
-    const key = sending ? active || tid : null
-    if (sending && key) sessions.markRunning(key, true)
-    if (!sending) {
-      if (active) sessions.markRunning(active, false)
-      if (tid) sessions.markRunning(tid, false)
-    }
+  () => chat.runningThreadIds,
+  (ids) => {
+    const next = new Set(ids)
+    Array.from(sessions.runningThreads).forEach((tid) => {
+      if (!next.has(tid)) sessions.markRunning(tid, false)
+    })
+    ids.forEach((tid) => sessions.markRunning(tid, true))
   },
+  { immediate: true },
 )
 
 watch(
-  () => [chat.pendingInterrupt, sessions.activeThreadId] as const,
-  ([interrupt, active]) => {
-    sessions.waitingThreads.forEach((t) => sessions.markWaiting(t, false))
-    if (interrupt && active) sessions.markWaiting(active, true)
+  () => chat.waitingThreadIds,
+  (ids) => {
+    const next = new Set(ids)
+    Array.from(sessions.waitingThreads).forEach((tid) => {
+      if (!next.has(tid)) sessions.markWaiting(tid, false)
+    })
+    ids.forEach((tid) => sessions.markWaiting(tid, true))
+  },
+  { immediate: true },
+)
+
+// 任意会话完成一轮后刷新列表（标题/条数）与当前文件面板
+watch(
+  () => chat.turnVersion,
+  () => {
+    if (backendOnline.value) void sessions.refresh()
+    fileRefreshKey.value++
   },
 )
 
-// 一轮结束后刷新会话列表（标题/条数）与文件面板
+// 新建会话 / 后台线程迁移后同步高亮
 watch(
-  () => chat.sending,
-  (now, prev) => {
-    if (prev && !now && backendOnline.value) {
-      void sessions.refresh()
-      fileRefreshKey.value++
+  () => chat.threadId,
+  (tid) => {
+    if (tid && sessions.sessions.some((item) => item.thread_id === tid)) {
+      sessions.activeThreadId = tid
     }
   },
 )
@@ -456,8 +483,18 @@ function newChatFromNotice() {
 
 watch(() => [chat.messages.length, shown.value.map((m) => (m.content || '') + (m.result || '') + (m.status || ''))], scrollBottom, { deep: true })
 
-function submit() {
+async function submit() {
   if (!draft.value.trim() && pendingFiles.value.length === 0) return
+  // 没有会话时先建一个，确保 SSE 请求始终带着确定的 thread_id
+  if (!chat.threadId && !chat.demoMode) {
+    const id = await sessions.createSession()
+    if (!id) {
+      uploadError.value = '无法创建会话，请检查后端连接'
+      return
+    }
+    sessions.activeThreadId = id
+    chat.activateThread(id)
+  }
   const files = pendingFiles.value
   chat.send(draft.value, files)
   draft.value = ''
@@ -498,6 +535,8 @@ function submit() {
         @select="selectSession"
         @create="createSession"
         @remove="removeSession"
+        @rename="renameSession"
+        @pin="togglePin"
       />
 
       <section class="panel chat">
