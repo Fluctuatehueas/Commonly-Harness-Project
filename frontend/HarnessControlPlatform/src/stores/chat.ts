@@ -12,11 +12,14 @@ export interface MessageTokens {
   output: number
   total: number
   rounds?: number
+  // 上下文窗口由后端返回，前端不再维护常量
+  contextWindow?: number
+  contextUsed?: number
 }
 
 export interface ChatMsg {
   id: string
-  kind: 'user' | 'assistant' | 'tool' | 'interrupt' | 'system'
+  kind: 'user' | 'assistant' | 'reasoning' | 'subagent' | 'tool' | 'interrupt' | 'system'
   content?: string
   attachments?: ContextFile[]
   streaming?: boolean
@@ -29,10 +32,16 @@ export interface ChatMsg {
   status?: 'calling' | 'done' | 'error'
   source?: string
   subagentName?: string
+  // 子 Agent 的推理/工具挂在委派节点下，按此 ID 组成轨迹树
+  parentToolCallId?: string
+  // 到达时间，用于轨迹树按时间戳排序与展示
+  at?: number
   interruptId?: string
   interruptType?: string
   payload?: Record<string, unknown>
   resolved?: 'answered' | 'approved' | 'rejected'
+  // 用户在 HITL 卡片里提交内容的简短摘要，卡片收起后用于轨迹树展示
+  resolution?: string
 }
 
 interface SseEvent {
@@ -47,6 +56,10 @@ interface ThreadChat {
   pendingInterrupt: ChatMsg | null
   controller: AbortController | null
   sessionTokens: MessageTokens | null
+  // 用户消息 ID -> 本轮耗时（后端 done.duration_ms）
+  turnDurations: Record<string, number>
+  // 当前进行中的用户轮次，用于回填耗时
+  activeTurnKey: string | null
 }
 
 const SKILL_TOOLS = new Set([
@@ -70,6 +83,49 @@ function categoryOf(name: string): ToolCategory {
 
 export { categoryOf }
 
+// HITL 提交内容压成一行，卡片收起后仍能在轨迹树里看到用户回答了什么。
+function summarizeResume(payload: Record<string, unknown>): string {
+  const text = typeof payload.text === 'string' ? payload.text.trim() : ''
+  if (text) return text.slice(0, 120)
+
+  const decision = typeof payload.decision === 'string' ? payload.decision : ''
+  if (decision) {
+    const reason = typeof payload.message === 'string' ? payload.message.trim() : ''
+    if (decision === 'reject') return `拒绝${reason ? `：${reason}` : ''}`.slice(0, 120)
+    if (decision === 'approve_thread') return '批准（仅本会话允许）'
+    return '批准（仅本次）'
+  }
+
+  const decisions = payload.decisions as
+    | { type?: string; message?: string }[]
+    | undefined
+  if (Array.isArray(decisions)) {
+    return decisions
+      .map((item) =>
+        item.type === 'reject'
+          ? `拒绝${item.message ? `：${item.message}` : ''}`
+          : '批准',
+      )
+      .join('、')
+      .slice(0, 120)
+  }
+
+  const parts: string[] = []
+  const values = payload.values as Record<string, unknown> | undefined
+  if (values && typeof values === 'object') {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === '' || value === null || value === undefined || value === false) continue
+      parts.push(`${key}=${Array.isArray(value) ? value.join('/') : String(value)}`)
+    }
+  }
+  const selected = payload.selected as string[] | undefined
+  if (Array.isArray(selected) && selected.length) parts.push(`选项=${selected.join('/')}`)
+  const freeText = typeof payload.free_text === 'string' ? payload.free_text.trim() : ''
+  if (freeText) parts.push(`补充=${freeText}`)
+  if (payload.cancelled) parts.push('已取消')
+  return parts.join('；').slice(0, 160)
+}
+
 export const useChatStore = defineStore('chat', () => {
   // threadId -> 独立会话状态。SSE 事件始终写入发起请求的那个 thread。
   const threads = ref<Record<string, ThreadChat>>({})
@@ -79,6 +135,8 @@ export const useChatStore = defineStore('chat', () => {
   const roundLimit = ref(50)
   // 每完成一轮自增，供侧边栏刷新标题/条数
   const turnVersion = ref(0)
+  // 最近完成一轮的 thread_id；后台会话完成时也能定位到正确文件域
+  const lastTurnThreadId = ref<string | null>(null)
 
   let pendingDemoIndex = 0
 
@@ -90,6 +148,8 @@ export const useChatStore = defineStore('chat', () => {
       pendingInterrupt: null,
       controller: null,
       sessionTokens: null,
+      turnDurations: {},
+      activeTurnKey: null,
     }
   }
 
@@ -126,6 +186,7 @@ export const useChatStore = defineStore('chat', () => {
   const thinking = computed(() => current.value?.thinking ?? false)
   const pendingInterrupt = computed(() => current.value?.pendingInterrupt ?? null)
   const sessionTokens = computed(() => current.value?.sessionTokens ?? null)
+  const turnDurations = computed(() => current.value?.turnDurations ?? {})
   const isEmpty = computed(() => messages.value.length === 0)
 
   // 后台仍在运行的会话集合，供侧边栏动画使用
@@ -158,22 +219,47 @@ export const useChatStore = defineStore('chat', () => {
   // 单个 SSE 事件 → 指定 thread 的消息列表变更
   function handleEvent(evt: SseEvent, state: ThreadChat, key: string) {
     lastError.value = ''
-    switch (evt.type) {
-      case 'token': {
-        state.thinking = false
-        const last = state.messages[state.messages.length - 1]
-        if (last && last.kind === 'assistant' && last.streaming) {
-          last.content = (last.content || '') + String(evt.content || '')
-        } else {
-          state.messages.push({
-            id: uid('a'),
-            kind: 'assistant',
-            content: String(evt.content || ''),
-            streaming: true,
-          })
-        }
-        break
+
+    // 同一段流式内容在相邻 chunk 中增量拼接；切换来源或父节点时新建一条。
+    function appendDelta(kind: 'assistant' | 'reasoning' | 'subagent') {
+      state.thinking = false
+      const source = String(evt.source || 'main')
+      const parent = evt.parent_tool_call_id
+        ? String(evt.parent_tool_call_id)
+        : undefined
+      const text = String(evt.content || '')
+      const last = state.messages[state.messages.length - 1]
+      if (
+        last &&
+        last.kind === kind &&
+        last.streaming &&
+        last.source === source &&
+        last.parentToolCallId === parent
+      ) {
+        last.content = (last.content || '') + text
+        return
       }
+      state.messages.push({
+        id: uid(kind === 'assistant' ? 'a' : kind === 'reasoning' ? 'r' : 's'),
+        kind,
+        content: text,
+        streaming: true,
+        source,
+        parentToolCallId: parent,
+        at: Date.now(),
+      })
+    }
+
+    switch (evt.type) {
+      case 'token':
+        appendDelta('assistant')
+        break
+      case 'reasoning':
+        appendDelta('reasoning')
+        break
+      case 'subagent_token':
+        appendDelta('subagent')
+        break
       case 'tool_start': {
         state.thinking = false
         state.messages.push({
@@ -187,6 +273,10 @@ export const useChatStore = defineStore('chat', () => {
           status: 'calling',
           source: String(evt.source || 'main'),
           subagentName: evt.subagent_name ? String(evt.subagent_name) : undefined,
+          parentToolCallId: evt.parent_tool_call_id
+            ? String(evt.parent_tool_call_id)
+            : undefined,
+          at: Date.now(),
         })
         break
       }
@@ -216,6 +306,7 @@ export const useChatStore = defineStore('chat', () => {
           interruptId: evt.interrupt_id ? String(evt.interrupt_id) : undefined,
           interruptType: String(evt.interrupt_type || 'unknown'),
           payload: evt as Record<string, unknown>,
+          at: Date.now(),
         }
         state.messages.push(msg)
         state.pendingInterrupt = msg
@@ -242,14 +333,25 @@ export const useChatStore = defineStore('chat', () => {
             }
           }
         }
-        const session = evt.session_usage as Partial<MessageTokens> | undefined
+        const session = evt.session_usage as
+          | (Partial<MessageTokens> & {
+              context_window?: number
+              context_used?: number
+            })
+          | undefined
         if (session && typeof session.total === 'number') {
           state.sessionTokens = {
             input: session.input || 0,
             output: session.output || 0,
             total: session.total,
             rounds: session.rounds || 0,
+            contextWindow: session.context_window || 0,
+            contextUsed: session.context_used ?? session.input ?? 0,
           }
+        }
+        // 后端以服务端处理时间计算本轮耗时，折叠后只展示这一个数字。
+        if (typeof evt.duration_ms === 'number' && state.activeTurnKey) {
+          state.turnDurations[state.activeTurnKey] = evt.duration_ms
         }
         for (const message of state.messages) {
           if (message.streaming) message.streaming = false
@@ -257,7 +359,9 @@ export const useChatStore = defineStore('chat', () => {
         state.sending = false
         state.thinking = false
         state.controller = null
+        state.activeTurnKey = null
         if (!evt.interrupted) state.pendingInterrupt = null
+        lastTurnThreadId.value = realId || key
         turnVersion.value++
         break
       }
@@ -267,10 +371,15 @@ export const useChatStore = defineStore('chat', () => {
           id: uid('s'),
           kind: 'system',
           content: `⚠ ${lastError.value}`,
+          at: Date.now(),
         })
+        for (const message of state.messages) {
+          if (message.streaming) message.streaming = false
+        }
         state.sending = false
         state.thinking = false
         state.controller = null
+        state.activeTurnKey = null
         break
       }
     }
@@ -355,12 +464,15 @@ export const useChatStore = defineStore('chat', () => {
     const trimmed = text.trim()
     if (!trimmed && attachments.length === 0) return
     const message = trimmed || '请阅读我上传的附件，并简要说明内容。'
-    state.messages.push({
+    const userMsg: ChatMsg = {
       id: uid('u'),
       kind: 'user',
       content: trimmed,
       attachments,
-    })
+      at: Date.now(),
+    }
+    state.messages.push(userMsg)
+    state.activeTurnKey = userMsg.id
     state.sending = true
     state.thinking = true
 
@@ -392,9 +504,15 @@ export const useChatStore = defineStore('chat', () => {
     const state = key ? threads.value[key] : undefined
     if (!key || !state || state.pendingInterrupt !== interrupt) return
     interrupt.resolved = markAs
+    interrupt.resolution = summarizeResume(payload)
     state.pendingInterrupt = null
     state.sending = true
     state.thinking = true
+    // HITL 恢复仍属于同一用户轮次，耗时回填到该轮。
+    const lastUser = [...state.messages]
+      .reverse()
+      .find((message) => message.kind === 'user')
+    state.activeTurnKey = lastUser?.id || state.activeTurnKey
     if (demoMode.value) {
       void runDemoResume(state, key, markAs)
       return
@@ -415,6 +533,7 @@ export const useChatStore = defineStore('chat', () => {
     state.controller = null
     state.sending = false
     state.thinking = false
+    state.activeTurnKey = null
   }
 
   function newChat() {
@@ -440,6 +559,13 @@ export const useChatStore = defineStore('chat', () => {
     lastError.value = ''
   }
 
+  // 历史会话的每轮耗时要靠轨迹接口回填（实时轮次已由 done 事件带回）。
+  function setTurnDurations(tid: string, durations: Record<string, number>) {
+    const state = threads.value[tid]
+    if (!state) return
+    state.turnDurations = { ...state.turnDurations, ...durations }
+  }
+
   // ---------- 演示模式：脚本化 SSE 事件，覆盖全部卡片类型 ----------
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
   let demoSessionTokens: MessageTokens = { input: 0, output: 0, total: 0, rounds: 0 }
@@ -461,7 +587,12 @@ export const useChatStore = defineStore('chat', () => {
         content: '',
         interrupted,
         usage,
-        session_usage: { ...demoSessionTokens },
+        session_usage: {
+          ...demoSessionTokens,
+          context_window: 128000,
+          context_used: usage.input,
+        },
+        duration_ms: 2400,
       },
       state,
       key,
@@ -481,6 +612,11 @@ export const useChatStore = defineStore('chat', () => {
   async function runDemo(state: ThreadChat, key: string, userText: string) {
     await sleep(400)
     state.thinking = false
+    handleEvent(
+      { type: 'reasoning', content: '先确认偏好文件与可用工具，再给出结论。', source: 'main' },
+      state,
+      key,
+    )
     await typeOut(state, `收到「${userText.slice(0, 18)}」。我先读取你的偏好文件，再检索资料。`)
     handleEvent({ type: 'tool_start', tool_call_id: 'call-1', tool_name: 'read_file', source: 'main' }, state, key)
     await sleep(300)
@@ -506,7 +642,28 @@ export const useChatStore = defineStore('chat', () => {
     handleEvent({ type: 'tool_start', tool_call_id: 'call-4', tool_name: 'task', source: 'main', subagent_name: 'research_agent' }, state, key)
     await sleep(250)
     handleEvent({ type: 'tool_args', tool_call_id: 'call-4', args: '{"subagent_type": "research_agent", "description": "汇总检索结果并给出结构化结论"}', source: 'main' }, state, key)
-    await sleep(900)
+    handleEvent(
+      {
+        type: 'reasoning',
+        content: '检索结果里有三条可以合并的结论，我先按可信度排序。',
+        source: 'research_agent',
+        parent_tool_call_id: 'call-4',
+      },
+      state,
+      key,
+    )
+    await sleep(500)
+    handleEvent(
+      {
+        type: 'subagent_token',
+        content: '已核对三条来源，正在整理最终摘要。',
+        source: 'research_agent',
+        parent_tool_call_id: 'call-4',
+      },
+      state,
+      key,
+    )
+    await sleep(400)
     handleEvent({ type: 'tool_result', tool_call_id: 'call-4', tool_name: 'task', status: 'done', text: '子 Agent 报告：三条核心结论已生成，建议以 Markdown 输出。', source: 'research_agent' }, state, key)
     handleEvent({ type: 'tool_end', tool_call_id: 'call-4', status: 'done', source: 'main' }, state, key)
 
@@ -557,8 +714,10 @@ export const useChatStore = defineStore('chat', () => {
     lastError,
     roundLimit,
     sessionTokens,
+    turnDurations,
     isEmpty,
     turnVersion,
+    lastTurnThreadId,
     runningThreadIds,
     waitingThreadIds,
     activateThread,
@@ -569,5 +728,6 @@ export const useChatStore = defineStore('chat', () => {
     stop,
     newChat,
     loadHistory,
+    setTurnDurations,
   }
 })

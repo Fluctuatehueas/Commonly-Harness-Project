@@ -7,8 +7,8 @@ import { QUICK_ENTRIES } from '@/mock/dashboard'
 const router = useRouter()
 
 const ROUTES: Record<string, string> = {
-  chat: '/',
-  workflow: '/workflow',
+  chat: '/chat',
+  workflow: '/trajectory',
   models: '/models',
   plugins: '/plugins',
   kb: '/kb',

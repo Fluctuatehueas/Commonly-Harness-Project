@@ -18,7 +18,7 @@ const DEFAULTS: DisplayPrefs = {
   showToolCalls: true,
   showSkills: true,
   showDelegation: true,
-  showReasoning: false,
+  showReasoning: true,
   showAsyncTasks: true,
   expandToolArgs: false,
   typewriter: true,

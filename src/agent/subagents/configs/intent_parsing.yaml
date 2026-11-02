@@ -20,12 +20,9 @@ description: |
 # 空列表是合法的：本子 Agent 只依靠提示词完成翻译，不调用业务工具。
 tools: []
 
-# 硬性只读：禁止子 Agent 通过文件工具写入任何路径。
-# 由 main_agent 在加载时把字典转成 FilesystemPermission 数据类。
-permissions:
-  - operations: ["write"]
-    paths: ["/**"]
-    mode: deny
+# 硬性只读：在工具层拒绝写类与执行类工具。
+# 不用 permissions：路径级权限拦不住 execute 这类 shell 工具。
+deny_tools: ["write_file", "edit_file", "delete", "execute"]
 
 # 子 Agent 技能应放在 /skills/subagents/intent_parsing/ 下，
 # 并通过 skill-management 的 assign_skill 分配（需要沙箱）。

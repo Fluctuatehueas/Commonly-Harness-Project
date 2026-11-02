@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from contextlib import aclosing, asynccontextmanager
 from typing import Any, AsyncIterator
@@ -24,6 +25,12 @@ from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
 from agent.config import MAIN_AGENT_MODEL_RUN_LIMIT
+from agent.project_context import (
+    reset_project_context,
+    reset_project_thread,
+    set_project_context,
+    set_project_thread,
+)
 from agent.schema import (
     ChatRequest,
     ChatResponse,
@@ -36,15 +43,20 @@ from api.async_tasks import extract_async_task_id
 from api.async_tasks import router as async_tasks_router
 from api.context import build_user_content
 from api.context import router as context_router
-from api.files import router as files_router
 from api.history import router as history_router
+from api.history import sessions_router as history_sessions_router
 from api.settings import router as settings_router
 from api.trajectory import router as trajectory_router
+from api.skills import router as skills_router
+from api.mcp import router as mcp_router
+from api.projects import router as projects_router
+from api.session_files import router as session_files_router
 from api.message_utils import (
     content_to_text,
     make_session_title,
     serialize_interrupt as _serialize_interrupt,
 )
+from utils.integrity import integrity_hint, is_low_integrity, process_integrity
 
 
 logger = logging.getLogger(__name__)
@@ -90,9 +102,14 @@ async def index() -> dict[str, str]:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    """轻量存活探针；不触发数据库或沙箱操作。"""
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    """轻量存活探针；附带进程完整性级别，便于前端定位写入失败。"""
+    return {
+        "status": "ok",
+        "integrity": process_integrity(),
+        "low_integrity": is_low_integrity(),
+        "integrity_hint": integrity_hint(),
+    }
 
 
 def _extract_answer(result: Any) -> str:
@@ -169,6 +186,32 @@ def _get_tool_chunks(token: Any) -> list[dict[str, Any]]:
     """读取模型增量消息中的工具调用分片。"""
     tool_call_chunks = getattr(token, "tool_call_chunks", None) or []
     return [chunk for chunk in tool_call_chunks if isinstance(chunk, dict)]
+
+
+# 这些工具会启动子 Agent；其执行期间的事件应挂到本次委派节点下。
+DELEGATION_TOOL_NAMES = {"task", START_ASYNC_TASK_TOOL_NAME}
+
+
+def _get_reasoning_text(token: Any) -> str:
+    """读取模型增量消息中的推理内容。
+
+    DeepSeek / OpenAI 兼容端点通常把思考内容放在 ``additional_kwargs`` 的
+    ``reasoning_content``；部分实现会以结构化 reasoning 内容块返回。
+    """
+    additional = getattr(token, "additional_kwargs", None) or {}
+    if isinstance(additional, dict):
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            value = additional.get(key)
+            if value:
+                return str(value)
+    content = getattr(token, "content", None)
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") in {"reasoning", "thinking"}
+        )
+    return ""
 
 
 def _is_tool_result(token: Any) -> bool:
@@ -249,6 +292,21 @@ async def _run_chat(request: ChatRequest) -> ChatResponse:
 async def _run_chat_unlocked(request: ChatRequest, thread_id: str) -> ChatResponse:
     """执行一轮非流式对话，并返回标准化响应。"""
     username = request.username or request.user_id
+    # 本轮绑定的项目决定文件落点；Agent 图本身按用户缓存，不随项目重建。
+    project = await agent_loader.resolve_project(request.user_id, thread_id)
+    project_token = set_project_context(project)
+    thread_token = set_project_thread(thread_id)
+    try:
+        return await _run_chat_turn(request, thread_id, username)
+    finally:
+        reset_project_thread(thread_token)
+        reset_project_context(project_token)
+
+
+async def _run_chat_turn(
+    request: ChatRequest, thread_id: str, username: str,
+) -> ChatResponse:
+    """持有会话工作目录上下文执行一轮对话。"""
     agent = await agent_loader.get_agent_for_user(
         user_id=request.user_id,
         username=username,
@@ -329,6 +387,73 @@ async def chat(request: ChatRequest) -> ChatResponse:
     return await _run_chat(request)
 
 
+def _summarize_hitl_resume(payload: dict[str, Any]) -> tuple[str, str]:
+    """把用户提交的 HITL 内容压成（摘要, 结论），供轨迹页记录「人工回复」。
+
+    ``resume`` 的载荷有三种形态：审批 decisions、新版 hitl 表单、旧版 text。
+    这里只做展示用摘要，不参与实际恢复逻辑。
+    """
+    if not isinstance(payload, dict):
+        return "", "answered"
+
+    text = str(payload.get("text") or "").strip()
+    if text:
+        return text[:120], "answered"
+
+    # 宿主能力审批：{decision: approve|approve_thread|reject, message}
+    decision = str(payload.get("decision") or "").strip().lower()
+    if decision:
+        reason = str(payload.get("message") or "").strip()
+        if decision in {"reject", "rejected"}:
+            return (f"拒绝：{reason}" if reason else "拒绝执行")[:160], "rejected"
+        if decision in {"approve_thread", "approve_session", "remember", "allow_thread"}:
+            return "批准并加入本会话白名单", "approved"
+        return "批准执行", "approved"
+
+    decisions = payload.get("decisions")
+    if isinstance(decisions, list) and decisions:
+        rejected = [
+            item
+            for item in decisions
+            if isinstance(item, dict) and item.get("type") == "reject"
+        ]
+        if rejected:
+            reason = next(
+                (str(item.get("message") or "").strip() for item in rejected if item.get("message")),
+                "",
+            )
+            return (f"拒绝：{reason}" if reason else "拒绝执行")[:160], "rejected"
+        return "批准执行", "approved"
+
+    parts: list[str] = []
+    values = payload.get("values")
+    if isinstance(values, dict):
+        for key, value in values.items():
+            if value in ("", None, False) or value == []:
+                continue
+            rendered = "/".join(str(item) for item in value) if isinstance(value, list) else str(value)
+            parts.append(f"{key}={rendered}")
+    selected = payload.get("selected")
+    if isinstance(selected, list) and selected:
+        parts.append("选项=" + "/".join(str(item) for item in selected))
+    free_text = str(payload.get("free_text") or "").strip()
+    if free_text:
+        parts.append(f"补充={free_text}")
+    if payload.get("cancelled"):
+        parts.append("已取消")
+    status = "rejected" if payload.get("cancelled") else "answered"
+    return "；".join(parts)[:160], status
+
+
+def _attach_hitl_resume(context: HarnessContext, request: Any, is_resume: bool) -> None:
+    """恢复请求把用户回复写进上下文，轨迹中间件据此落一条 hitl 事件。"""
+    if not is_resume:
+        return
+    summary, status = _summarize_hitl_resume(getattr(request, "resume", None) or {})
+    context.hitl_summary = summary
+    context.hitl_status = status
+
+
 async def _stream_response(
     request: ChatRequest | ResumeChatRequest,
     *,
@@ -368,12 +493,18 @@ async def _stream_response_unlocked(
     确保恢复后仍能再次触发缺字段或审批中断，并沿用原始 checkpoint。
     """
     username = request.username or request.user_id
+    project_token = None
+    thread_token = None
 
+    # 一轮耗时以服务端处理时间为准，前端不再自行估算。
+    turn_started = time.monotonic()
     # 原始工具 ID 跨请求和 checkpoint 稳定，不能改成请求内随机展示 ID。
     # 仅用消息与分片索引关联后续不再携带 ID 的参数增量。
     tool_call_ids: dict[str, str] = {}
     tool_subagent_names: dict[str, str] = {}
     pending_tool_ids: set[str] = set()
+    # 当前正在执行的委派工具调用栈：子 Agent 的事件挂到栈顶的 task 节点下。
+    active_delegations: list[str] = []
     pending_interrupts: dict[str, dict[str, Any]] = {}
     answer_parts: list[str] = []
     assistant_message_id: str | None = None
@@ -397,6 +528,10 @@ async def _stream_response_unlocked(
                 thread_id,
                 make_session_title(request.message),
             )
+        # 会话索引已存在后解析项目；解析失败由 store 回落到默认项目。
+        project = await agent_loader.resolve_project(request.user_id, thread_id)
+        project_token = set_project_context(project)
+        thread_token = set_project_thread(thread_id)
         agent = await agent_loader.get_agent_for_user(
             user_id=request.user_id,
             username=username,
@@ -412,6 +547,7 @@ async def _stream_response_unlocked(
             username=username,
             thread_id=thread_id,
         )
+        _attach_hitl_resume(context, request, is_resume)
         # 必须使用异步流式调用：MCP StructuredTool 不支持同步 invoke/stream。
         # values 流用于捕获 interrupt；同时订阅子图以保证审批和补充信息能冒泡，
         # 但普通子 Agent 事件仅是内部执行细节，不发送给用户界面。
@@ -441,10 +577,31 @@ async def _stream_response_unlocked(
             if _is_internal_middleware_stream(metadata):
                 continue
             source = _get_stream_source(chunk, metadata)
-            if _is_subagent_stream(source):
-                continue
+            # 子 Agent 的事件不再丢弃：推理与工具过程要挂到委派节点下展示，
+            # 但其正文不算主 Agent 的最终回答。
+            is_subagent = _is_subagent_stream(source)
+            parent_tool_call_id = (
+                active_delegations[-1]
+                if is_subagent and active_delegations
+                else ""
+            )
             message_id = str(getattr(token, "id", None) or uuid.uuid4())
             tool_chunks = _get_tool_chunks(token)
+
+            # 推理内容与正文可能出现在同一个分片里，必须先发送再处理正文。
+            reasoning = _get_reasoning_text(token)
+            if reasoning:
+                if assistant_message_id is None:
+                    assistant_message_id = f"assistant-{uuid.uuid4()}"
+                yield _create_sse_message(
+                    {
+                        "type": "reasoning",
+                        "message_id": assistant_message_id,
+                        "content": reasoning,
+                        "source": source,
+                        "parent_tool_call_id": parent_tool_call_id,
+                    }
+                )
 
             for tool_chunk in tool_chunks:
                 assistant_message_id = None
@@ -460,12 +617,16 @@ async def _stream_response_unlocked(
                         "tool_call_id": tool_call_id,
                         "tool_name": tool_name,
                         "source": source,
+                        "parent_tool_call_id": parent_tool_call_id,
                     }
                     subagent_name = _get_subagent_name(args)
                     if subagent_name:
                         tool_subagent_names[tool_call_id] = subagent_name
                         start_event["subagent_name"] = subagent_name
                     yield _create_sse_message(start_event)
+                    # 委派工具开启一个子 Agent 执行窗口，后续子图事件都挂到它下面。
+                    if tool_name in DELEGATION_TOOL_NAMES:
+                        active_delegations.append(tool_call_id)
 
                 if args:
                     args_text = _serialize_tool_args(args)
@@ -474,6 +635,7 @@ async def _stream_response_unlocked(
                         "tool_call_id": tool_call_id,
                         "args": args_text,
                         "source": source,
+                        "parent_tool_call_id": parent_tool_call_id,
                     }
                     subagent_name = _get_subagent_name(args)
                     if subagent_name:
@@ -491,6 +653,14 @@ async def _stream_response_unlocked(
                 tool_status = "error" if getattr(token, "status", None) == "error" else "done"
                 result_text = content_to_text(getattr(token, "content", ""))
                 pending_tool_ids.discard(tool_call_id)
+                if tool_call_id in active_delegations:
+                    # 委派结束：先出栈，再让结果事件作为委派节点自身的结束记录。
+                    active_delegations.remove(tool_call_id)
+                result_parent = (
+                    active_delegations[-1]
+                    if is_subagent and active_delegations
+                    else ""
+                )
                 if tool_name == START_ASYNC_TASK_TOOL_NAME and tool_status != "error":
                     task_id = extract_async_task_id(getattr(token, "content", ""))
                     if task_id:
@@ -508,6 +678,7 @@ async def _stream_response_unlocked(
                     "source": source,
                     "status": tool_status,
                     "tool_status": tool_status,
+                    "parent_tool_call_id": result_parent,
                 }
                 subagent_name = tool_subagent_names.get(tool_call_id)
                 if subagent_name:
@@ -521,6 +692,7 @@ async def _stream_response_unlocked(
                         "tool_call_id": tool_call_id,
                         "tool_name": tool_name,
                         "source": source,
+                        "parent_tool_call_id": result_parent,
                     }
                 )
                 continue
@@ -530,6 +702,18 @@ async def _stream_response_unlocked(
                 continue
             if assistant_message_id is None:
                 assistant_message_id = f"assistant-{uuid.uuid4()}"
+            if is_subagent:
+                # 子 Agent 的正文只作为委派节点下的过程输出，不进入最终回答。
+                yield _create_sse_message(
+                    {
+                        "type": "subagent_token",
+                        "message_id": assistant_message_id,
+                        "content": content,
+                        "source": source,
+                        "parent_tool_call_id": parent_tool_call_id,
+                    }
+                )
+                continue
             answer_parts.append(content)
             yield _create_sse_message(
                 {
@@ -575,6 +759,7 @@ async def _stream_response_unlocked(
                 "usage": rounds[-1] if rounds else {},
                 "session_usage": usage_data.get("session", {}),
                 "round_limit": MAIN_AGENT_MODEL_RUN_LIMIT,
+                "duration_ms": int((time.monotonic() - turn_started) * 1000),
             }
         )
     except Exception as exc:
@@ -591,6 +776,10 @@ async def _stream_response_unlocked(
     finally:
         if stream is not None:
             await stream.aclose()
+        if thread_token is not None:
+            reset_project_thread(thread_token)
+        if project_token is not None:
+            reset_project_context(project_token)
 
 
 @router.post("/chat/stream")
@@ -642,6 +831,10 @@ app.include_router(router)
 app.include_router(history_router)
 app.include_router(async_tasks_router)
 app.include_router(settings_router)
-app.include_router(files_router)
 app.include_router(context_router)
 app.include_router(trajectory_router)
+app.include_router(skills_router)
+app.include_router(mcp_router)
+app.include_router(projects_router)
+app.include_router(session_files_router)
+app.include_router(history_sessions_router)

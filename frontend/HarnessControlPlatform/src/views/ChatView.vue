@@ -1,7 +1,6 @@
 <script setup lang="ts">
 // 首页：对话测试（顶栏菜单 + 左侧会话栏 + SSE 流式 + 文件预览）
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import UiSwitch from '@/components/console/UiSwitch.vue'
@@ -9,7 +8,7 @@ import InterruptCard from '@/components/chat/InterruptCard.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
-import TrajectoryBar from '@/components/chat/TrajectoryBar.vue'
+import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
 import RoundLimitToast from '@/components/chat/RoundLimitToast.vue'
 import { API_BASE } from '@/api/client'
 import {
@@ -20,21 +19,37 @@ import {
   type ContextFile,
   type ContextFormats,
 } from '@/api/context'
+import { fetchTrajectory } from '@/api/trajectory'
 import { categoryOf, useChatStore, type ChatMsg } from '@/stores/chat'
 import { USER_ID, useSessionStore } from '@/stores/sessions'
 import { useDisplayStore } from '@/stores/display'
+import { useFileStore } from '@/stores/files'
+import { useSettingsStore } from '@/stores/settings'
+import { fetchSandboxStatus } from '@/api/settings'
 
 const chat = useChatStore()
 const display = useDisplayStore()
 const sessions = useSessionStore()
-const router = useRouter()
+const files = useFileStore()
+const settings = useSettingsStore()
+
+// 未配置沙箱时在对话页顶部提示本机执行的安全风险。
+const sandboxNotice = ref('')
+const sandboxBannerClosed = ref(false)
+const integrityNotice = ref('')
+const integrityBannerClosed = ref(false)
 
 const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
+const inputEl = ref<HTMLTextAreaElement | null>(null)
 const showFiles = ref(false)
 const fileRefreshKey = ref(0)
-// null=检测中 true=在线 false=离线（离线时保持演示模式）
+// null=检测中 true=在线 false=离线（离线时提示后端不可达）
 const backendOnline = ref<boolean | null>(null)
+// 用户离开底部后不再强制滚动，改为提供「回到底部」按钮
+const stickToBottom = ref(true)
+const hasOverflow = ref(false)
+const TEXTAREA_MAX_HEIGHT = 168
 
 // ---------- 上下文附件 ----------
 const formats = ref<ContextFormats>({
@@ -62,18 +77,51 @@ const SUGGESTIONS = [
   '演示一次人工介入流程',
 ]
 
+/** 后端由 Electron 主进程拉起时会有启动延迟：短轮询等待，避免误判离线。 */
+async function fetchHealthWithRetry(attempts = 20): Promise<Response | null> {
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(2500) })
+      if (res.ok) return res
+    } catch {
+      // 后端仍在启动，继续重试
+    }
+    await new Promise((resolveTimer) => setTimeout(resolveTimer, 400))
+  }
+  return null
+}
+
 onMounted(async () => {
-  try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(4000) })
-    backendOnline.value = res.ok
-  } catch {
-    backendOnline.value = false
+  const res = await fetchHealthWithRetry()
+  backendOnline.value = Boolean(res)
+  if (res) {
+    const health = (await res.json().catch(() => null)) as {
+      low_integrity?: boolean
+      integrity_hint?: string
+    } | null
+    if (health?.low_integrity) {
+      integrityNotice.value =
+        health.integrity_hint ||
+        '后端进程完整性过低，无法写入普通目录；请由 Electron 主进程或普通终端启动后端。'
+    }
   }
   if (backendOnline.value) {
     chat.demoMode = false
     void sessions.refresh()
     formats.value = await fetchContextFormats()
+    void settings.load()
+    void fetchSandboxStatus()
+      .then((status) => {
+        if (!status.configured) sandboxNotice.value = status.notice
+      })
+      .catch(() => undefined)
   }
+  // 从工作台“最近对话”进入时，恢复选中的会话
+  if (!chat.threadId && sessions.activeThreadId) {
+    void selectSession(sessions.activeThreadId)
+  }
+  // 已经处于某个会话时，先记录文件基线，便于下一轮标记新增文件。
+  if (sessions.activeThreadId) void files.prime(sessions.activeThreadId)
 })
 
 // ---------- 上传交互 ----------
@@ -207,6 +255,8 @@ async function selectSession(threadId: string) {
   clearPending()
   sessions.activeThreadId = threadId
   chat.activateThread(threadId)
+  // 记录切换前的文件基线，下一轮结束时才能准确判断“本轮新增”。
+  void files.prime(threadId)
   // 后台仍在运行的会话：保留实时缓冲，不能用 checkpoint 历史覆盖
   if (chat.isThreadSending(threadId)) return
   try {
@@ -217,10 +267,25 @@ async function selectSession(threadId: string) {
     const data = (await res.json()) as {
       messages: HistoryMessage[]
       interrupt: Record<string, unknown> | null
-      session_usage?: { input: number; output: number; total: number; rounds?: number }
+      session_usage?: {
+        input: number
+        output: number
+        total: number
+        rounds?: number
+        context_window?: number
+        context_used?: number
+      }
     }
     const msgs: ChatMsg[] = data.messages.map((m, i) => {
       if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content }
+      if (m.role === 'reasoning') {
+        return {
+          id: m.id || `h-r-${i}`,
+          kind: 'reasoning',
+          content: m.content,
+          source: m.source || 'main',
+        }
+      }
       if (m.role === 'assistant') {
         return { id: m.id || `h-a-${i}`, kind: 'assistant', content: m.content, tokens: m.tokens }
       }
@@ -248,10 +313,43 @@ async function selectSession(threadId: string) {
         payload: data.interrupt,
       })
     }
-    chat.loadHistory(msgs, threadId, data.session_usage ?? null)
-    fileRefreshKey.value++
+    const usage = data.session_usage
+      ? {
+          input: data.session_usage.input,
+          output: data.session_usage.output,
+          total: data.session_usage.total,
+          rounds: data.session_usage.rounds,
+          contextWindow: data.session_usage.context_window,
+          contextUsed: data.session_usage.context_used,
+        }
+      : null
+    chat.loadHistory(msgs, threadId, usage)
+    void hydrateTurnDurations(threadId, msgs)
+    stickToBottom.value = true
+    void scrollBottom()
   } catch {
     chat.activateThread(threadId)
+  }
+}
+
+// 历史消息不带耗时：从轨迹接口把每个 run 的 duration 回填到对应轮次。
+async function hydrateTurnDurations(threadId: string, msgs: ChatMsg[]) {
+  try {
+    const data = await fetchTrajectory(threadId, USER_ID)
+    const userIds = msgs.filter((m) => m.kind === 'user').map((m) => m.id)
+    if (!userIds.length || !data.runs.length) return
+    const offset = Math.max(userIds.length - data.runs.length, 0)
+    const durations: Record<string, number> = {}
+    for (let i = 0; i < data.runs.length; i++) {
+      const target = userIds[i + offset] || userIds[userIds.length - 1]
+      const value = data.runs[i]?.summary?.duration_ms
+      if (target && typeof value === 'number' && value > 0) {
+        durations[target] = value
+      }
+    }
+    chat.setTurnDurations(threadId, durations)
+  } catch {
+    // 轨迹接口不可用时不影响聊天历史展示
   }
 }
 
@@ -265,12 +363,24 @@ async function createSession() {
   }
   sessions.activeThreadId = id
   chat.activateThread(id)
-  fileRefreshKey.value++
+  void files.prime(id)
+}
+
+/** 点击左侧项目条目：打开该项目下最近一条对话。 */
+async function openProjectConversations(projectId: string) {
+  const items = sessions.sessions
+    .filter((item) => item.project_id === projectId)
+    .slice()
+    .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+  const latest = items[0]
+  if (!latest) return
+  await selectSession(latest.thread_id)
 }
 
 async function removeSession(threadId: string) {
   await sessions.removeSession(threadId)
   chat.releaseThread(threadId)
+  files.forget(threadId)
   if (sessions.activeThreadId === threadId) {
     sessions.activeThreadId = null
   }
@@ -309,11 +419,13 @@ watch(
   { immediate: true },
 )
 
-// 任意会话完成一轮后刷新列表（标题/条数）与当前文件面板
+// 任意会话完成一轮后刷新列表（标题/条数）与文件抽屉
 watch(
   () => chat.turnVersion,
   () => {
     if (backendOnline.value) void sessions.refresh()
+    const threadId = chat.lastTurnThreadId
+    if (threadId) void files.markRound(threadId)
     fileRefreshKey.value++
   },
 )
@@ -330,8 +442,10 @@ watch(
 
 // ---------- 消息渲染 ----------
 function visible(msg: ChatMsg): boolean {
-  if (msg.kind !== 'tool') return true
   const prefs = display.prefs
+  if (msg.kind === 'reasoning') return prefs.showReasoning
+  if (msg.kind === 'subagent') return prefs.showDelegation
+  if (msg.kind !== 'tool') return true
   if (msg.category === 'skill' && !prefs.showSkills) return false
   if (msg.category === 'delegation') {
     const asyncTask = msg.toolName === 'start_async_task'
@@ -344,65 +458,104 @@ function visible(msg: ChatMsg): boolean {
 
 const shown = computed(() => chat.messages.filter(visible))
 
-// ---------- 过程消息折叠 ----------
-// 一轮里只有「最后一条助手文本」算正式回答；其余模型中间话术、工具、
-// 技能、委派都收进一条透明轨迹条，header 只展示最新的过程记录。
-function isFinalAssistant(index: number): boolean {
-  const msg = shown.value[index]
-  if (!msg || msg.kind !== 'assistant' || !msg.content) return false
-  for (let i = index + 1; i < shown.value.length; i++) {
-    const next = shown.value[i]
-    if (!next) continue
-    if (next.kind === 'user') return true
-    if (next.kind === 'tool' || next.kind === 'interrupt') return false
-    if (next.kind === 'assistant' && (next.content || next.streaming)) return false
-  }
-  return true
-}
-
-interface RenderItem {
+// ---------- 按「用户轮次」分组 ----------
+// 每轮：用户消息 + 轨迹树（推理/工具/技能/委派/中间话术）+ 最终回答 + 中断卡片。
+// 轨迹永远在正式回答之上；最后一轮在执行中时保持展开，结束后自动折叠。
+interface TurnView {
   key: string
-  items: ChatMsg[]
-  msg: ChatMsg
+  user: ChatMsg | null
+  process: ChatMsg[]
+  final: ChatMsg | null
+  interrupt: ChatMsg | null
+  notes: ChatMsg[]
+  live: boolean
 }
 
-const renderItems = computed<RenderItem[]>(() => {
-  const items: RenderItem[] = []
-  let group: ChatMsg[] = []
+const turns = computed<TurnView[]>(() => {
+  const result: TurnView[] = []
+  let current: TurnView | null = null
 
   const flush = () => {
-    if (group.length === 0) return
-    const first = group[0]
-    const latest = group[group.length - 1]
-    if (!first || !latest) return
-    items.push({
-      key: `traj-${first.id}`,
-      items: group,
-      msg: latest,
-    })
-    group = []
+    if (!current) return
+    // 只有「本轮最后一条且带内容」的助手消息才算正式回答，其余都是过程轨迹。
+    const last = current.process[current.process.length - 1]
+    if (last && last.kind === 'assistant' && last.content) {
+      current.final = last
+      current.process = current.process.slice(0, -1)
+    }
+    result.push(current)
+    current = null
   }
 
-  shown.value.forEach((msg, index) => {
-    const process =
-      msg.kind === 'tool' ||
-      (msg.kind === 'assistant' && !isFinalAssistant(index))
-    if (process) {
-      group.push(msg)
-      return
+  for (const msg of shown.value) {
+    if (msg.kind === 'user') {
+      flush()
+      current = {
+        key: msg.id,
+        user: msg,
+        process: [],
+        final: null,
+        interrupt: null,
+        notes: [],
+        live: false,
+      }
+      continue
     }
-    flush()
-    items.push({ key: msg.id, items: [], msg })
-  })
+    if (!current) {
+      current = {
+        key: `pre-${msg.id}`,
+        user: null,
+        process: [],
+        final: null,
+        interrupt: null,
+        notes: [],
+        live: false,
+      }
+    }
+    if (msg.kind === 'interrupt') {
+      if (msg.resolved) {
+        // 已处理的 HITL 不再常驻聊天区：收进本轮轨迹树，只保留一行结论。
+        current.process.push({
+          id: `${msg.id}-resolved`,
+          kind: 'interrupt',
+          content: interruptSummary(msg),
+          interruptType: msg.interruptType,
+          resolved: msg.resolved,
+          status: 'done',
+          at: msg.at,
+        })
+      } else {
+        current.interrupt = msg
+      }
+    } else if (msg.kind === 'system') {
+      current.notes.push(msg)
+    } else {
+      current.process.push(msg)
+    }
+  }
   flush()
-  return items
+
+  const lastTurn = result[result.length - 1]
+  if (lastTurn && chat.sending) lastTurn.live = true
+  return result
 })
 
-function openTrajectory(threadId: string | null) {
-  router.push({
-    path: '/workflow',
-    query: threadId ? { thread: threadId } : {},
-  })
+function turnDuration(turn: TurnView): number | undefined {
+  if (!turn.user) return undefined
+  return chat.turnDurations[turn.user.id]
+}
+
+// 已回复的 HITL 在轨迹树里显示成一条可展开的结论行。
+function interruptSummary(msg: ChatMsg): string {
+  const payload = msg.payload || {}
+  const hitl = payload.hitl as { title?: string } | undefined
+  const fallback =
+    String(payload.information_needed || '').trim().slice(0, 80) ||
+    (msg.interruptType === 'hitl_approval' ? '审批请求' : '补充信息请求')
+  const status =
+    msg.resolved === 'approved' ? '已批准' : msg.resolved === 'rejected' ? '已拒绝' : '已回复'
+  const detail = msg.resolution ? `：${msg.resolution}` : ''
+  return `${hitl?.title || fallback}（${status}）${detail}`
 }
 
 const backendStatusLabel = computed(
@@ -415,8 +568,78 @@ const backendStatusClass = computed(() =>
 async function scrollBottom() {
   await nextTick()
   const el = scroller.value
-  if (el) el.scrollTop = el.scrollHeight
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+  stickToBottom.value = true
+  updateOverflow()
 }
+
+function updateOverflow() {
+  const el = scroller.value
+  hasOverflow.value = Boolean(el && el.scrollHeight - el.clientHeight > 24)
+}
+
+// 用户一旦向上滚动，就停止自动跟随；是否回到底部由按钮决定。
+function onMessagesScroll() {
+  const el = scroller.value
+  if (!el) return
+  updateOverflow()
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+  stickToBottom.value = distance < 48
+}
+
+function jumpToBottom() {
+  void scrollBottom()
+}
+
+// ---------- 输入框自适应高度 ----------
+function autoGrow() {
+  const el = inputEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`
+}
+
+watch(draft, () => {
+  void nextTick(autoGrow)
+})
+
+// ---------- 后端运行参数（思考 / 联网搜索） ----------
+const settingsDisabled = computed(
+  () => chat.sending || settings.saving || settings.online === false,
+)
+const settingsHint = computed(() => {
+  if (settings.online === false) return '后端离线，开关仅本地展示'
+  if (settings.saving) return '正在写入后端…'
+  if (settings.error) return settings.error
+  return ''
+})
+
+function toggleThinking(value: boolean) {
+  void settings.setThinking(value)
+}
+
+function toggleWebSearch(value: boolean) {
+  void settings.setWebSearch(value)
+}
+
+// ---------- 上下文窗口圆环 ----------
+const DONUT_CIRC = 2 * Math.PI * 15.5
+const ctxWindow = computed(() => chat.sessionTokens?.contextWindow || 0)
+const ctxUsed = computed(
+  () => chat.sessionTokens?.contextUsed ?? chat.sessionTokens?.input ?? 0,
+)
+const ctxPct = computed(() =>
+  ctxWindow.value > 0
+    ? Math.min(100, Math.round((ctxUsed.value / ctxWindow.value) * 100))
+    : 0,
+)
+const ctxTone = computed(() =>
+  ctxPct.value >= 85 ? 'danger' : ctxPct.value >= 60 ? 'warn' : 'ok',
+)
+const ctxDash = computed(
+  () => `${(ctxPct.value / 100) * DONUT_CIRC} ${DONUT_CIRC}`,
+)
 
 // ---------- 消息复制 ----------
 const copiedId = ref('')
@@ -481,7 +704,24 @@ function newChatFromNotice() {
   void createSession()
 }
 
-watch(() => [chat.messages.length, shown.value.map((m) => (m.content || '') + (m.result || '') + (m.status || ''))], scrollBottom, { deep: true })
+// 内容增长时只在用户仍贴着底部才自动滚动，避免打断向上翻阅
+watch(
+  () => [
+    chat.messages.length,
+    shown.value.reduce(
+      (sum, msg) =>
+        sum + (msg.content?.length || 0) + (msg.result?.length || 0) + (msg.args?.length || 0),
+      0,
+    ),
+    chat.sending,
+  ],
+  () => {
+    void nextTick(() => {
+      updateOverflow()
+      if (stickToBottom.value) void scrollBottom()
+    })
+  },
+)
 
 async function submit() {
   if (!draft.value.trim() && pendingFiles.value.length === 0) return
@@ -501,6 +741,11 @@ async function submit() {
   // 已发送的附件不再重复引用；预览 URL 保留给消息气泡显示。
   pendingFiles.value = []
   uploadError.value = ''
+  stickToBottom.value = true
+  void nextTick(() => {
+    autoGrow()
+    void scrollBottom()
+  })
 }
 </script>
 
@@ -510,10 +755,6 @@ async function submit() {
       <template #actions>
         <span class="status-chip" :class="backendStatusClass">
           <i class="dot"></i>{{ backendStatusLabel }}
-        </span>
-        <span class="demo-toggle" title="后端未启动时用脚本事件预览全部 UI；后端在线时自动关闭">
-          <UiSwitch v-model="chat.demoMode" />
-          <em>演示模式</em>
         </span>
       </template>
     </TopNav>
@@ -537,6 +778,7 @@ async function submit() {
         @remove="removeSession"
         @rename="renameSession"
         @pin="togglePin"
+        @select-project="openProjectConversations"
       />
 
       <section class="panel chat">
@@ -544,8 +786,8 @@ async function submit() {
           <div class="title">
             <span class="title-icon"><AppIcon name="message" :size="14" /></span>
             <div>
-              <strong>对话测试</strong>
-              <small>SSE 流式 · 工具 / 技能可视化 · HITL 人工介入</small>
+              <strong>对话</strong>
+              <small>推理 / 工具轨迹树 · SSE 流式 · HITL 人工介入</small>
             </div>
           </div>
           <div class="controls">
@@ -559,99 +801,153 @@ async function submit() {
           </div>
         </header>
 
-        <div ref="scroller" class="messages">
-          <div v-if="shown.length === 0" class="empty">
-            <div class="empty-orb"><AppIcon name="sparkles" :size="26" /></div>
-            <h3>Harness 对话测试台</h3>
-            <p>发送一条消息，观察模型推理、工具调用、技能使用与人工介入的完整链路。</p>
-            <div class="suggestions">
-              <button v-for="s in SUGGESTIONS" :key="s" type="button" @click="chat.send(s)">{{ s }}</button>
-            </div>
-          </div>
+        <div v-if="sandboxNotice && !sandboxBannerClosed" class="sandbox-warn">
+          <AppIcon name="shield" :size="13" />
+          <span>{{ sandboxNotice }}</span>
+          <button type="button" title="关闭提示" @click="sandboxBannerClosed = true">
+            <AppIcon name="close" :size="10" />
+          </button>
+        </div>
 
-          <template v-for="item in renderItems" :key="item.key">
-            <div v-if="item.items.length" class="row indent">
-              <TrajectoryBar
-                :items="item.items"
-                :thread-id="chat.threadId"
-                @open="openTrajectory"
-              />
+        <div v-if="integrityNotice && !integrityBannerClosed" class="sandbox-warn">
+          <AppIcon name="shield" :size="13" />
+          <span>{{ integrityNotice }}</span>
+          <button type="button" title="关闭提示" @click="integrityBannerClosed = true">
+            <AppIcon name="close" :size="10" />
+          </button>
+        </div>
+
+        <div class="messages-wrap">
+          <div ref="scroller" class="messages" @scroll.passive="onMessagesScroll">
+            <div v-if="shown.length === 0" class="empty">
+              <div class="empty-orb"><AppIcon name="sparkles" :size="26" /></div>
+              <h3>Harness 对话测试台</h3>
+              <p>发送一条消息，观察模型推理、工具调用、技能使用与人工介入的完整链路。</p>
+              <div class="suggestions">
+                <button v-for="s in SUGGESTIONS" :key="s" type="button" @click="chat.send(s)">{{ s }}</button>
+              </div>
             </div>
 
-            <div v-else-if="item.msg.kind === 'user'" class="row user">
-              <div class="msg-col user">
-                <div class="bubble user-bubble">
-                  <div v-if="item.msg.attachments?.length" class="bubble-atts">
-                    <span v-for="att in item.msg.attachments" :key="att.id" class="bubble-att">
-                      <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
-                      <AppIcon v-else name="file" :size="11" />
-                      <span>{{ att.name }}</span>
-                    </span>
+            <template v-for="turn in turns" :key="turn.key">
+              <div v-if="turn.user" class="row user">
+                <div class="msg-col user">
+                  <div class="bubble user-bubble">
+                    <div v-if="turn.user.attachments?.length" class="bubble-atts">
+                      <span v-for="att in turn.user.attachments" :key="att.id" class="bubble-att">
+                        <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
+                        <AppIcon v-else name="file" :size="11" />
+                        <span>{{ att.name }}</span>
+                      </span>
+                    </div>
+                    <span v-if="turn.user.content">{{ turn.user.content }}</span>
                   </div>
-                  <span v-if="item.msg.content">{{ item.msg.content }}</span>
-                </div>
-                <div v-if="item.msg.content" class="msg-meta user">
-                  <button
-                    class="copy-mini"
-                    type="button"
-                    :class="{ copied: copiedId === item.msg.id }"
-                    :title="copiedId === item.msg.id ? '已复制' : '复制文本'"
-                    @click="copyMessage(item.msg)"
-                  >
-                    <AppIcon :name="copiedId === item.msg.id ? 'check' : 'copy'" :size="10" />
-                    <span>{{ copiedId === item.msg.id ? '已复制' : '复制' }}</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div v-else-if="item.msg.kind === 'assistant'" class="row">
-              <div class="avatar ai">AI</div>
-              <div class="msg-col ai">
-                <div class="bubble ai-bubble">
-                  <MarkdownView v-if="item.msg.content" :content="item.msg.content" />
-                  <span v-if="item.msg.streaming" class="cursor"></span>
-                </div>
-                <div v-if="item.msg.content && !item.msg.streaming" class="msg-meta ai">
-                  <button
-                    class="copy-mini"
-                    type="button"
-                    :class="{ copied: copiedId === item.msg.id }"
-                    :title="copiedId === item.msg.id ? '已复制' : '复制回答'"
-                    @click="copyMessage(item.msg)"
-                  >
-                    <AppIcon :name="copiedId === item.msg.id ? 'check' : 'copy'" :size="10" />
-                    <span>{{ copiedId === item.msg.id ? '已复制' : '复制' }}</span>
-                  </button>
+                  <div v-if="turn.user.content" class="msg-meta user">
+                    <button
+                      class="copy-mini"
+                      type="button"
+                      :class="{ copied: copiedId === turn.user.id }"
+                      :title="copiedId === turn.user.id ? '已复制' : '复制文本'"
+                      @click="copyMessage(turn.user)"
+                    >
+                      <AppIcon :name="copiedId === turn.user.id ? 'check' : 'copy'" :size="10" />
+                      <span>{{ copiedId === turn.user.id ? '已复制' : '复制' }}</span>
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
 
-            <div v-else-if="item.msg.kind === 'interrupt'" class="row indent">
-              <InterruptCard :msg="item.msg" />
-            </div>
+              <!-- 轨迹永远在正式回答之上：树状展开，结束后自动折叠 -->
+              <div v-if="turn.process.length || turn.live" class="row indent tree-row">
+                <div class="tree-col">
+                  <TrajectoryTree
+                    :items="turn.process"
+                    :live="turn.live"
+                    :duration-ms="turnDuration(turn)"
+                  />
+                </div>
+              </div>
 
-            <div v-else class="row center">
-              <span class="system-note">{{ item.msg.content }}</span>
-            </div>
-          </template>
+              <div v-if="turn.final" class="row">
+                <div class="avatar ai">AI</div>
+                <div class="msg-col ai">
+                  <div class="bubble ai-bubble">
+                    <MarkdownView v-if="turn.final.content" :content="turn.final.content" />
+                    <span v-if="turn.final.streaming" class="cursor"></span>
+                  </div>
+                  <div v-if="turn.final.content && !turn.final.streaming" class="msg-meta ai">
+                    <button
+                      class="copy-mini"
+                      type="button"
+                      :class="{ copied: copiedId === turn.final.id }"
+                      :title="copiedId === turn.final.id ? '已复制' : '复制回答'"
+                      @click="copyMessage(turn.final)"
+                    >
+                      <AppIcon :name="copiedId === turn.final.id ? 'check' : 'copy'" :size="10" />
+                      <span>{{ copiedId === turn.final.id ? '已复制' : '复制' }}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
 
-          <div v-if="chat.thinking && display.prefs.showReasoning" class="row indent">
-            <div class="thinking-trace">
-              <span class="tt-icon"><AppIcon name="workflow" :size="12" /></span>
-              <span class="tt-tag">轨迹</span>
-              <span class="tt-text">模型推理中…</span>
-              <span class="tt-dots">
-                <i class="s-dot"></i><i class="s-dot"></i><i class="s-dot"></i>
-              </span>
-            </div>
+              <div v-if="turn.interrupt" class="row indent">
+                <InterruptCard :msg="turn.interrupt" />
+              </div>
+
+              <div v-for="note in turn.notes" :key="note.id" class="row center">
+                <span class="system-note">{{ note.content }}</span>
+              </div>
+            </template>
           </div>
-          <div v-else-if="chat.thinking" class="row center">
-            <span class="system-note">模型处理中…</span>
-          </div>
+
+          <!-- 用户向上翻阅时，不再强制滚到底，只在视口底部提供一个回底按钮 -->
+          <Transition name="pop">
+            <button
+              v-if="hasOverflow && !stickToBottom"
+              class="jump-bottom"
+              type="button"
+              title="回到最新消息"
+              @click="jumpToBottom"
+            >
+              <AppIcon name="chevronRight" :size="12" />
+              <span>回到底部</span>
+            </button>
+          </Transition>
         </div>
 
         <footer class="input-bar">
+          <!-- 发送框顶部：快速切换后端的思考模式与联网搜索 -->
+          <div class="input-head">
+            <div class="mode-toggles">
+              <span
+                class="mode-toggle"
+                :class="{ on: settings.thinking, disabled: settingsDisabled }"
+                :title="'开启后模型返回推理过程，前端在轨迹树里流式展示'"
+              >
+                <AppIcon name="sparkles" :size="12" />
+                <span>思考模式</span>
+                <UiSwitch
+                  :model-value="settings.thinking"
+                  :disabled="settingsDisabled"
+                  @update:model-value="toggleThinking"
+                />
+              </span>
+              <span
+                class="mode-toggle"
+                :class="{ on: settings.webSearch, disabled: settingsDisabled }"
+                :title="'开启后 Agent 可调用 search_web / fetch_web，关闭时后端不再绑定搜索工具'"
+              >
+                <AppIcon name="globe" :size="12" />
+                <span>联网搜索</span>
+                <UiSwitch
+                  :model-value="settings.webSearch"
+                  :disabled="settingsDisabled"
+                  @update:model-value="toggleWebSearch"
+                />
+              </span>
+            </div>
+            <span v-if="settingsHint" class="settings-hint">{{ settingsHint }}</span>
+          </div>
+
           <div v-if="pendingFiles.length" class="pending-row">
             <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
               <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
@@ -730,10 +1026,12 @@ async function submit() {
               @change="onFilesPicked"
             />
             <textarea
+              ref="inputEl"
               v-model="draft"
               rows="1"
               placeholder="输入消息，可附图片/文档/网页链接；Enter 发送 / Shift+Enter 换行"
               :disabled="chat.sending"
+              @input="autoGrow"
               @keydown.enter.exact.prevent="submit"
             ></textarea>
             <button v-if="chat.sending" class="stop" type="button" title="中止" @click="chat.stop()">
@@ -750,19 +1048,39 @@ async function submit() {
             </button>
           </div>
 
-          <!-- 本会话统计：输出为历轮生成之和，上下文取最近一轮输入（含系统提示词/工具/技能） -->
-          <div
-            v-if="chat.sessionTokens"
-            class="session-usage"
-            :title="`按最终回答统计：输出 ${chat.sessionTokens.output} tok（历轮生成之和）；当前上下文 ${chat.sessionTokens.input} tok（最近一轮输入，含系统提示词/工具/技能/记忆）`"
-          >
-            <AppIcon name="cpu" :size="10" />
-            <span>本会话输出</span>
-            <b>{{ formatExact(chat.sessionTokens.output) }} tok</b>
-            <em>·</em>
-            <span>当前上下文</span>
-            <b>{{ formatExact(chat.sessionTokens.input) }} tok</b>
-            <em v-if="chat.sessionTokens.rounds">· {{ chat.sessionTokens.rounds }} 轮</em>
+          <!-- 本会话统计 + 上下文窗口圆环 -->
+          <div v-if="chat.sessionTokens" class="input-foot">
+            <div
+              class="usage-text"
+              :title="`按最终回答统计：输出 ${chat.sessionTokens.output} tok（历轮生成之和）；当前上下文 ${formatExact(ctxUsed)} tok（最近一轮输入，含系统提示词/工具/技能/记忆）`"
+            >
+              <AppIcon name="cpu" :size="10" />
+              <span>本会话输出</span>
+              <b>{{ formatExact(chat.sessionTokens.output) }} tok</b>
+              <em>·</em>
+              <span>当前上下文</span>
+              <b>{{ formatExact(ctxUsed) }} tok</b>
+              <em v-if="chat.sessionTokens.rounds">· {{ chat.sessionTokens.rounds }} 轮</em>
+            </div>
+
+            <div
+              v-if="ctxWindow > 0"
+              class="ctx-donut"
+              :class="ctxTone"
+              :title="`上下文窗口占用 ${formatExact(ctxUsed)} / ${formatExact(ctxWindow)} tok（${ctxPct}%）`"
+            >
+              <svg viewBox="0 0 36 36" aria-hidden="true">
+                <circle class="donut-track" cx="18" cy="18" r="15.5" />
+                <circle
+                  class="donut-bar"
+                  cx="18"
+                  cy="18"
+                  r="15.5"
+                  :stroke-dasharray="ctxDash"
+                />
+              </svg>
+              <span class="donut-label">{{ ctxPct }}%</span>
+            </div>
           </div>
         </footer>
       </section>
@@ -781,19 +1099,23 @@ async function submit() {
 
 <style scoped>
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .chat-layout {
   flex: 1;
   display: flex;
-  gap: 14px;
+  gap: 0;
   align-items: stretch;
   height: calc(100vh - var(--topbar-h));
-  padding: 14px 18px 18px;
+  min-height: 0;
+  padding: 0;
   min-width: 0;
+  overflow: hidden;
 }
 
 .chat {
@@ -803,7 +1125,8 @@ async function submit() {
   min-height: 0;
   min-width: 0;
   overflow: hidden;
-  max-height: 90vh;
+  border-top: 0;
+  background: transparent;
 }
 
 .chat-head {
@@ -811,40 +1134,41 @@ async function submit() {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  padding: 13px 18px;
+  padding: 11px 18px;
   border-bottom: 1px solid var(--line);
+  background: transparent;
 }
 
 .title {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
 }
 
 .title-icon {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
+  width: 22px;
+  height: 22px;
   color: var(--accent-cyan);
-  background: rgba(53, 224, 255, 0.1);
+  background: transparent;
 }
 
 .title strong {
   display: block;
-  font-size: 15px;
+  font-size: 14px;
+  letter-spacing: -0.01em;
 }
 
 .title small {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-3);
 }
 
 .controls {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex: none;
 }
 
@@ -853,12 +1177,12 @@ async function submit() {
   align-items: center;
   gap: 6px;
   flex: none;
-  padding: 4px 11px;
-  font-size: 11px;
+  padding: 3px 9px;
+  font-size: 10.5px;
   white-space: nowrap;
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(16, 32, 64, 0.5);
+  border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--text-2);
 }
 
@@ -880,36 +1204,22 @@ async function submit() {
 
 .status-chip.offline {
   color: var(--amber);
-  border-color: rgba(255, 182, 72, 0.35);
+  border-color: rgba(242, 176, 60, 0.35);
 }
 
 .status-chip.checking {
   color: var(--text-3);
 }
 
-.demo-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-
-.demo-toggle em {
-  font-style: normal;
-  font-size: 11.5px;
-  white-space: nowrap;
-  color: var(--text-2);
-}
-
 .chip {
   flex: none;
-  padding: 4px 10px;
-  font-size: 10.5px;
+  padding: 3px 8px;
+  font-size: 10px;
   white-space: nowrap;
-  color: var(--text-2);
+  color: var(--text-3);
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(16, 32, 64, 0.5);
+  border-radius: var(--radius-sm);
+  background: transparent;
 }
 
 .ghost {
@@ -917,28 +1227,115 @@ async function submit() {
   align-items: center;
   gap: 5px;
   flex: none;
-  padding: 6px 12px;
-  font-size: 12px;
+  padding: 5px 10px;
+  font-size: 11.5px;
   white-space: nowrap;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   background: transparent;
-  transition: all 0.18s;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 .ghost:hover {
   color: var(--text-1);
   border-color: var(--line-strong);
+  background: var(--bg-hover);
+}
+
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* 未配置沙箱时的本机执行安全提示 */
+.sandbox-warn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 16px 6px;
+  padding: 6px 10px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--amber);
+  border: 1px solid rgba(242, 176, 60, 0.28);
+  border-radius: var(--radius-sm);
+  background: rgba(242, 176, 60, 0.06);
+}
+
+.sandbox-warn span {
+  flex: 1;
+  min-width: 0;
+}
+
+.sandbox-warn button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: var(--text-3);
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+}
+
+.sandbox-warn button:hover {
+  color: var(--text-1);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 18px 20px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* 轨迹树容器：占满宽度，后面可跟「完整轨迹」入口 */
+.tree-row {
+  width: 100%;
+}
+
+.tree-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+}
+
+/* 回到最新消息：固定在聊天视口底部，不阻塞阅读 */
+.jump-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 12;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  font-size: 10.5px;
+  color: var(--text-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.jump-bottom :deep(svg) {
+  transform: rotate(90deg);
+  color: var(--accent-cyan);
+}
+
+.jump-bottom:hover {
+  border-color: var(--accent);
+  color: #fff;
 }
 
 .empty {
@@ -950,23 +1347,23 @@ async function submit() {
 .empty-orb {
   display: grid;
   place-items: center;
-  width: 58px;
-  height: 58px;
+  width: 48px;
+  height: 48px;
   margin: 0 auto 14px;
-  border-radius: 50%;
   color: var(--accent-cyan);
-  background: radial-gradient(circle at 35% 30%, rgba(53, 224, 255, 0.25), rgba(30, 70, 150, 0.25));
-  box-shadow: 0 0 28px rgba(53, 224, 255, 0.25);
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
 }
 
 .empty h3 {
   margin: 0 0 6px;
-  font-size: 17px;
+  font-size: 16px;
 }
 
 .empty p {
   margin: 0 0 16px;
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--text-3);
 }
 
@@ -974,23 +1371,23 @@ async function submit() {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .suggestions button {
-  padding: 7px 13px;
-  font-size: 12px;
+  padding: 6px 11px;
+  font-size: 11.5px;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(16, 32, 64, 0.5);
-  transition: all 0.18s;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 .suggestions button:hover {
   color: var(--text-1);
   border-color: var(--accent);
-  background: rgba(59, 120, 255, 0.12);
+  background: var(--bg-hover);
 }
 
 .row {
@@ -1020,37 +1417,30 @@ async function submit() {
 .avatar {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  font-size: 11px;
-  font-weight: 700;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
   flex: none;
 }
 
 .avatar.ai {
-  color: #cfe3ff;
-  background: linear-gradient(135deg, #2f6bff, #16306e);
-  box-shadow: 0 0 12px rgba(63, 122, 255, 0.35);
+  color: var(--accent-cyan);
+  border: 1px solid var(--line-strong);
+  background: transparent;
 }
 
 .bubble {
   position: relative;
   max-width: 72%;
-  padding: 10px 14px;
+  padding: 9px 13px;
   font-size: 13px;
   line-height: 1.7;
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   white-space: pre-wrap;
   word-break: break-word;
-  transition: box-shadow 0.25s ease, border-color 0.25s ease;
-}
-
-/* 悬停气泡时泛起星尘辉光 */
-.bubble:hover {
-  box-shadow:
-    0 0 22px rgba(63, 122, 255, 0.18),
-    0 0 6px rgba(53, 224, 255, 0.22);
 }
 
 /* 气泡 + 下方 meta 行的纵向容器 */
@@ -1085,74 +1475,129 @@ async function submit() {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 8px;
+  padding: 2px 7px;
   font-size: 10px;
   color: var(--text-3);
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(8, 18, 38, 0.55);
-  transition: all 0.18s;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 .copy-mini:hover {
   color: var(--accent-cyan);
-  border-color: rgba(53, 224, 255, 0.45);
-  box-shadow: 0 0 12px rgba(53, 224, 255, 0.28);
+  border-color: var(--line-strong);
+  background: var(--bg-hover);
 }
 
 .copy-mini.copied {
-  color: var(--green);
-  border-color: rgba(61, 220, 132, 0.5);
-  box-shadow: 0 0 12px rgba(61, 220, 132, 0.3);
+  color: var(--accent-cyan);
+  border-color: rgba(55, 208, 196, 0.45);
 }
 
-/* 发送栏底部居中：本会话统计 */
-.session-usage {
+/* 发送栏底部：左侧用量文本 + 右侧上下文圆环 */
+.input-foot {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  align-self: center;
-  padding: 2px 12px;
-  font-size: 10px;
-  color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(8, 18, 38, 0.5);
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 2px;
 }
 
-.session-usage :deep(svg) {
+.usage-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 10px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-text :deep(svg) {
   color: var(--accent-cyan);
 }
 
-.session-usage b {
+.usage-text b {
   font-weight: 600;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  background: linear-gradient(100deg, #dff3ff, #7cc4ff 55%, #35e0ff);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--text-1);
 }
 
-.session-usage em {
+.usage-text em {
   font-style: normal;
   font-variant-numeric: tabular-nums;
   opacity: 0.8;
 }
 
+/* 上下文窗口占用：圆形进度条 */
+.ctx-donut {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: none;
+}
+
+.ctx-donut svg {
+  width: 34px;
+  height: 34px;
+}
+
+.donut-track {
+  fill: none;
+  stroke: rgba(96, 156, 255, 0.16);
+  stroke-width: 3;
+}
+
+.donut-bar {
+  fill: none;
+  stroke: var(--accent-cyan);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dashoffset: 0;
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+  transition: stroke-dasharray 0.35s ease, stroke 0.25s;
+}
+
+.ctx-donut.warn .donut-bar {
+  stroke: var(--amber);
+}
+
+.ctx-donut.danger .donut-bar {
+  stroke: #e2605e;
+}
+
+.donut-label {
+  position: absolute;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+.ctx-donut.danger .donut-label {
+  color: var(--danger);
+}
+
 .ai-bubble {
   border: 1px solid var(--line);
-  background: var(--bg-card);
-  border-top-left-radius: 4px;
+  background: rgba(8, 16, 30, 0.34);
+  backdrop-filter: blur(6px);
+  border-top-left-radius: 0;
   /* Markdown 渲染后由块级元素控制换行，不能再沿用 pre-wrap */
   white-space: normal;
 }
 
 .user-bubble {
-  color: #eaf2ff;
-  background: linear-gradient(120deg, #2f6bff, #2451b8);
-  border-top-right-radius: 4px;
-  box-shadow: 0 4px 16px rgba(47, 100, 220, 0.3);
+  color: var(--text-1);
+  background: rgba(91, 140, 255, 0.14);
+  border: 1px solid rgba(91, 140, 255, 0.3);
+  border-top-right-radius: 0;
 }
 
 .cursor {
@@ -1170,72 +1615,6 @@ async function submit() {
   50% { opacity: 0; }
 }
 
-.thinking-trace {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 7px 10px;
-  color: var(--text-3);
-  border: 1px dashed var(--line);
-  border-radius: 9px;
-  background: transparent;
-}
-
-.tt-icon {
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  flex: none;
-  border-radius: 6px;
-  color: var(--accent-cyan);
-  background: rgba(79, 140, 255, 0.1);
-  animation: tt-glow 1.4s ease-in-out infinite;
-}
-
-@keyframes tt-glow {
-  0%, 100% { opacity: 0.65; }
-  50% { opacity: 1; }
-}
-
-.tt-tag {
-  flex: none;
-  padding: 1px 6px;
-  font-size: 10px;
-  letter-spacing: 0.4px;
-  color: var(--accent-cyan);
-  border: 1px solid rgba(53, 224, 255, 0.25);
-  border-radius: 999px;
-}
-
-.tt-text {
-  flex: 1;
-  font-size: 11.5px;
-}
-
-.tt-dots {
-  display: inline-flex;
-  gap: 4px;
-  flex: none;
-}
-
-.s-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent-cyan);
-  animation: bounce 1.2s infinite;
-}
-
-.s-dot:nth-child(2) { animation-delay: 0.15s; }
-.s-dot:nth-child(3) { animation-delay: 0.3s; }
-
-@keyframes bounce {
-  0%, 60%, 100% { transform: none; opacity: 0.5; }
-  30% { transform: translateY(-4px); opacity: 1; }
-}
-
 .system-note {
   font-size: 11.5px;
   color: var(--text-3);
@@ -1247,7 +1626,56 @@ async function submit() {
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--line);
-  background: rgba(8, 16, 34, 0.6);
+  background: transparent;
+}
+
+/* 发送框顶部：思考模式 / 联网搜索快速开关 */
+.input-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 26px;
+}
+
+.mode-toggles {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  transition: color 0.18s;
+}
+
+.mode-toggle :deep(svg) {
+  color: var(--text-3);
+  transition: color 0.18s;
+}
+
+.mode-toggle.on,
+.mode-toggle.on :deep(svg) {
+  color: var(--accent-cyan);
+}
+
+.mode-toggle.disabled {
+  opacity: 0.55;
+}
+
+.settings-hint {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10px;
+  color: var(--amber);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .input-row {
@@ -1270,9 +1698,9 @@ async function submit() {
   flex: none;
   color: var(--text-2);
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  background: rgba(6, 13, 28, 0.7);
-  transition: all 0.18s;
+  border-radius: var(--radius-md);
+  background: transparent;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 /* 附件下拉容器：菜单向上弹出，避免遮挡输入框 */
@@ -1284,7 +1712,7 @@ async function submit() {
 .attach.active {
   color: var(--accent-cyan);
   border-color: var(--accent);
-  background: rgba(53, 224, 255, 0.1);
+  background: var(--bg-hover);
 }
 
 .attach-menu {
@@ -1298,10 +1726,9 @@ async function submit() {
   width: 210px;
   padding: 6px;
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  background: rgba(10, 22, 44, 0.97);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-  backdrop-filter: blur(12px);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: 0 10px 28px rgba(2, 6, 14, 0.5);
 }
 
 .attach-menu button {
@@ -1314,14 +1741,14 @@ async function submit() {
   text-align: left;
   color: var(--text-2);
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: transparent;
-  transition: all 0.15s;
+  transition: color 0.15s, background 0.15s;
 }
 
 .attach-menu button:hover {
   color: var(--text-1);
-  background: rgba(53, 224, 255, 0.09);
+  background: var(--bg-hover);
 }
 
 .attach-menu button svg,
@@ -1354,8 +1781,8 @@ async function submit() {
   padding: 7px 10px;
   color: var(--accent-cyan);
   border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: rgba(6, 13, 28, 0.78);
+  border-radius: var(--radius-sm);
+  background: rgba(4, 10, 20, 0.4);
 }
 
 .url-row input {
@@ -1380,8 +1807,8 @@ async function submit() {
   font-size: 11.5px;
   color: #fff;
   border: none;
-  border-radius: 7px;
-  background: linear-gradient(120deg, #3b78ff, #2a5cd6);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
 }
 
 .url-ok:disabled {
@@ -1402,8 +1829,8 @@ async function submit() {
 }
 
 .url-cancel:hover {
-  color: #ff6b6b;
-  background: rgba(255, 93, 93, 0.14);
+  color: #e2605e;
+  background: rgba(226, 96, 94, 0.14);
 }
 
 .pop-enter-active,
@@ -1420,7 +1847,7 @@ async function submit() {
 .attach:hover:not(:disabled) {
   color: var(--accent-cyan);
   border-color: var(--accent);
-  background: rgba(53, 224, 255, 0.08);
+  background: var(--bg-hover);
 }
 
 .attach:disabled {
@@ -1456,8 +1883,8 @@ async function submit() {
   font-size: 11px;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(16, 32, 64, 0.55);
+  border-radius: var(--radius-sm);
+  background: transparent;
 }
 
 .pending-chip img {
@@ -1486,8 +1913,8 @@ async function submit() {
 }
 
 .pending-chip button:hover {
-  color: #ff6b6b;
-  background: rgba(255, 93, 93, 0.14);
+  color: #e2605e;
+  background: rgba(226, 96, 94, 0.14);
 }
 
 .upload-error {
@@ -1522,21 +1949,24 @@ async function submit() {
 
 .input-row textarea {
   flex: 1;
-  max-height: 120px;
+  min-height: 40px;
+  max-height: 168px;
   padding: 10px 14px;
   font-size: 13px;
   font-family: inherit;
   color: var(--text-1);
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  background: rgba(6, 13, 28, 0.7);
+  border-radius: var(--radius-md);
+  background: var(--bg-deep);
   resize: none;
   outline: none;
+  overflow-y: auto;
+  line-height: 1.6;
 }
 
 .input-row textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.15);
+  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.22);
 }
 
 .send,
@@ -1546,15 +1976,14 @@ async function submit() {
   width: 40px;
   height: 40px;
   border: none;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   color: #fff;
-  transition: all 0.18s;
+  transition: filter 0.16s ease;
   flex: none;
 }
 
 .send {
-  background: linear-gradient(120deg, #3b78ff, #2a5cd6);
-  box-shadow: 0 4px 14px rgba(50, 110, 255, 0.4);
+  background: var(--accent);
 }
 
 .send:disabled {
@@ -1563,8 +1992,7 @@ async function submit() {
 }
 
 .stop {
-  background: linear-gradient(120deg, #ff5d5d, #c8302f);
-  box-shadow: 0 4px 14px rgba(255, 93, 93, 0.35);
+  background: var(--danger);
 }
 
 .slide-enter-active,

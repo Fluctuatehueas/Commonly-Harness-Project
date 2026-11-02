@@ -47,3 +47,14 @@ _skill_management_script = _load_skill_management_script() # 获取skill_managem
 # __dict__初测这个值 nodule["create_skill_management_tools"] = create_skill_management_tools,
 # 这个才是对外接口，可以import，上面的不行，因为他是模块本身。
 create_skill_management_tools = _skill_management_script.create_skill_management_tools
+
+# 管理接口复用同一套校验/安装实现，避免下载、解压、元信息逻辑出现两份。
+download_skill = _skill_management_script._download_skill
+validate_archive_members = _skill_management_script._validate_archive_members
+find_skill_directory = _skill_management_script._find_skill_directory
+ensure_skill_metadata = _skill_management_script._ensure_skill_metadata
+parse_skill_metadata = _skill_management_script._parse_skill_metadata
+validate_skill_name = _skill_management_script._skill_directory
+MAIN_SKILLS_DIRECTORY = _skill_management_script.MAIN_SKILLS_DIRECTORY
+SUBAGENTS_DIRECTORY = _skill_management_script.SUBAGENTS_DIRECTORY
+SKILL_NAME_PATTERN = _skill_management_script.SKILL_NAME_PATTERN

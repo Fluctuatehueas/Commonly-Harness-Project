@@ -1,28 +1,45 @@
-/* Harness 控制台全局样式与设计变量 */
+/* Harness 控制台全局样式 —— 深空工业控制台
+   工业仪表盘 + 精密仪器感：非卡片式、1px 发丝线、背景层差、克制动效。 */
 
 :root {
-  /* 颜色 */
-  --bg-deep: #050b18;
-  --bg-panel: rgba(12, 24, 48, 0.72);
-  --bg-panel-solid: #0c1830;
-  --bg-card: rgba(18, 34, 64, 0.66);
-  --bg-card-hover: rgba(26, 46, 84, 0.8);
-  --line: rgba(86, 140, 255, 0.16);
-  --line-strong: rgba(96, 156, 255, 0.38);
-  --accent: #4f8cff;
-  --accent-cyan: #35e0ff;
-  --green: #3ddc84;
-  --amber: #ffb648;
-  --text-1: #e8f0ff;
-  --text-2: #9db0d6;
-  --text-3: #5f739c;
+  /* ---------- 颜色 ---------- */
+  --bg-deep: #070b14;
+  --bg-panel: #0b1220;
+  --bg-rail: #090e19;
+  --bg-elevated: #101a2c;
+  --bg-hover: rgba(91, 140, 255, 0.07);
+  --bg-active: rgba(91, 140, 255, 0.12);
 
-  /* 尺寸 */
-  --sidebar-w: 208px;
-  --topbar-h: 56px;
-  --radius-lg: 16px;
-  --radius-md: 12px;
-  --radius-sm: 8px;
+  /* 兼容旧组件命名 */
+  --bg-card: #0e1728;
+  --bg-card-hover: #121e33;
+
+  --line: rgba(126, 154, 198, 0.14);
+  --line-strong: rgba(126, 154, 198, 0.3);
+
+  --accent: #5b8cff;
+  --accent-cyan: #37d0c4;
+  --green: #37c9a4;
+  --amber: #f2b03c;
+  --danger: #e2605e;
+
+  --text-1: #e6edf9;
+  --text-2: #93a5c4;
+  --text-3: #5c6f92;
+
+  /* ---------- 排版 ---------- */
+  --font-sans:
+    'Inter', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system,
+    sans-serif;
+  --font-mono:
+    'Cascadia Code', 'JetBrains Mono', 'Consolas', 'SFMono-Regular', ui-monospace, monospace;
+
+  /* ---------- 尺寸 ---------- */
+  --sidebar-w: 248px;
+  --topbar-h: 44px;
+  --radius-lg: 10px;
+  --radius-md: 6px;
+  --radius-sm: 4px;
 
   color-scheme: dark;
 }
@@ -39,64 +56,73 @@ body,
 
 body {
   margin: 0;
-  font-family:
-    'HarmonyOS Sans SC',
-    'MiSans',
-    'PingFang SC',
-    'Microsoft YaHei',
-    system-ui,
-    -apple-system,
-    sans-serif;
+  font-family: var(--font-sans);
+  font-size: 13px;
   color: var(--text-1);
-  /* 星辰宇宙全局背景：深色渐变压暗 + BG_Chat 星域图 */
   background:
-    linear-gradient(rgba(4, 9, 20, 0.72), rgba(4, 9, 20, 0.82)),
-    radial-gradient(1200px 600px at 75% -10%, rgba(46, 96, 200, 0.22), transparent 60%),
-    url('../assets/BG_Chat.png') center / cover no-repeat fixed,
+    linear-gradient(rgba(126, 154, 198, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(126, 154, 198, 0.035) 1px, transparent 1px),
+    radial-gradient(1100px 620px at 82% -12%, rgba(91, 140, 255, 0.12), transparent 62%),
+    radial-gradient(900px 560px at -8% 108%, rgba(55, 208, 196, 0.06), transparent 60%),
     var(--bg-deep);
+  background-size: 64px 64px, 64px 64px, auto, auto, auto;
+  background-attachment: fixed;
   background-color: var(--bg-deep);
   -webkit-font-smoothing: antialiased;
 }
 
+h1,
+h2,
+h3,
+h4,
+strong {
+  letter-spacing: -0.01em;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--font-mono);
+}
+
+/* 数据 / 编号统一用等宽数字 */
+.mono,
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 细滚动条 */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(90, 130, 200, 0.28);
-  border-radius: 4px;
+  background: rgba(126, 154, 198, 0.22);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(126, 154, 198, 0.36);
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* 通用面板 */
+/* 通用面板：透明分区，靠发丝线与间距区分，页面背景全程可见 */
 .panel {
-  background: var(--bg-panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  backdrop-filter: blur(8px);
-  transition: border-color 0.25s ease, box-shadow 0.25s ease;
-}
-
-/* 全局星辰交互：面板悬停时泛起星云辉光 */
-.panel:hover {
-  border-color: var(--line-strong);
-  box-shadow:
-    0 0 0 1px rgba(53, 224, 255, 0.08),
-    0 8px 32px rgba(12, 30, 70, 0.45),
-    0 0 46px rgba(63, 122, 255, 0.12);
-}
-
-/* 页面骨架：顶部导航布局，主内容占满宽度 */
-.app-shell {
-  min-height: 100vh;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .panel-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 14px 16px 0;
 }
 
@@ -104,19 +130,18 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: 0.5px;
+  letter-spacing: -0.01em;
 }
 
 .panel-title .title-icon {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  width: 22px;
+  height: 22px;
   color: var(--accent-cyan);
-  background: rgba(53, 224, 255, 0.1);
+  background: transparent;
 }
 
 .panel-link {
@@ -126,7 +151,7 @@ body {
   font-size: 12px;
   color: var(--text-3);
   text-decoration: none;
-  transition: color 0.2s;
+  transition: color 0.16s;
 }
 
 .panel-link:hover {
@@ -143,57 +168,58 @@ button {
   cursor: pointer;
 }
 
-/* ============================================================
-   星辰宇宙：全局粒子 / 辉光交互工具类
-   ============================================================ */
-@keyframes cosmic-shine {
-  from { transform: translateX(-130%) skewX(-18deg); }
-  to   { transform: translateX(230%)  skewX(-18deg); }
-}
-
-@keyframes cosmic-twinkle {
-  0%, 100% { opacity: 0.25; }
-  50%      { opacity: 1; }
-}
-
-@keyframes cosmic-pulse {
-  0%, 100% { box-shadow: 0 0 10px rgba(53, 224, 255, 0.25); }
-  50%      { box-shadow: 0 0 22px rgba(53, 224, 255, 0.55); }
-}
-
-/* 所有按钮：悬停时掠过一道星尘光带 */
+/* 交互反馈只做“动作回应”：颜色与强调线，不做上浮缩放 */
 button {
-  position: relative;
-  overflow: hidden;
-  transition: color 0.18s, border-color 0.18s, background 0.18s, box-shadow 0.18s, filter 0.18s;
+  transition:
+    color 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
 }
 
-button::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  pointer-events: none;
-  opacity: 0;
-  background: linear-gradient(
-    105deg,
-    transparent 35%,
-    rgba(160, 225, 255, 0.3) 50%,
-    transparent 65%
-  );
-  transform: translateX(-130%) skewX(-18deg);
+button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
 }
 
-button:hover:not(:disabled)::before {
-  opacity: 1;
-  animation: cosmic-shine 0.7s ease;
+input,
+select,
+textarea {
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
 
-button:hover:not(:disabled) {
-  filter: brightness(1.08);
+/* 分区线工具类 */
+.hairline {
+  height: 1px;
+  background: var(--line);
+  border: 0;
 }
 
-/* 开关的滑块不属于按钮内容光效范围 */
-.switch::before {
-  display: none;
+/* 页面载入编排：stagger fade + 轻微位移 */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.reveal {
+  animation: rise-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+
+/* 尊重减少动态偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -130,6 +130,14 @@ class InterruptSerializer:
 
 _text_converter = TextConverter()
 _interrupt_serializer = InterruptSerializer(_text_converter)
+# 宿主能力审批：工具内部 interrupt，支持“仅本会话允许”。
+_interrupt_serializer.register(
+    "host_approval",
+    matcher=lambda value: value.get("type") == "host_approval",
+    extractor=lambda value: {
+        "host_approval": value.get("host_approval", {}),
+    },
+)
 # HITL 审批：DeepAgents / LangChain 的 interrupt_on 会返回 action_requests。
 _interrupt_serializer.register(
     "hitl_approval",
@@ -139,7 +147,16 @@ _interrupt_serializer.register(
         **({"review_configs": value["review_configs"]} if "review_configs" in value else {}),
     },
 )
-# HITL 补充信息：hitl_tool.request_additional_info 的中断结构。
+# HITL 补充信息 / 推荐选项：agent.hitl 的统一中断结构。
+_interrupt_serializer.register(
+    "hitl_request",
+    matcher=lambda value: value.get("type") == "hitl_request",
+    extractor=lambda value: {
+        "hitl": value.get("hitl", {}),
+        "resume_schema": value.get("resume_schema", {}),
+    },
+)
+# 兼容旧 checkpoint：早期 request_additional_info 的中断结构。
 _interrupt_serializer.register(
     "information_request",
     matcher=lambda value: value.get("type") == "information_request",

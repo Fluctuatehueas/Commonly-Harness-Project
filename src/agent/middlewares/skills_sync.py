@@ -23,6 +23,10 @@ class SandboxSkillsMiddleware(SkillsMiddleware):
     async def abefore_agent(self, state: dict[str, Any], runtime: Any, config: Any) -> Any:
         """在用户代理锁内同步，并刷新当前线程的技能索引。"""
         backend = getattr(self._backend, "default", self._backend)
+        # 默认后端现在是 ProjectWorkspaceBackend（文件走项目/会话沙箱）。
+        # 技能必须同步到用户级沙箱的 /skills 与 /AGENTS.md，因此取它持有的
+        # SandboxBackendProxy，而不是走项目文件路由。
+        backend = getattr(backend, "sandbox", None) or backend
         await asyncio.to_thread(self._synchronizer.sync, backend)
         # manifest 属于用户级状态，而元数据属于单个线程，不能沿用旧缓存。
         refreshed_state = dict(state)

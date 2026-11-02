@@ -9,13 +9,15 @@ export interface NavItem {
 }
 
 export const NAV_ITEMS: NavItem[] = [
-  { key: 'chat', label: '对话测试', icon: 'message', path: '/' },
-  { key: 'overview', label: '总览', icon: 'home', path: '/overview' },
-  { key: 'models', label: '模型管理', icon: 'cube', path: '/models' },
-  { key: 'chat-control', label: '对话控制', icon: 'sliders', path: '/chat-control' },
-  { key: 'kb', label: '知识库', icon: 'book', path: '/kb' },
-  { key: 'workflow', label: '轨迹', icon: 'workflow', path: '/workflow' },
+  { key: 'home', label: '工作台', icon: 'home', path: '/' },
+  { key: 'chat', label: '对话', icon: 'message', path: '/chat' },
+  { key: 'workflow', label: '轨迹', icon: 'workflow', path: '/trajectory' },
+  { key: 'tasks', label: '我的任务图', icon: 'target', path: '/tasks' },
   { key: 'plugins', label: '插件市场', icon: 'plug', path: '/plugins' },
+  { key: 'skills', label: '技能管理', icon: 'sparkles', path: '/skills' },
+  { key: 'mcp', label: 'MCP服务', icon: 'server', path: '/mcp' },
+  { key: 'kb', label: '知识库', icon: 'book', path: '/kb' },
+  { key: 'models', label: '模型管理', icon: 'cube', path: '/models' },
   { key: 'settings', label: '系统设置', icon: 'gear', path: '/settings' },
 ]
 

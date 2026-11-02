@@ -32,19 +32,10 @@ class ContextWindowMonitorMiddleWare(AgentMiddleware):
         self.alert_threshold = float(alert_threshold)
         self.context_limit = int(context_limit or 0)
 
-    # ---------- 同步版本 ----------
-
-    def before_agent(self, state: dict[str, Any], runtime: Runtime) -> dict[str, Any] | None:
-        """Agent 启动前采集一次上下文占用。"""
-        self._check_and_report(state, phase="before_agent")
-        return None
-
-    def after_agent(self, state: dict[str, Any], runtime: Runtime) -> dict[str, Any] | None:
-        """Agent 结束后再采集一次，观察本轮对话对上下文的消耗。"""
-        self._check_and_report(state, phase="after_agent")
-        return None
-
-    # ---------- 异步版本（托管版 DeepAgent 强制走异步） ----------
+    # ---------- 异步钩子 ----------
+    # DeepAgents 统一走异步图；同时实现同步钩子会让中间件链出现两个同名节点，
+    # LangGraph 会报 "wrote to unknown channel branch:to:<middleware>.before_agent"。
+    # 因此这里只保留 async 版本。
 
     async def abefore_agent(self, state: dict[str, Any], runtime: Runtime) -> dict[str, Any] | None:
         self._check_and_report(state, phase="abefore_agent")

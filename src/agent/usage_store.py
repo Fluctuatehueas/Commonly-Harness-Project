@@ -23,6 +23,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from agent.config import MODEL_CONTEXT_LIMIT
+
 USAGE_NAMESPACE_PREFIX = ("usage",)
 SESSION_KEY = "session"
 
@@ -51,15 +53,29 @@ def _session_summary(rounds: list[dict[str, Any]]) -> dict[str, int]:
 
 
 async def read_usage(store: Any, *, user_id: str, thread_id: str) -> dict[str, Any]:
-    """读取会话用量；无记录时返回空结构。"""
+    """读取会话用量；无记录时返回空结构。
+
+    ``session.context_window`` 与 ``session.context_used`` 是运行时附加字段，
+    让前端不用再维护本地上下文窗口常量。
+    """
     if store is None or not user_id or not thread_id:
-        return {"rounds": [], "session": _session_summary([])}
+        return _with_context_window({"rounds": [], "session": _session_summary([])})
     item = await store.aget(usage_namespace(user_id, thread_id), SESSION_KEY)
     if item is None:
-        return {"rounds": [], "session": _session_summary([])}
+        return _with_context_window({"rounds": [], "session": _session_summary([])})
     value = dict(item.value or {})
     rounds = [dict(entry) for entry in value.get("rounds", []) if isinstance(entry, dict)]
-    return {"rounds": rounds, "session": _session_summary(rounds)}
+    return _with_context_window({"rounds": rounds, "session": _session_summary(rounds)})
+
+
+def _with_context_window(usage: dict[str, Any]) -> dict[str, Any]:
+    """给会话用量补上真实上下文窗口与当前占用。"""
+    session = dict(usage.get("session") or {})
+    session.setdefault("context_window", int(MODEL_CONTEXT_LIMIT))
+    session.setdefault("context_used", int(session.get("input") or 0))
+    result = dict(usage)
+    result["session"] = session
+    return result
 
 
 async def append_usage_round(

@@ -3,10 +3,28 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import AppIcon from './AppIcon.vue'
+import WindowControls from './WindowControls.vue'
+import brandIcon from '@/assets/icon.png'
 import { NAV_ITEMS } from '@/mock/dashboard'
 
 const route = useRoute()
 const active = computed(() => String(route.name || 'home'))
+
+// Electron 里才启用自绘窗口拖动区与右上角按钮；浏览器构建完全不受影响。
+const bridge = (
+  window as unknown as {
+    harnessWindow?: { toggleMaximize: () => void }
+  }
+).harnessWindow
+const isElectron = Boolean(bridge)
+
+function onTopbarDblClick(event: MouseEvent) {
+  if (!bridge) return
+  const target = event.target as HTMLElement | null
+  // 点在链接 / 按钮 / 输入框上时不触发窗口最大化
+  if (target?.closest('a, button, input, select, textarea, .no-drag')) return
+  bridge.toggleMaximize()
+}
 
 const now = ref(format(new Date()))
 let timer: number | undefined
@@ -23,9 +41,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
 </script>
 
 <template>
-  <header class="topnav">
+  <header class="topnav" :class="{ electron: isElectron }" @dblclick="onTopbarDblClick">
     <RouterLink to="/" class="brand">
-      <span class="brand-logo"><AppIcon name="globe" :size="18" /></span>
+      <img class="brand-logo" :src="brandIcon" alt="Harness" />
       <strong>Harness</strong>
     </RouterLink>
 
@@ -45,6 +63,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
     <div class="spacer"></div>
     <slot name="actions"></slot>
     <div class="clock">{{ now }}</div>
+    <WindowControls />
   </header>
 </template>
 
@@ -56,40 +75,53 @@ onBeforeUnmount(() => window.clearInterval(timer))
   height: var(--topbar-h);
   display: flex;
   align-items: center;
-  gap: 18px;
-  padding: 0 20px;
-  background: rgba(6, 12, 26, 0.82);
+  gap: 12px;
+  padding: 0 14px 0 12px;
+  background: rgba(9, 14, 25, 0.62);
   border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
+}
+
+/* Electron 无边框窗口：顶栏作为拖动区，交互元素与窗口按钮单独排除 */
+.topnav.electron {
+  -webkit-app-region: drag;
+}
+
+.topnav.electron :deep(a),
+.topnav.electron :deep(button),
+.topnav.electron :deep(input),
+.topnav.electron :deep(select),
+.topnav.electron :deep(textarea) {
+  -webkit-app-region: no-drag;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   flex: none;
 }
 
 .brand-logo {
-  display: grid;
-  place-items: center;
   width: 30px;
   height: 30px;
-  border-radius: 50%;
-  color: #cfe3ff;
-  background: radial-gradient(circle at 30% 30%, #2f6bff, #0a1e4d);
-  box-shadow: 0 0 14px rgba(63, 122, 255, 0.4);
+  flex: none;
+  border-radius: 0;
+  object-fit: contain;
+  box-shadow: none;
 }
 
 .brand strong {
-  font-size: 16px;
-  letter-spacing: 0.5px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
 .menu {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
+  height: 100%;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -99,31 +131,51 @@ onBeforeUnmount(() => window.clearInterval(timer))
 }
 
 .menu-item {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
+  height: 100%;
   flex: none;
-  padding: 7px 12px;
-  font-size: 12.5px;
+  padding: 6px 10px;
+  font-size: 12px;
+  letter-spacing: 0;
   color: var(--text-2);
-  border-radius: 999px;
   white-space: nowrap;
-  transition: all 0.18s;
+  transition: color 0.16s ease, background 0.16s ease;
 }
 
 .menu-item span {
   white-space: nowrap;
 }
 
+.menu-item::after {
+  content: '';
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 0;
+  height: 1px;
+  background: transparent;
+  transition: background 0.16s ease;
+}
+
 .menu-item:hover {
   color: var(--text-1);
-  background: rgba(79, 140, 255, 0.1);
+  background: rgba(126, 154, 198, 0.06);
 }
 
 .menu-item.active {
-  color: #fff;
-  background: linear-gradient(90deg, rgba(63, 122, 255, 0.9), rgba(47, 94, 210, 0.6));
-  box-shadow: 0 2px 12px rgba(47, 108, 255, 0.35);
+  color: var(--text-1);
+  background: transparent;
+}
+
+.menu-item.active::after {
+  background: var(--accent);
+}
+
+.menu-item.active :deep(svg) {
+  color: var(--accent);
 }
 
 .spacer {
@@ -132,13 +184,15 @@ onBeforeUnmount(() => window.clearInterval(timer))
 
 .clock {
   flex: none;
-  padding: 5px 12px;
-  font-size: 11.5px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
   white-space: nowrap;
-  color: var(--text-1);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(16, 32, 64, 0.55);
+  color: var(--text-3);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 </style>

@@ -31,17 +31,7 @@ from opensandbox.sync.manager import SandboxManagerSync
 from agent.backends.open_sandbox import OpenSandboxBackend
 from agent.backends.sandbox_proxy import SandboxBackendProxy
 from agent.backends.skill_sync import SandboxSkillSynchronizer
-from agent.config import (
-    OPEN_SANDBOX_API_KEY,
-    OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS,
-    OPEN_SANDBOX_HOST,
-    OPEN_SANDBOX_IMAGE,
-    OPEN_SANDBOX_PORT,
-    OPEN_SANDBOX_PREWARM_ENABLED,
-    OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS,
-    OPEN_SANDBOX_USE_SERVER_PROXY,
-    SKILLS_ROOT,
-)
+from agent import config as agent_config
 
 
 SANDBOX_NAMESPACE_PREFIX = ("sandboxes",)
@@ -62,11 +52,14 @@ class SandboxManager:
         self._close_task: asyncio.Task[None] | None = None
         self._is_closed = False
         self._connection: ConnectionConfigSync | None = None
-        if OPEN_SANDBOX_API_KEY:
+        if agent_config.OPEN_SANDBOX_API_KEY:
             self._connection = ConnectionConfigSync(
-                api_key=OPEN_SANDBOX_API_KEY,
-                domain=f"{OPEN_SANDBOX_HOST}:{OPEN_SANDBOX_PORT}",
-                use_server_proxy=OPEN_SANDBOX_USE_SERVER_PROXY,
+                api_key=agent_config.OPEN_SANDBOX_API_KEY,
+                domain=(
+                    f"{agent_config.OPEN_SANDBOX_HOST}:"
+                    f"{agent_config.OPEN_SANDBOX_PORT}"
+                ),
+                use_server_proxy=agent_config.OPEN_SANDBOX_USE_SERVER_PROXY,
             )
 
     async def initialize(self) -> None:
@@ -96,7 +89,7 @@ class SandboxManager:
         """
         if (
             self._is_closed
-            or not OPEN_SANDBOX_PREWARM_ENABLED
+            or not agent_config.OPEN_SANDBOX_PREWARM_ENABLED
             or self._warm_reserve is not None
             or (self._warm_task is not None and not self._warm_task.done())
         ):
@@ -281,7 +274,9 @@ class SandboxManager:
         """
         sandbox = SandboxSync.connect(sandbox_id, connection_config=self._connection)
         try:
-            backend = OpenSandboxBackend(sandbox, OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS)
+            backend = OpenSandboxBackend(
+                sandbox, agent_config.OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS
+            )
             if backend.is_healthy():
                 return backend
             raise RuntimeError("用户沙箱暂时不可用，请稍后重试；原沙箱及持久化标识已保留")
@@ -294,13 +289,17 @@ class SandboxManager:
         创建客户端；预热实例故意不写入用户元数据。
         """
         sandbox = SandboxSync.create(
-            image=OPEN_SANDBOX_IMAGE,
-            timeout=timedelta(seconds=OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS),
+            image=agent_config.OPEN_SANDBOX_IMAGE,
+            timeout=timedelta(
+                seconds=agent_config.OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS
+            ),
             metadata={"myagent_user_id": user_id} if user_id is not None else {},
             connection_config=self._connection,
         )
         try:
-            backend = OpenSandboxBackend(sandbox, OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS)
+            backend = OpenSandboxBackend(
+                sandbox, agent_config.OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS
+            )
         except BaseException:
             sandbox.close()
             raise
@@ -313,7 +312,8 @@ class SandboxManager:
         backend = self._create_backend()
         try:
             SandboxSkillSynchronizer(
-                SKILLS_ROOT, Path(__file__).resolve().parents[1] / "memory" / "AGENTS.md",
+                agent_config.SKILLS_ROOT,
+                Path(__file__).resolve().parents[1] / "memory" / "AGENTS.md",
             ).sync(SandboxBackendProxy(backend))
         except BaseException:
             self._discard_reserve(backend)
@@ -346,7 +346,10 @@ class SandboxManager:
             manager = SandboxManagerSync.create(connection_config=self._connection)
             try:
                 manager.renew_sandbox(
-                    sandbox_id, timedelta(seconds=OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS),
+                    sandbox_id,
+                    timedelta(
+                        seconds=agent_config.OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS
+                    ),
                 )
             finally:
                 manager.close()

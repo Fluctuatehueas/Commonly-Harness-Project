@@ -27,32 +27,101 @@ let timer: number | undefined
 
 // 甘特图按过程类别分行；颜色与对话页的轨迹条保持同一套语义
 const LANES = [
-  { key: 'run', label: 'Run', color: '#5b6b8c', icon: 'workflow' },
-  { key: 'model', label: '模型', color: '#4f8cff', icon: 'sparkles' },
-  { key: 'tool', label: '工具', color: '#35e0ff', icon: 'wrench' },
-  { key: 'skill', label: '技能', color: '#a78bfa', icon: 'layers' },
-  { key: 'delegation', label: '委派', color: '#ffb648', icon: 'users' },
-  { key: 'hitl', label: '人工介入', color: '#ff6b6b', icon: 'shield' },
+  { key: 'run', label: 'Run', color: '#5c6f92', icon: 'workflow' },
+  { key: 'model', label: '模型', color: '#5b8cff', icon: 'sparkles' },
+  { key: 'tool', label: '工具', color: '#37d0c4', icon: 'wrench' },
+  { key: 'skill', label: '技能', color: '#8f7bff', icon: 'layers' },
+  { key: 'delegation', label: '委派', color: '#f2b03c', icon: 'users' },
+  { key: 'hitl', label: '人工介入', color: '#e2605e', icon: 'shield' },
 ] as const
 
 const TYPE_META: Record<string, { label: string; icon: IconName; color: string }> = {
-  run: { label: 'Run', icon: 'workflow', color: '#5b6b8c' },
-  model: { label: '模型', icon: 'sparkles', color: '#4f8cff' },
-  tool: { label: '工具', icon: 'wrench', color: '#35e0ff' },
-  skill: { label: '技能', icon: 'layers', color: '#a78bfa' },
-  delegation: { label: '委派', icon: 'users', color: '#ffb648' },
-  hitl: { label: '人工介入', icon: 'shield', color: '#ff6b6b' },
+  run: { label: 'Run', icon: 'workflow', color: '#5c6f92' },
+  model: { label: '模型', icon: 'sparkles', color: '#5b8cff' },
+  tool: { label: '工具', icon: 'wrench', color: '#37d0c4' },
+  skill: { label: '技能', icon: 'layers', color: '#8f7bff' },
+  delegation: { label: '委派', icon: 'users', color: '#f2b03c' },
+  hitl: { label: '人工介入', icon: 'shield', color: '#e2605e' },
 }
 
+// selectedRunId 为空表示查看整个会话的全部轮次
 const selectedRun = computed(
-  () => runs.value.find((run) => run.run_id === selectedRunId.value) || runs.value[runs.value.length - 1],
+  () => runs.value.find((run) => run.run_id === selectedRunId.value) || null,
 )
 
-const events = computed(() => selectedRun.value?.events || [])
+const activeRuns = computed<TrajectoryRun[]>(() => {
+  if (!selectedRunId.value) return runs.value
+  const run = selectedRun.value
+  return run ? [run] : []
+})
+
+const events = computed(() => activeRuns.value.flatMap((run) => run.events))
+
+const runNumber = computed(() => {
+  const map = new Map<string, number>()
+  runs.value.forEach((run, index) => map.set(run.run_id, index + 1))
+  return map
+})
+
+const scopeStatus = computed(() => {
+  if (!runs.value.length) return '暂无运行'
+  if (selectedRunId.value) return selectedRun.value?.status || '暂无运行'
+  if (runs.value.some((run) => run.status === 'running')) return 'running'
+  return runs.value[runs.value.length - 1]?.status || 'done'
+})
+
+// 全部轮次时把每轮的汇总累加，单轮时直接复用该 run 的统计。
+const summary = computed(() => {
+  if (selectedRun.value) return selectedRun.value.summary
+  const total = {
+    model_calls: 0,
+    tool_calls: 0,
+    skill_calls: 0,
+    delegations: 0,
+    hitl: 0,
+    tokens: { input: 0, output: 0, total: 0 },
+    peak_context_tokens: 0,
+    duration_ms: 0,
+    event_count: 0,
+  }
+  for (const run of activeRuns.value) {
+    total.model_calls += run.summary.model_calls
+    total.tool_calls += run.summary.tool_calls
+    total.skill_calls += run.summary.skill_calls
+    total.delegations += run.summary.delegations
+    total.hitl += run.summary.hitl
+    total.tokens.input += run.summary.tokens.input || 0
+    total.tokens.output += run.summary.tokens.output || 0
+    total.tokens.total += run.summary.tokens.total || 0
+    total.peak_context_tokens = Math.max(total.peak_context_tokens, run.summary.peak_context_tokens)
+    total.duration_ms += run.summary.duration_ms || 0
+    total.event_count += run.summary.event_count
+  }
+  return total
+})
 
 const selectedEvent = computed(
   () => events.value.find((event) => event.id === selectedEventId.value) || null,
 )
+
+// 过程日志按页展示，避免轨迹很多时整页被无限拉长
+const LOG_PAGE_SIZE = 20
+const logPage = ref(1)
+const logPages = computed(() =>
+  Math.max(1, Math.ceil(events.value.length / LOG_PAGE_SIZE)),
+)
+const pagedEvents = computed(() => {
+  const start = (logPage.value - 1) * LOG_PAGE_SIZE
+  return events.value.slice(start, start + LOG_PAGE_SIZE)
+})
+
+watch(
+  () => events.value.length,
+  () => {
+    if (logPage.value > logPages.value) logPage.value = logPages.value
+  },
+)
+
 
 const ganttRange = computed(() => {
   const starts = events.value
@@ -99,13 +168,20 @@ function formatOffset(ms: number) {
   if (ms < 1000) return `+${Math.round(ms)}ms`
   const seconds = ms / 1000
   if (seconds < 60) return `+${seconds.toFixed(seconds < 10 ? 1 : 0)}s`
-  return `+${Math.floor(seconds / 60)}m${Math.round(seconds % 60)}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `+${minutes}m${Math.round(seconds % 60)}s`
+  const hours = Math.floor(minutes / 60)
+  return `+${hours}h${minutes % 60}m`
 }
 
 function durationLabel(ms: number | null | undefined) {
   if (ms === null || ms === undefined) return '—'
   if (ms < 1000) return `${ms}ms`
-  return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 60) return `${minutes}m${Math.round((ms % 60_000) / 1000)}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h${minutes % 60}m`
 }
 
 function timeLabel(iso: string) {
@@ -122,6 +198,9 @@ function statusLabel(status: string) {
       done: '完成',
       error: '失败',
       interrupted: '等待介入',
+      answered: '已回复',
+      approved: '已批准',
+      rejected: '已拒绝',
     }[status] || status
   )
 }
@@ -138,8 +217,10 @@ function eventTime(event: TrajectoryEvent) {
 
 function selectRun(runId: string) {
   selectedRunId.value = runId
-  const run = runs.value.find((item) => item.run_id === runId)
-  const list = run?.events || []
+  logPage.value = 1
+  const list = runId
+    ? runs.value.find((item) => item.run_id === runId)?.events || []
+    : events.value
   const last = [...list].reverse().find((event) => event.type !== 'run') || list[list.length - 1]
   selectedEventId.value = last?.id || ''
 }
@@ -152,6 +233,11 @@ function selectEvent(eventId: string) {
   selectedEventId.value = eventId
 }
 
+function eventRunLabel(event: TrajectoryEvent): string {
+  const index = runNumber.value.get(event.run_id)
+  return index ? `第${index}轮` : ''
+}
+
 async function load() {
   if (!threadId.value) {
     runs.value = []
@@ -162,9 +248,14 @@ async function load() {
   try {
     const data = await fetchTrajectory(threadId.value, USER_ID)
     runs.value = data.runs
-    if (!data.runs.some((run) => run.run_id === selectedRunId.value)) {
-      selectRun(data.latest_run_id || data.runs[data.runs.length - 1]?.run_id || '')
-    } else if (!selectedEventId.value) {
+    if (
+      selectedRunId.value &&
+      !data.runs.some((run) => run.run_id === selectedRunId.value)
+    ) {
+      // 选中的轮次已不存在（会话被清理）时回到整会话视图
+      selectedRunId.value = ''
+    }
+    if (!selectedEventId.value || !events.value.some((event) => event.id === selectedEventId.value)) {
       selectRun(selectedRunId.value)
     }
   } catch (err) {
@@ -178,7 +269,7 @@ function startTimer() {
   stopTimer()
   if (!autoRefresh.value) return
   timer = window.setInterval(() => {
-    if (selectedRun.value?.status === 'running') void load()
+    if (activeRuns.value.some((run) => run.status === 'running')) void load()
   }, 4000)
 }
 
@@ -198,6 +289,7 @@ watch(
 watch(threadId, () => {
   selectedRunId.value = ''
   selectedEventId.value = ''
+  logPage.value = 1
   void load()
   startTimer()
 })
@@ -218,7 +310,7 @@ onBeforeUnmount(stopTimer)
     <TopNav>
       <template #actions>
         <span class="status-chip">
-          <i class="dot"></i>{{ selectedRun ? statusLabel(selectedRun.status) : '暂无运行' }}
+          <i class="dot"></i>{{ statusLabel(scopeStatus) }}
         </span>
         <span class="auto-toggle">
           <UiSwitch v-model="autoRefresh" />
@@ -244,11 +336,12 @@ onBeforeUnmount(stopTimer)
             </option>
           </select>
           <select
-            v-if="runs.length > 1"
+            v-if="runs.length > 0"
             class="run-select"
             :value="selectedRunId"
             @change="onRunChange"
           >
+            <option value="">全部轮次（整会话）</option>
             <option v-for="(run, index) in runs" :key="run.run_id" :value="run.run_id">
               第 {{ index + 1 }} 轮 · {{ timeLabel(run.started_at) }}
             </option>
@@ -267,7 +360,7 @@ onBeforeUnmount(stopTimer)
         <p>先在对话页发送一条消息，再回到这里查看执行轨迹。</p>
       </div>
 
-      <div v-else-if="!selectedRun" class="panel empty">
+      <div v-else-if="runs.length === 0" class="panel empty">
         <div class="empty-orb"><AppIcon name="workflow" :size="24" /></div>
         <h3>本会话还没有轨迹数据</h3>
         <p>轨迹由后端 TrajectoryMiddleware 记录；发一条消息后再刷新即可。</p>
@@ -277,31 +370,32 @@ onBeforeUnmount(stopTimer)
       <template v-else>
         <section class="summary">
           <div class="stat">
-            <small>总耗时</small>
-            <strong>{{ durationLabel(selectedRun.summary.duration_ms) }}</strong>
+            <small>{{ selectedRunId ? '总耗时' : '累计耗时' }}</small>
+            <strong>{{ durationLabel(summary.duration_ms) }}</strong>
+            <span v-if="!selectedRunId" class="stat-sub">{{ activeRuns.length }} 轮</span>
           </div>
           <div class="stat">
             <small>模型调用</small>
-            <strong>{{ selectedRun.summary.model_calls }}</strong>
+            <strong>{{ summary.model_calls }}</strong>
           </div>
           <div class="stat">
             <small>工具 / 技能</small>
-            <strong>{{ selectedRun.summary.tool_calls }} / {{ selectedRun.summary.skill_calls }}</strong>
+            <strong>{{ summary.tool_calls }} / {{ summary.skill_calls }}</strong>
           </div>
           <div class="stat">
             <small>委派 / 介入</small>
-            <strong>{{ selectedRun.summary.delegations }} / {{ selectedRun.summary.hitl }}</strong>
+            <strong>{{ summary.delegations }} / {{ summary.hitl }}</strong>
           </div>
           <div class="stat">
             <small>Token</small>
-            <strong>{{ selectedRun.summary.tokens.total }}</strong>
+            <strong>{{ summary.tokens.total }}</strong>
             <span class="stat-sub">
-              in {{ selectedRun.summary.tokens.input }} · out {{ selectedRun.summary.tokens.output }}
+              in {{ summary.tokens.input }} · out {{ summary.tokens.output }}
             </span>
           </div>
           <div class="stat">
             <small>上下文峰值</small>
-            <strong>{{ selectedRun.summary.peak_context_tokens }}</strong>
+            <strong>{{ summary.peak_context_tokens }}</strong>
             <span class="stat-sub">
               / {{ events[events.length - 1]?.context?.limit || 0 }} tokens
             </span>
@@ -348,27 +442,37 @@ onBeforeUnmount(stopTimer)
             <section class="panel log-panel">
               <header class="panel-head">
                 <strong>过程日志</strong>
-                <small>按时间顺次排列，点击查看详情</small>
+                <small>共 {{ events.length }} 条 · 按时间顺次排列，点击查看详情</small>
               </header>
               <div class="log-list">
                 <button
-                  v-for="event in events"
+                  v-for="event in pagedEvents"
                   :key="event.id"
                   class="log-item"
                   type="button"
                   :class="{ selected: selectedEventId === event.id }"
                   @click="selectEvent(event.id)"
                 >
-                  <span class="log-time">{{ timeLabel(eventTime(event)) }}</span>
-                  <span class="log-dot" :style="{ background: typeMeta(event.type).color }"></span>
-                  <span class="log-label">{{ event.label }}</span>
-                  <span class="log-type">{{ typeMeta(event.type).label }}</span>
-                  <span class="log-duration">{{ durationLabel(event.duration_ms) }}</span>
-                  <span class="log-status" :class="event.status">{{ statusLabel(event.status) }}</span>
-                  <span class="log-tokens" v-if="event.tokens?.total">{{ event.tokens.total }} tok</span>
+                  <div class="log-main">
+                    <span class="log-dot" :style="{ background: typeMeta(event.type).color }"></span>
+                    <span class="log-label">{{ event.label }}</span>
+                    <span class="log-status" :class="event.status">{{ statusLabel(event.status) }}</span>
+                  </div>
+                  <div class="log-meta">
+                    <span class="log-time">{{ timeLabel(eventTime(event)) }}</span>
+                    <span class="log-run">{{ eventRunLabel(event) }}</span>
+                    <span class="log-type">{{ typeMeta(event.type).label }}</span>
+                    <span class="log-duration">耗时 {{ durationLabel(event.duration_ms) }}</span>
+                    <span class="log-tokens" v-if="event.tokens?.total">{{ event.tokens.total }} tok</span>
+                  </div>
                 </button>
-                <p v-if="events.length === 0" class="log-empty">本轮没有过程记录</p>
+                <p v-if="events.length === 0" class="log-empty">当前范围没有过程记录</p>
               </div>
+              <footer v-if="logPages > 1" class="log-pager">
+                <button type="button" :disabled="logPage <= 1" @click="logPage--">上一页</button>
+                <span>第 {{ logPage }} / {{ logPages }} 页</span>
+                <button type="button" :disabled="logPage >= logPages" @click="logPage++">下一页</button>
+              </footer>
             </section>
           </div>
 
@@ -468,10 +572,11 @@ onBeforeUnmount(stopTimer)
 }
 
 .panel {
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--bg-card);
-  backdrop-filter: blur(8px);
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  backdrop-filter: none;
 }
 
 .head {
@@ -491,11 +596,10 @@ onBeforeUnmount(stopTimer)
 .title-icon {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
+  width: 22px;
+  height: 22px;
   color: var(--accent-cyan);
-  background: rgba(53, 224, 255, 0.1);
+  background: transparent;
 }
 
 .head-title strong {
@@ -523,8 +627,8 @@ onBeforeUnmount(stopTimer)
   font-family: inherit;
   color: var(--text-2);
   border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  background: rgba(6, 13, 28, 0.8);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
   outline: none;
 }
 
@@ -533,13 +637,13 @@ onBeforeUnmount(stopTimer)
   align-items: center;
   gap: 6px;
   flex: none;
-  padding: 4px 11px;
-  font-size: 11px;
+  padding: 3px 9px;
+  font-size: 10.5px;
   white-space: nowrap;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(16, 32, 64, 0.5);
+  border-radius: var(--radius-sm);
+  background: transparent;
 }
 
 .status-chip .dot {
@@ -569,19 +673,20 @@ onBeforeUnmount(stopTimer)
   align-items: center;
   gap: 5px;
   flex: none;
-  padding: 6px 12px;
-  font-size: 12px;
+  padding: 5px 10px;
+  font-size: 11.5px;
   white-space: nowrap;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   background: transparent;
-  transition: all 0.18s;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 .ghost:hover:not(:disabled) {
   color: var(--text-1);
   border-color: var(--line-strong);
+  background: var(--bg-hover);
 }
 
 .ghost:disabled {
@@ -591,12 +696,12 @@ onBeforeUnmount(stopTimer)
 
 .error-note {
   margin: 0;
-  padding: 8px 12px;
+  padding: 8px 10px;
   font-size: 12px;
   color: var(--amber);
-  border: 1px solid rgba(255, 182, 72, 0.3);
-  border-radius: 10px;
-  background: rgba(255, 182, 72, 0.08);
+  border: 1px solid rgba(242, 176, 60, 0.3);
+  border-radius: var(--radius-sm);
+  background: transparent;
 }
 
 .summary {
@@ -606,40 +711,11 @@ onBeforeUnmount(stopTimer)
 }
 
 .stat {
-  position: relative;
-  overflow: hidden;
-  padding: 11px 13px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background:
-    radial-gradient(120% 90% at 85% -10%, rgba(63, 122, 255, 0.16), transparent 55%),
-    linear-gradient(160deg, rgba(24, 44, 84, 0.62), rgba(9, 18, 38, 0.74));
-  box-shadow: inset 0 0 20px rgba(63, 122, 255, 0.05);
-  backdrop-filter: blur(6px);
-  transition: border-color 0.22s, box-shadow 0.22s, transform 0.22s;
-}
-
-/* 卡内漂浮的星尘光点 */
-.stat::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background-image:
-    radial-gradient(1.2px 1.2px at 18% 30%, rgba(160, 225, 255, 0.9), transparent 60%),
-    radial-gradient(1px 1px at 68% 18%, rgba(200, 235, 255, 0.75), transparent 60%),
-    radial-gradient(1.4px 1.4px at 84% 62%, rgba(120, 210, 255, 0.7), transparent 60%),
-    radial-gradient(1px 1px at 38% 78%, rgba(190, 225, 255, 0.6), transparent 60%);
-  animation: cosmic-twinkle 3.2s ease-in-out infinite;
-}
-
-.stat:hover {
-  transform: translateY(-2px);
-  border-color: var(--line-strong);
-  box-shadow:
-    inset 0 0 20px rgba(63, 122, 255, 0.08),
-    0 6px 22px rgba(8, 20, 46, 0.55),
-    0 0 26px rgba(53, 224, 255, 0.14);
+  padding: 10px 2px 2px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .stat small {
@@ -651,13 +727,10 @@ onBeforeUnmount(stopTimer)
 .stat strong {
   display: block;
   margin-top: 2px;
-  font-size: 16px;
+  font-family: var(--font-mono);
+  font-size: 15px;
   font-variant-numeric: tabular-nums;
-  background: linear-gradient(100deg, #dff3ff, #7cc4ff 55%, #35e0ff);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  text-shadow: 0 0 18px rgba(53, 224, 255, 0.25);
+  color: var(--text-1);
 }
 
 .stat-sub {
@@ -760,16 +833,16 @@ onBeforeUnmount(stopTimer)
 .lane-track {
   position: relative;
   height: 20px;
-  border-radius: 5px;
+  border-radius: 0;
   background:
     repeating-linear-gradient(
       90deg,
-      rgba(96, 156, 255, 0.07) 0,
-      rgba(96, 156, 255, 0.07) 1px,
+      rgba(126, 154, 198, 0.06) 0,
+      rgba(126, 154, 198, 0.06) 1px,
       transparent 1px,
       transparent 25%
     ),
-    rgba(6, 13, 28, 0.45);
+    var(--bg-rail);
 }
 
 .gantt-bar {
@@ -778,21 +851,20 @@ onBeforeUnmount(stopTimer)
   height: 12px;
   padding: 0;
   border: none;
-  border-radius: 4px;
-  opacity: 0.65;
+  border-radius: 2px;
+  opacity: 0.7;
   overflow: hidden;
   cursor: pointer;
-  transition: opacity 0.15s, box-shadow 0.15s, transform 0.15s;
+  transition: opacity 0.15s, box-shadow 0.15s;
 }
 
 .gantt-bar:hover {
-  opacity: 0.95;
-  transform: translateY(-1px);
+  opacity: 1;
 }
 
 .gantt-bar.selected {
   opacity: 1;
-  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.75), 0 0 10px rgba(53, 224, 255, 0.35);
+  box-shadow: 0 0 0 1px rgba(230, 237, 249, 0.8);
 }
 
 .bar-label {
@@ -810,34 +882,81 @@ onBeforeUnmount(stopTimer)
 .log-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  max-height: 340px;
-  overflow-y: auto;
+  gap: 4px;
+  padding-right: 2px;
 }
 
-.log-item {
-  display: grid;
-  grid-template-columns: 68px 8px minmax(0, 1fr) 54px 52px 58px 66px;
+/* 日志分页：分页后列表可以完整展开，不再用内部滚动条挤压内容 */
+.log-pager {
+  display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 7px 8px;
+  justify-content: center;
+  gap: 12px;
+  padding: 10px 0 2px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.log-pager button {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+}
+
+.log-pager button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.log-pager button:hover:not(:disabled) {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+
+/* 两行式日志：第一行标题，第二行元信息，避免多列挤压内容 */
+.log-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
   font-size: 11px;
   text-align: left;
   color: var(--text-2);
-  border: 1px solid transparent;
-  border-radius: 7px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
   background: transparent;
-  transition: all 0.15s;
+  transition: background 0.15s, color 0.15s;
 }
 
 .log-item:hover {
-  background: rgba(79, 140, 255, 0.07);
+  background: var(--bg-hover);
 }
 
 .log-item.selected {
   color: var(--text-1);
-  border-color: var(--line-strong);
-  background: rgba(53, 224, 255, 0.06);
+  background: var(--bg-hover);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.log-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.log-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-left: 13px;
+  font-size: 9.5px;
+  color: var(--text-3);
 }
 
 .log-time {
@@ -846,16 +965,25 @@ onBeforeUnmount(stopTimer)
   font-variant-numeric: tabular-nums;
 }
 
+.log-run {
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+
 .log-dot {
   width: 6px;
   height: 6px;
+  flex: none;
   border-radius: 50%;
 }
 
 .log-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-1);
+  word-break: break-word;
 }
 
 .log-type {
@@ -868,35 +996,47 @@ onBeforeUnmount(stopTimer)
   font-size: 9.5px;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
-  text-align: right;
 }
 
 .log-status {
-  padding: 1px 5px;
+  flex: none;
+  margin-left: auto;
+  padding: 1px 6px;
   font-size: 9px;
   text-align: center;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line);
 }
 
 .log-status.done {
-  color: var(--green);
-  border-color: rgba(61, 220, 132, 0.3);
+  color: var(--accent-cyan);
+  border-color: rgba(55, 208, 196, 0.3);
 }
 
 .log-status.running {
-  color: var(--accent-cyan);
-  border-color: rgba(53, 224, 255, 0.3);
+  color: var(--accent);
+  border-color: rgba(91, 140, 255, 0.3);
 }
 
 .log-status.error {
-  color: #ff7b7b;
-  border-color: rgba(255, 93, 93, 0.35);
+  color: var(--danger);
+  border-color: rgba(226, 96, 94, 0.35);
 }
 
 .log-status.interrupted {
   color: var(--amber);
-  border-color: rgba(255, 182, 72, 0.35);
+  border-color: rgba(242, 176, 60, 0.35);
+}
+
+.log-status.answered,
+.log-status.approved {
+  color: var(--green);
+  border-color: rgba(61, 220, 132, 0.3);
+}
+
+.log-status.rejected {
+  color: var(--danger);
+  border-color: rgba(226, 96, 94, 0.35);
 }
 
 .log-empty {
@@ -926,11 +1066,11 @@ onBeforeUnmount(stopTimer)
 .detail-icon {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   flex: none;
-  border-radius: 8px;
-  background: rgba(79, 140, 255, 0.12);
+  border-radius: var(--radius-sm);
+  background: transparent;
 }
 
 .detail-head strong {
@@ -945,9 +1085,9 @@ onBeforeUnmount(stopTimer)
 
 .detail-status {
   margin-left: auto;
-  padding: 2px 7px;
+  padding: 1px 7px;
   font-size: 9.5px;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line);
   color: var(--text-3);
 }
@@ -959,17 +1099,28 @@ onBeforeUnmount(stopTimer)
 
 .detail-status.running {
   color: var(--accent-cyan);
-  border-color: rgba(53, 224, 255, 0.3);
+  border-color: rgba(55, 208, 196, 0.3);
 }
 
 .detail-status.error {
-  color: #ff7b7b;
-  border-color: rgba(255, 93, 93, 0.35);
+  color: var(--danger);
+  border-color: rgba(226, 96, 94, 0.35);
 }
 
 .detail-status.interrupted {
   color: var(--amber);
-  border-color: rgba(255, 182, 72, 0.35);
+  border-color: rgba(242, 176, 60, 0.35);
+}
+
+.detail-status.answered,
+.detail-status.approved {
+  color: var(--green);
+  border-color: rgba(61, 220, 132, 0.3);
+}
+
+.detail-status.rejected {
+  color: var(--danger);
+  border-color: rgba(226, 96, 94, 0.35);
 }
 
 .detail-scroll {
@@ -991,8 +1142,9 @@ onBeforeUnmount(stopTimer)
   flex-direction: column;
   gap: 1px;
   padding: 6px 8px;
-  border-radius: 7px;
-  background: rgba(6, 13, 28, 0.5);
+  border-radius: 0;
+  background: transparent;
+  border-top: 1px solid var(--line);
 }
 
 .kv small {
@@ -1023,15 +1175,15 @@ onBeforeUnmount(stopTimer)
   padding: 8px 10px;
   max-height: 220px;
   overflow: auto;
-  font-family: 'Cascadia Code', Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(4, 10, 22, 0.72);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
 }
 
 .token-row {
@@ -1058,15 +1210,15 @@ onBeforeUnmount(stopTimer)
 .context-bar {
   height: 6px;
   overflow: hidden;
-  border-radius: 999px;
-  background: rgba(96, 156, 255, 0.16);
+  border-radius: 2px;
+  background: rgba(126, 154, 198, 0.16);
 }
 
 .context-bar i {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #35e0ff, #4f8cff);
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent));
 }
 
 .empty-detail {
@@ -1092,13 +1244,13 @@ onBeforeUnmount(stopTimer)
 .empty-orb {
   display: grid;
   place-items: center;
-  width: 56px;
-  height: 56px;
+  width: 48px;
+  height: 48px;
   margin-bottom: 12px;
   border-radius: 50%;
   color: var(--accent-cyan);
-  background: radial-gradient(circle at 35% 30%, rgba(53, 224, 255, 0.22), rgba(30, 70, 150, 0.25));
-  box-shadow: 0 0 28px rgba(53, 224, 255, 0.2);
+  border: 1px solid var(--line-strong);
+  background: transparent;
 }
 
 .empty h3 {

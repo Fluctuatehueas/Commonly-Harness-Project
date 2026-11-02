@@ -37,12 +37,19 @@ logging.basicConfig(
 import uvicorn  # noqa: E402
 
 from api.chat import app  # noqa: E402
+from utils.integrity import integrity_hint, process_integrity  # noqa: E402
 
 
 def main() -> None:
     """以单进程模式启动 FastAPI 服务。"""
     host = os.getenv("HARNESS_API_HOST", "127.0.0.1")
     port = int(os.getenv("HARNESS_API_PORT", "8000"))
+    level = process_integrity()
+    hint = integrity_hint()
+    if hint:
+        logging.getLogger(__name__).warning("进程完整性=%s；%s", level, hint)
+    else:
+        logging.getLogger(__name__).info("进程完整性=%s", level)
     # loop="none" 表示沿用上面已设置的 Selector 事件循环策略。
     uvicorn.run(app, host=host, port=port, loop="none")
     

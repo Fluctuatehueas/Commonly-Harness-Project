@@ -10,6 +10,8 @@ export interface SessionItem {
   updated_at: string
   message_count: number
   pinned: boolean
+  /** 归属项目；未归属时为 null（后端未就绪时前端兜底为 null）。 */
+  project_id: string | null
 }
 
 export const USER_ID = 'console_user'
@@ -58,6 +60,7 @@ export const useSessionStore = defineStore('sessions', () => {
       sessions.value = data.sessions.map((item) => ({
         ...item,
         pinned: Boolean(item.pinned),
+        project_id: item.project_id ?? null,
       }))
       sortSessions()
       offline.value = false
@@ -68,12 +71,18 @@ export const useSessionStore = defineStore('sessions', () => {
     }
   }
 
-  async function createSession(): Promise<string | null> {
+  async function createSession(projectId?: string | null): Promise<string | null> {
     try {
-      const res = await fetch(`${API_BASE}/history?user_id=${USER_ID}`, { method: 'POST' })
+      const query = new URLSearchParams({ user_id: USER_ID })
+      if (projectId) query.set('project_id', projectId)
+      const res = await fetch(`${API_BASE}/history?${query.toString()}`, { method: 'POST' })
       if (!res.ok) return null
       const session = (await res.json()) as SessionItem
-      sessions.value.unshift({ ...session, pinned: Boolean(session.pinned) })
+      sessions.value.unshift({
+        ...session,
+        pinned: Boolean(session.pinned),
+        project_id: session.project_id ?? null,
+      })
       sortSessions()
       return session.thread_id
     } catch {
@@ -85,30 +94,40 @@ export const useSessionStore = defineStore('sessions', () => {
     threadId: string,
     body: { title?: string; pinned?: boolean },
   ): Promise<boolean> {
-    try {
-      const res = await fetch(
-        `${API_BASE}/history/${threadId}?user_id=${USER_ID}`,
-        {
+    // 现有后端在 /history 上支持 title/pinned；项目归属按新契约在 /sessions 上提供。
+    // 先走现有路径，失败再尝试新路径，两者都不可用时返回 false（界面保留原值）。
+    const endpoints = [
+      `${API_BASE}/history/${threadId}?user_id=${USER_ID}`,
+      `${API_BASE}/sessions/${threadId}?user_id=${USER_ID}`,
+    ]
+    for (const endpoint of endpoints) {
+      try {
+        const res = await fetch(endpoint, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
-        },
-      )
-      if (!res.ok) return false
-      const updated = (await res.json()) as SessionItem
-      const index = sessions.value.findIndex((item) => item.thread_id === threadId)
-      if (index >= 0) {
-        sessions.value[index] = {
-          ...sessions.value[index]!,
-          ...updated,
-          pinned: Boolean(updated.pinned),
+        })
+        if (!res.ok) continue
+        const updated = (await res.json()) as Partial<SessionItem>
+        const index = sessions.value.findIndex((item) => item.thread_id === threadId)
+        if (index >= 0) {
+          sessions.value[index] = {
+            ...sessions.value[index]!,
+            ...updated,
+            pinned: Boolean(updated.pinned ?? sessions.value[index]!.pinned),
+            project_id:
+              updated.project_id === undefined
+                ? sessions.value[index]!.project_id
+                : updated.project_id,
+          }
         }
+        sortSessions()
+        return true
+      } catch {
+        // 继续尝试下一个端点
       }
-      sortSessions()
-      return true
-    } catch {
-      return false
     }
+    return false
   }
 
   async function renameSession(threadId: string, title: string): Promise<boolean> {

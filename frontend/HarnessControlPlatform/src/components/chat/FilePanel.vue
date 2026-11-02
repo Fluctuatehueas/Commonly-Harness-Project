@@ -1,57 +1,146 @@
 <script setup lang="ts">
-// 文件面板：列出当前会话生成的文件，支持预览编辑与下载
-import { ref, watch } from 'vue'
+// 文件抽屉：按本机/沙箱分组 + 目录树；本机文件定位到资源管理器，沙箱文件下载。
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
-import { downloadText, useFileStore } from '@/stores/files'
+import MarkdownView from './MarkdownView.vue'
+import FileTreeNode from './FileTreeNode.vue'
+import { buildGroups, type FileGroup } from './fileTree'
+import { useFileStore, type FileMeta } from '@/stores/files'
+import { absoluteWorkspacePath, revealFile } from '@/api/workspace'
 
 const props = defineProps<{ threadId: string | null; refreshKey?: number }>()
 const emit = defineEmits<{ close: [] }>()
 const files = useFileStore()
 
-const dirty = ref(false)
-const savedToast = ref('')
+const drawerWidth = ref(440)
+const resizing = ref(false)
+let resizeStartX = 0
+let resizeStartWidth = 0
+
+const groups = computed(() => buildGroups(files.files))
+const newCount = computed(
+  () => files.files.filter((file) => files.isNew(props.threadId, file)).length,
+)
+
+const isMarkdown = computed(() =>
+  /\.(?:md|markdown|mdx)$/i.test(files.current?.path || ''),
+)
+const previewMode = ref(false)
+const notice = ref('')
+let noticeTimer: number | undefined
 
 watch(
   () => [props.threadId, props.refreshKey] as const,
   ([id]) => {
     files.closePreview()
-    dirty.value = false
     if (id) void files.list(id)
   },
   { immediate: true },
 )
 
-async function reload() {
-  if (props.threadId) await files.list(props.threadId)
+watch(
+  () => files.current?.path,
+  (path) => {
+    previewMode.value = /\.(?:md|markdown|mdx)$/i.test(path || '')
+  },
+)
+
+function reload() {
+  if (props.threadId) void files.list(props.threadId)
 }
 
-async function saveFile() {
-  if (!props.threadId) return
-  if (await files.save(props.threadId)) {
-    dirty.value = false
-    flash('已保存到会话文件系统')
+function flash(message: string) {
+  notice.value = message
+  if (noticeTimer) window.clearTimeout(noticeTimer)
+  noticeTimer = window.setTimeout(() => (notice.value = ''), 2600)
+}
+
+function isNew(file: FileMeta) {
+  return files.isNew(props.threadId, file)
+}
+
+function groupNewCount(group: FileGroup) {
+  return group.files.filter((file) => isNew(file)).length
+}
+
+function localPath(file: Pick<FileMeta, 'path' | 'origin'>): string {
+  if (file.origin !== 'project' || !files.workspace) return ''
+  return absoluteWorkspacePath(files.workspace, file.path)
+}
+
+async function openInExplorer(file: Pick<FileMeta, 'path' | 'origin'>) {
+  const target = localPath(file)
+  if (!target) {
+    flash('当前没有可用的本机项目目录')
+    return
+  }
+  if (await revealFile(target)) return
+  try {
+    await navigator.clipboard.writeText(target)
+    flash(`无法直接定位文件，路径已复制：${target}`)
+  } catch {
+    flash(target)
   }
 }
 
-function flash(msg: string) {
-  savedToast.value = msg
-  window.setTimeout(() => (savedToast.value = ''), 2200)
+function handleAction(file: FileMeta) {
+  if (file.origin === 'project') {
+    void openInExplorer(file)
+    return
+  }
+  if (props.threadId) void files.download(props.threadId, file.path, file.origin)
 }
 
-function fmtSize(n: number) {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / 1024 / 1024).toFixed(1)} MB`
+function handleOpen(file: FileMeta) {
+  if (props.threadId) void files.open(props.threadId, file.path, file.origin)
 }
+
+function previewAction() {
+  if (!files.current) return
+  if (files.current.origin === 'project') {
+    void openInExplorer(files.current)
+    return
+  }
+  if (props.threadId) {
+    void files.download(props.threadId, files.current.path, files.current.origin)
+  }
+}
+
+function onResizeMove(event: MouseEvent) {
+  drawerWidth.value = Math.min(
+    760,
+    Math.max(340, resizeStartWidth + (resizeStartX - event.clientX)),
+  )
+}
+
+function stopResize() {
+  resizing.value = false
+  window.removeEventListener('mousemove', onResizeMove)
+  window.removeEventListener('mouseup', stopResize)
+}
+
+function startResize(event: MouseEvent) {
+  event.preventDefault()
+  resizing.value = true
+  resizeStartX = event.clientX
+  resizeStartWidth = drawerWidth.value
+  window.addEventListener('mousemove', onResizeMove)
+  window.addEventListener('mouseup', stopResize)
+}
+
+onBeforeUnmount(stopResize)
 </script>
 
 <template>
-  <div class="file-panel">
+  <aside class="file-panel" :class="{ resizing }" :style="{ width: `${drawerWidth}px` }">
+    <div class="resizer" title="拖动调整宽度" @mousedown="startResize"></div>
+
     <header class="fp-head">
       <span class="title-icon"><AppIcon name="file" :size="14" /></span>
       <strong>会话文件</strong>
-      <span v-if="files.source" class="src">{{ files.source === 'sandbox' ? '沙箱' : '线程状态' }}</span>
-      <button class="icon-btn" type="button" title="刷新" @click="reload()">
+      <span class="src">{{ files.source === 'project+sandbox' ? '本机 + 沙箱' : '沙箱' }}</span>
+      <span v-if="newCount" class="new-tag head-new">本轮 +{{ newCount }} new</span>
+      <button class="icon-btn" type="button" title="刷新" @click="reload">
         <AppIcon name="timer" :size="14" />
       </button>
       <button class="icon-btn" type="button" title="关闭" @click="emit('close')">
@@ -60,72 +149,97 @@ function fmtSize(n: number) {
     </header>
 
     <div v-if="files.error" class="fp-error">{{ files.error }}</div>
+    <p v-if="notice" class="fp-notice mono">{{ notice }}</p>
 
-    <!-- 文件列表 -->
     <div v-if="!files.current" class="fp-list">
+      <p class="fp-hint">
+        {{ files.projectId
+          ? '项目会话同时展示本机项目目录与沙箱工作目录：本机文件可在资源管理器定位，沙箱文件可下载。'
+          : '自由会话的 AI 产物保留在沙箱内，可在这里预览与下载。' }}
+      </p>
+
       <div v-if="files.loading" class="fp-empty">加载中…</div>
       <div v-else-if="files.files.length === 0" class="fp-empty">
-        当前会话还没有生成文件。让 Agent 写一个文件试试，例如“把刚才的结论保存为 /notes.md”。
+        当前会话还没有文件。让 Agent 写一个文件试试，例如“把刚才的结论保存为 notes.md”。
       </div>
-      <button
-        v-for="f in files.files"
-        :key="f.path"
-        class="file-row"
-        type="button"
-        @click="props.threadId && files.open(props.threadId, f.path)"
-      >
-        <AppIcon name="file" :size="14" class="f-icon" />
-        <span class="f-path">{{ f.path }}</span>
-        <span class="f-size">{{ fmtSize(f.size) }}</span>
-      </button>
+
+      <section v-for="group in groups" :key="group.origin" class="file-group">
+        <header class="group-head">
+          <AppIcon name="folder" :size="13" class="group-icon" />
+          <span class="group-label">{{ group.label }}</span>
+          <span class="group-count mono">{{ group.files.length }}</span>
+          <span v-if="groupNewCount(group)" class="new-tag">本轮 +{{ groupNewCount(group) }}</span>
+        </header>
+        <div class="group-tree">
+          <FileTreeNode
+            v-for="node in group.tree"
+            :key="node.path"
+            :node="node"
+            :depth="0"
+            :is-new="isNew"
+            @open="handleOpen"
+            @action="handleAction"
+          />
+        </div>
+      </section>
     </div>
 
-    <!-- 预览 / 编辑 -->
     <template v-else>
       <div class="fp-editor-head">
         <code class="f-path">{{ files.current.path }}</code>
         <div class="fp-actions">
+          <span class="f-origin" :class="files.current.origin">
+            {{ files.current.origin === 'project' ? '本机' : '沙箱' }}
+          </span>
           <button class="mini" type="button" @click="files.closePreview()">
             <AppIcon name="chevronRight" :size="12" style="transform: rotate(180deg)" /> 列表
           </button>
-          <button
-            class="mini"
-            type="button"
-            @click="downloadText(files.current.path.split('/').pop() || 'file.txt', files.current.content)"
-          >
-            <AppIcon name="layers" :size="12" /> 下载
+          <button v-if="isMarkdown" class="mini" type="button" @click="previewMode = !previewMode">
+            <AppIcon :name="previewMode ? 'edit' : 'eye'" :size="12" />
+            {{ previewMode ? '源码' : '预览' }}
           </button>
-          <button class="mini primary" type="button" :disabled="!dirty || files.saving" @click="saveFile">
-            <AppIcon name="check" :size="12" /> {{ files.saving ? '保存中…' : '保存' }}
+          <button class="mini" type="button" @click="previewAction">
+            <AppIcon :name="files.current.origin === 'project' ? 'external' : 'download'" :size="12" />
+            {{ files.current.origin === 'project' ? '在资源管理器打开' : '下载' }}
           </button>
         </div>
       </div>
-      <textarea
-        v-model="files.current.content"
-        class="fp-editor"
-        spellcheck="false"
-        @input="dirty = true"
-      ></textarea>
+      <div v-if="previewMode && isMarkdown" class="fp-preview">
+        <MarkdownView :content="files.current.content" />
+      </div>
+      <pre v-else class="fp-text">{{ files.current.content }}</pre>
     </template>
-
-    <Transition name="fade">
-      <div v-if="savedToast" class="fp-toast">{{ savedToast }}</div>
-    </Transition>
-  </div>
+  </aside>
 </template>
 
 <style scoped>
 .file-panel {
-  position: relative;
-  width: 340px;
-  flex: none;
+  position: fixed;
+  top: var(--topbar-h);
+  right: 0;
+  bottom: 0;
+  z-index: 45;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: rgba(9, 18, 38, 0.92);
+  min-width: 340px;
   overflow: hidden;
+  border-left: 1px solid var(--line-strong);
+  background: rgba(6, 14, 26, 0.72);
+  backdrop-filter: blur(18px);
+  box-shadow: -18px 0 40px rgba(2, 8, 20, 0.45);
+}
+
+.file-panel.resizing {
+  user-select: none;
+}
+
+.resizer {
+  position: absolute;
+  top: 0;
+  left: -4px;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
 }
 
 .fp-head {
@@ -147,16 +261,20 @@ function fmtSize(n: number) {
   height: 24px;
   border-radius: 6px;
   color: var(--accent-cyan);
-  background: rgba(53, 224, 255, 0.1);
+  background: rgba(53, 224, 255, 0.08);
 }
 
 .src {
   margin-left: auto;
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--text-3);
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 2px 8px;
+}
+
+.head-new {
+  margin-left: 0;
 }
 
 .icon-btn {
@@ -164,16 +282,10 @@ function fmtSize(n: number) {
   place-items: center;
   width: 26px;
   height: 26px;
+  color: var(--text-2);
   border: 1px solid var(--line);
   border-radius: 7px;
-  color: var(--text-2);
   background: transparent;
-  transition: all 0.18s;
-}
-
-.icon-btn:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
 }
 
 .fp-error {
@@ -183,16 +295,37 @@ function fmtSize(n: number) {
   color: var(--amber);
   border: 1px solid rgba(255, 182, 72, 0.3);
   border-radius: 8px;
-  background: rgba(255, 182, 72, 0.06);
+  background: rgba(255, 182, 72, 0.05);
+}
+
+.fp-notice {
+  margin: 8px 12px 0;
+  padding: 6px 9px;
+  overflow: hidden;
+  font-size: 9.5px;
+  color: var(--accent-cyan);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid rgba(53, 224, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(53, 224, 255, 0.05);
 }
 
 .fp-list {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 8px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
+}
+
+.fp-hint {
+  margin: 2px 6px 4px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-3);
 }
 
 .fp-empty {
@@ -204,43 +337,49 @@ function fmtSize(n: number) {
   text-align: center;
 }
 
-.file-row {
+.file-group {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(6, 13, 28, 0.35);
+}
+
+.group-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 9px 10px;
-  color: var(--text-1);
-  text-align: left;
-  border: 1px solid transparent;
-  border-radius: 9px;
-  background: transparent;
-  transition: all 0.15s;
+  gap: 6px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-2);
 }
 
-.file-row:hover {
-  border-color: var(--line);
-  background: rgba(79, 140, 255, 0.08);
-}
-
-.f-icon {
+.group-icon {
   color: var(--accent-cyan);
-  flex: none;
 }
 
-.f-path {
-  flex: 1;
-  min-width: 0;
-  font-family: 'Cascadia Code', Consolas, monospace;
+.group-label {
   font-size: 11.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-weight: 600;
 }
 
-.f-size {
-  font-size: 10.5px;
+.group-count {
+  font-size: 9.5px;
   color: var(--text-3);
+}
+
+.group-tree {
+  padding: 4px 4px 6px;
+}
+
+.new-tag {
   flex: none;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: #4be3a4;
+  border: 1px solid rgba(75, 227, 164, 0.35);
+  border-radius: 999px;
+  background: rgba(75, 227, 164, 0.1);
 }
 
 .fp-editor-head {
@@ -254,8 +393,11 @@ function fmtSize(n: number) {
 
 .fp-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   flex: none;
+  align-items: center;
 }
 
 .mini {
@@ -268,7 +410,6 @@ function fmtSize(n: number) {
   border: 1px solid var(--line);
   border-radius: 7px;
   background: transparent;
-  transition: all 0.15s;
 }
 
 .mini:hover {
@@ -276,62 +417,60 @@ function fmtSize(n: number) {
   border-color: var(--line-strong);
 }
 
-.mini.primary {
-  color: #fff;
-  border-color: transparent;
-  background: linear-gradient(90deg, #3b78ff, #2a5cd6);
+.f-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.mini.primary:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
+.f-origin {
+  flex: none;
+  padding: 1px 6px;
+  font-size: 9.5px;
+  line-height: 1.6;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--accent-cyan);
+  background: rgba(53, 224, 255, 0.08);
 }
 
-.fp-editor {
+.f-origin.sandbox {
+  color: var(--text-2);
+  border-color: var(--line);
+  background: transparent;
+}
+
+.fp-text {
   flex: 1;
   min-height: 0;
+  margin: 0;
   padding: 12px;
-  font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  overflow: auto;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.6;
   color: var(--text-1);
-  border: none;
-  background: rgba(4, 9, 20, 0.7);
-  resize: none;
-  outline: none;
+  white-space: pre-wrap;
 }
 
-.fp-toast {
-  position: absolute;
-  left: 50%;
-  bottom: 16px;
-  transform: translateX(-50%);
-  padding: 7px 14px;
-  font-size: 11.5px;
-  color: #c9f5db;
-  border: 1px solid rgba(61, 220, 132, 0.4);
-  border-radius: 999px;
-  background: rgba(12, 40, 28, 0.95);
-}
-
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity 0.25s;
-}
-
-.fade-enter-from,
-.fade-leave-to {
-  opacity: 0;
+.fp-preview {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px 24px;
 }
 
 @media (max-width: 1100px) {
   .file-panel {
-    position: absolute;
-    right: 12px;
-    top: 64px;
-    bottom: 12px;
-    z-index: 40;
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+    width: 100% !important;
+  }
+
+  .resizer {
+    display: none;
   }
 }
 </style>

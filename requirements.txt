@@ -17,6 +17,7 @@ langgraph-sdk==0.4.4
 fastapi==0.141.1
 fastmcp==3.2.4
 httpx==0.28.1
+requests==2.34.2  # utils/deepseek_webService 同步 HTTP 客户端
 uvicorn==0.53.0
 python-multipart==0.0.32  # /context/upload 表单上传
 

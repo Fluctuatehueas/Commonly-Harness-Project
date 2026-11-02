@@ -16,6 +16,11 @@ if [ -n "$offline_dir" ] && [ -d "$offline_dir" ]; then
     dpkg --install "$offline_dir"/*.deb
     apt-get check
 else
+    # >>> 改动 1：把 Debian 官方源替换成阿里云镜像源（兼容新旧两种源文件格式）
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f" ] && sed -i 's|deb.debian.org|mirrors.aliyun.com|g' "$f"
+    done
+
     apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
     apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
         golang-go default-jdk-headless nodejs npm
@@ -27,7 +32,9 @@ if ! python -c 'import yaml' 2>/dev/null; then
     if [ -n "$offline_dir" ] && [ -d "$offline_dir" ]; then
         python -m pip install --no-cache-dir --no-index --find-links "$offline_dir" 'PyYAML==6.0.3'
     else
-        python -m pip install --no-cache-dir --retries 2 --timeout 30 'PyYAML==6.0.3'
+        # >>> 改动 2：pip 也走阿里云 PyPI 镜像
+        python -m pip install --no-cache-dir --retries 2 --timeout 30 \
+            -i https://mirrors.aliyun.com/pypi/simple/ 'PyYAML==6.0.3'
     fi
 fi
 

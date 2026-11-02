@@ -18,13 +18,23 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import sys
 from typing import Annotated, Any, Callable, Union, get_args, get_origin, get_type_hints
 
 from zoneinfo import ZoneInfo
 
 from langchain_core.tools import tool
 
+SRC_ROOT = Path(__file__).resolve().parents[2]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from agent.schema import SearchServiceError
+from utils.deepseek_webService import get_web_service
+
 BASIC_TOOLS = []
+# 受「联网搜索」总开关控制的工具；关闭时不绑定到主 Agent。
+WEB_SEARCH_TOOL_NAMES = {"search_web", "fetch_web"}
 
 def basic_tool(tool: Callable):
     """装饰器：自动将工具注册到基本工具组。"""
@@ -367,16 +377,94 @@ def format_json(
         data = json.loads(data)
     return json.dumps(data, ensure_ascii=False, indent=indent)
 
+
+
 # 搜索类
+def _search_error(error: SearchServiceError) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "code": error.code or "search_error",
+            "message": str(error),
+            "status": error.status,
+        },
+    }
+
+
+def _truncate(text: str, limit: int) -> tuple[str, bool]:
+    if limit > 0 and len(text) > limit:
+        return text[:limit] + "\n...(内容已截断)", True
+    return text, False
+
+
 @basic_tool
 @tool
-def search_web(
-    query: Annotated[str, "搜索关键词"],
-    num_results: Annotated[int, "返回结果数量"],
-) -> list[dict[str, str]]:
-    """执行网络搜索（需要配置搜索 API）。"""
-    raise NotImplementedError("搜索功能尚未配置，请接入搜索 API")
+async def search_web(
+    query: Annotated[str, "搜索关键词，支持 site:/lang:/after: 等搜索语法"],
+    num_results: Annotated[int, "返回结果数量，1~50"] = 5,
+    need_content: Annotated[bool, "是否返回网页正文"] = False,
+    ori_question: Annotated[str, "触发搜索的用户原始问题，可空，有助于理解搜索意图"] = "",
+    max_content_chars: Annotated[int, "单条 content 最大字符数，0 表示不截断"] = 8000,
+) -> dict[str, Any]:
+    """执行 DeepSeek 网络搜索，返回标题、链接、摘要与权威性评分。"""
+    original_question = ori_question[:128] if ori_question else None
+    try:
+        response = await get_web_service().asearch(
+            query,
+            count=num_results,
+            ori_question=original_question,
+            need_content=need_content,
+        )
+    except SearchServiceError as error:
+        return _search_error(error)
+
+    results: list[dict[str, Any]] = []
+    for item in response.results:
+        data = item.to_dict(include_content=need_content)
+        if need_content:
+            content, truncated = _truncate(data.get("content", ""), max_content_chars)
+            data["content"] = content
+            data["content_truncated"] = truncated
+        results.append(data)
+    return {"ok": True, "query": query, "count": len(results), "results": results}
+
+
+@basic_tool
+@tool
+async def fetch_web(
+    url: Annotated[str, "要读取正文的网页 URL（http/https）"],
+    max_chars: Annotated[int, "正文最大字符数，0 表示不截断"] = 8000,
+) -> dict[str, Any]:
+    """读取指定网页的标题与正文 Markdown。"""
+    try:
+        page = await get_web_service().afetch(url)
+    except SearchServiceError as error:
+        return _search_error(error)
+
+    content, truncated = _truncate(page.get("content", ""), max_chars)
+    return {
+        "ok": True,
+        "url": url,
+        "title": page.get("title", ""),
+        "content": content,
+        "truncated": truncated,
+    }
+
+
+
 
 def get_basic_tools() -> list:
-    """返回基本工具组的所有工具。"""
-    return BASIC_TOOLS.copy()
+    """返回基本工具组的所有工具。
+
+    ``HARNESS_WEB_SEARCH`` 关闭时剔除搜索/抓取工具，下一次构图即生效；
+    这样前端聊天框的「联网搜索」开关不需要改动 Agent 代码。
+    """
+    from agent.config import WEB_SEARCH_ENABLED
+
+    if WEB_SEARCH_ENABLED:
+        return BASIC_TOOLS.copy()
+    return [
+        tool
+        for tool in BASIC_TOOLS
+        if str(getattr(tool, "name", "")) not in WEB_SEARCH_TOOL_NAMES
+    ]

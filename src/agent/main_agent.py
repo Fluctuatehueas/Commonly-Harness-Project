@@ -18,9 +18,11 @@ from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from deepagents.middleware.filesystem import FilesystemPermission
 from langchain_core.runnables import RunnableConfig
 
+from agent.backends.project_backend import ProjectWorkspaceBackend
 from agent.backends.readonly_backend import ReadOnlyFilesystemBackend
 from agent.backends.sandbox_proxy import SandboxBackendProxy
 from agent.backends.skill_sync import SandboxSkillSynchronizer
+import agent.config as agent_config
 from agent.config import (
     AGENTS_MD_FILENAME,
     ASYNC_AGENT_PROTOCOL_URL,
@@ -32,7 +34,7 @@ from agent.config import (
     get_main_model,
     get_summary_model,
 )
-from agent.memory.prompts import system_prompt
+from agent.memory.prompts import build_system_prompt
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware
 from agent.middlewares.context_window_monitor import ContextWindowMonitorMiddleWare
@@ -49,10 +51,15 @@ from agent.subagents.async_registry import (
 from agent.subagents.configs import config_path
 from agent.tools.async_sandbox_tools import create_async_sandbox_tools
 from agent.tools.document_tools import read_word_document
-from agent.tools.hitl_tool import request_additional_info
-from agent.tools.mcp_client import load_main_mcp_tools
+from agent.tools.hitl_tool import request_additional_info, request_user_choice
+from agent.tools.host_tools import build_host_tools
+from agent.mcp.runtime import mcp_runtime
 from agent.tools.skill_tools import create_skill_management_tools
 from agent.tools.commom_tools import get_basic_tools
+from agent.tools.workspace_tools import (
+    create_publish_to_project_tool,
+    create_run_in_sandbox_tool,
+)
 
 # 同步子 Agent 扩展点：
 # - 已经拿到工具对象的静态配置放进 SYNC_SUBAGENTS；
@@ -96,16 +103,23 @@ def _coerce_permissions(config: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _load_sync_subagents() -> list[dict[str, Any]]:
-    """加载静态配置和 YAML 中声明的同步子 Agent。"""
+    """加载静态配置和 YAML 中声明的同步子 Agent。
+
+    子 Agent 的 YAML 可以用 ``optional_tools`` 声明“有则绑定、无则跳过”的工具，
+    未加载的工具不会阻断构图。
+    """
     from agent.subagents.loader import aload_subagent
 
+    local_tools = [
+        read_word_document,
+        request_additional_info,
+        request_user_choice,
+    ]
     loaded = list(SYNC_SUBAGENTS)
     for config_file in SYNC_SUBAGENT_CONFIG_FILES:
-        # read_word_document 不是 MCP 工具，必须作为 local_tools 传进去，
-        # 否则 YAML 里声明它的子 Agent 会在构图时报"缺少配置工具"。
-        subagent = await aload_subagent(
-            config_file, local_tools=[read_word_document]
-        )
+        # read_word_document / request_additional_info 不是 MCP 工具，必须作为
+        # local_tools 传进去，否则 YAML 里声明它们的子 Agent 会在构图时报"缺少配置工具"。
+        subagent = await aload_subagent(config_file, local_tools=local_tools)
         loaded.append(_coerce_permissions(subagent))
     return loaded
 
@@ -148,21 +162,26 @@ async def create_main_agent(
     user_id = str(configurable.get("user_id", "anonymous"))
     sandbox_enabled = sandbox_backend is not None
 
-    # 文件路径决定存储位置：/memories/ 下的文件写入 PostgreSQL；
-    # 其余路径有沙箱时进入 OpenSandbox，无沙箱时落到线程状态（纯对话模式）。
+    # 文件路径决定存储位置：/memories/ 写 PostgreSQL，/artifacts/ 留在图状态，
+    # 其余路径落当前项目目录；命令执行始终走沙箱。
     routes: dict[str, Any] = {
         "/memories/": StoreBackend(
             namespace=lambda runtime: (user_id,),
             store=store,
         ),
+        # 大工具结果与对话历史留在图状态，不能写进用户项目目录。
+        "/artifacts/": StateBackend(),
     }
     if not sandbox_enabled:
         # 无沙箱时把宿主技能目录只读挂载到 /skills/：
         # 技能仍能渐进式加载，但 Agent 不能改写宿主上的 SKILL.md。
         routes["/skills/"] = ReadOnlyFilesystemBackend(root_dir=SKILLS_ROOT)
+    # 文件默认落当前项目目录，命令只走沙箱；没有沙箱时执行会被明确拒绝。
+    default_backend = ProjectWorkspaceBackend(sandbox_backend)
     backend = CompositeBackend(
-        default=sandbox_backend if sandbox_enabled else StateBackend(),
+        default=default_backend,
         routes=routes,
+        artifacts_root="/artifacts/",
     )
 
     # 同步子 Agent 可以来自静态对象，也可以来自带 MCP 声明的 YAML。
@@ -211,14 +230,25 @@ async def create_main_agent(
         ]
 
     # 主 Agent 只保留通用能力：MCP 公共工具、异步任务提交、信息补齐和技能管理。
-    # 业务读写工具应只挂到对应子 Agent 的 YAML 配置中。
-    mcp_tools = await load_main_mcp_tools()
+    # MCP 工具在 Agent 构图时才按 scope 懒发现/取代理，不在进程启动时连接。
+    mcp_tools = await mcp_runtime.tools_for_main_agent()
+    # 宿主能力默认关闭；开启后每个工具内部都会 interrupt 等待人工审批。
+    host_tools = build_host_tools()
     main_tools = [
         *mcp_tools,
         *async_tools,
         *get_basic_tools(),
+        *host_tools,
         request_additional_info,
+        request_user_choice,
         read_word_document,
+        # 项目产物发布与沙箱执行：文件落本机项目，命令只在沙箱运行。
+        create_publish_to_project_tool(
+            sandbox_backend,
+            store=store,
+            user_id=user_id,
+        ),
+        create_run_in_sandbox_tool(sandbox_backend),
         *skill_management_tools,
     ]
     _ensure_unique_tool_names(main_tools)
@@ -226,10 +256,43 @@ async def create_main_agent(
     delegation_instructions = (
         get_async_subagent_instructions() if sandbox_enabled else ""
     )
+    # 联网搜索是运行时开关：每次构图都读取最新配置，配合热更新重建 Agent。
+    search_policy_prompt = build_system_prompt(agent_config.WEB_SEARCH_ENABLED)
+    # 文件落盘与执行环境的固定约束：文件落项目，执行只在沙箱。
+    host_policy = ""
+    if host_tools:
+        host_policy = (
+            "- 宿主工具 `host_execute` / `host_read_file` / `host_write_file` 是最后手段："
+            "只有沙箱缺少目标运行环境、或必须访问项目外路径时才使用，并在 `reason` 中写清原因。\n"
+            "- 调用宿主工具会暂停等待人工审批；用户可能选择“仅本会话允许”，"
+            "同一会话内相同命令/路径将不再重复询问，换会话后重新审批。\n"
+            "- 项目内文件读写请继续使用普通文件工具，不要用宿主工具绕过项目目录。\n"
+        )
+    execute_policy_line = (
+        "- 优先在隔离沙箱中执行命令；沙箱缺少目标环境时，才使用 `host_execute`"
+        "（每次调用都会暂停等待人工审批）。\n"
+        if host_tools
+        else "- 所有命令、脚本、代码必须在隔离沙箱中执行；当前会直接拒绝本机执行。\n"
+    )
+    execution_policy = (
+        "\n\n## 文件与执行环境\n"
+        "- 对话分两种模式：项目会话绑定本机项目目录；自由会话没有项目目录。\n"
+        "- 项目会话：文件工具中的 `/` 是项目根目录，可写任意类型文件，"
+        "但绝不能执行项目内的文件。\n"
+        "- 自由会话：文件工具中的 `/` 是该会话在沙箱内的独立目录，"
+        "文件保留在沙箱，用户可从右侧文件抽屉查看与下载。\n"
+        f"{execute_policy_line}"
+        "- 项目会话需要项目文件参与执行时，调用 `run_in_sandbox` 并在 `files` 中"
+        "列出项目相对路径；自由会话直接在该会话沙箱目录执行。\n"
+        "- 只有项目会话才调用 `publish_to_project` 把成品落到本机；"
+        "自由会话不要调用。中间脚本、日志、测试夹具不要发布。\n"
+        "- `/.commonharness/` 是项目保留目录，禁止读写。\n"
+        f"{host_policy}"
+    )
     full_system_prompt = (
-        f"{system_prompt}\n\n{delegation_instructions}"
+        f"{search_policy_prompt}{execution_policy}\n\n{delegation_instructions}"
         if delegation_instructions
-        else system_prompt
+        else f"{search_policy_prompt}{execution_policy}"
     )
 
     # 中间件顺序具有语义：before_* 按声明顺序运行，after_* 反序运行。

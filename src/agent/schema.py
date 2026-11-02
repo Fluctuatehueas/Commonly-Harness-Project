@@ -26,6 +26,10 @@ class HarnessContext:
     thread_id: str = ""
     # 中间件在每轮开始时生成，用于把同一次 run 的事件归到一个轨迹分组。
     trajectory_run_id: str = ""
+    # HITL 恢复：用户在中断卡片里提交内容的摘要与结论（answered/approved/rejected），
+    # 由轨迹中间件写进本轮轨迹，供「轨迹」页展示「已回复」记录。
+    hitl_summary: str = ""
+    hitl_status: str = ""
 
 
 @dataclass
@@ -143,15 +147,19 @@ class Session(BaseModel):
     updated_at: datetime = Field(..., description="最后一次消息写入时间")
     message_count: int = Field(0, ge=0, description="会话中的展示消息数")
     pinned: bool = Field(False, description="是否置顶")
+    # 会话归属的项目（工作区目录）ID；null 表示归入「对话」分组。
+    project_id: Optional[str] = Field(None, description="所属项目 ID")
 
 
 class SessionUpdateRequest(BaseModel):
-    """会话重命名 / 置顶请求；None 表示不修改该字段。"""
+    """会话重命名 / 置顶 / 归属项目请求；None 表示不修改该字段。"""
 
     title: Optional[str] = Field(
         None, min_length=1, max_length=120, description="新的会话标题"
     )
     pinned: Optional[bool] = Field(None, description="是否置顶")
+    # 显式传 null 表示移回「对话」组；未传则保持原归属。
+    project_id: Optional[str] = Field(None, description="所属项目 ID，null 表示移出项目")
 
 
 class SessionListResponse(BaseModel):
@@ -206,3 +214,100 @@ class UserGroup:
     username: str  # 用户最近一次使用的名称
     thread_ids: set[str] = field(default_factory=set)  # 用户关联的会话 ID
     agent: Any | None = None  # 用户专属的 Agent 实例
+
+# ============================================================
+# 网络搜索数据模型
+# ============================================================
+
+
+@dataclass
+class SearchResult:
+    """单条搜索结果。"""
+    rerank_score: float
+    title: str
+    url: str
+    snippet: str = ""
+    summary: str = ""
+    content: str = ""
+    site_name: Optional[str] = None
+    site_icon: Optional[str] = None
+    date: Optional[str] = None
+    authority: int = -1
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "SearchResult":
+        def _float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _int(value: Any, default: int = -1) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _str(value: Any) -> str:
+            return "" if value is None else str(value)
+
+        return cls(
+            rerank_score=_float(d.get("rerank_score")),
+            title=_str(d.get("title")),
+            url=_str(d.get("url")),
+            snippet=_str(d.get("snippet")),
+            summary=_str(d.get("summary")),
+            content=_str(d.get("content")),
+            site_name=d.get("site_name") or None,
+            site_icon=d.get("site_icon") or None,
+            date=d.get("date") or None,
+            authority=_int(d.get("authority")),
+        )
+
+    def to_dict(self, *, include_content: bool = True) -> dict[str, Any]:
+        """转成工具可直接返回的原生类型，避免数字被字符串化。"""
+        data: dict[str, Any] = {
+            "title": self.title,
+            "url": self.url,
+            "snippet": self.snippet,
+            "summary": self.summary,
+            "site_name": self.site_name or "",
+            "date": self.date or "",
+            "authority": self.authority,
+            "rerank_score": self.rerank_score,
+            "is_quality": self.is_quality,
+        }
+        if include_content:
+            data["content"] = self.content
+        return data
+
+    @property
+    def is_quality(self) -> bool:
+        """rerank_score >= 1.5 为优质结果；authority >= 3 为极权威。-1表示未知"""
+        return self.rerank_score >= 1.5 or self.authority >= 3
+
+
+@dataclass
+class SearchResponse:
+    """一次搜索的完整结果。"""
+    results: list[SearchResult] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self, *, include_content: bool = True) -> dict[str, Any]:
+        return {
+            "results": [
+                item.to_dict(include_content=include_content)
+                for item in self.results
+            ],
+            "count": len(self.results),
+        }
+
+
+class SearchServiceError(Exception):
+    """搜索服务统一异常，携带原始错误信息。"""
+
+    def __init__(self, message: str, *, code: str | None = None,
+                 status: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.status = status

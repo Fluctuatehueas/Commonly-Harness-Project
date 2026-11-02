@@ -40,6 +40,21 @@ runtime/
 *.sqlite
 *.sqlite3
 *.db
+# 技能管理：被停用的技能目录是运行态数据
+**/skills-disabled/
+
+# MCP 运行态缓存与配置备份（servers.json 含访问令牌，不提交；格式见设计文档）
+mcp/cache/
+mcp/*.json.bak
+mcp/servers.json
+# MCP 服务工作目录：每个服务下载的包、npm 缓存与产物
+.mcp/
+
+# 本机调试/临时产物
+.screenshots/
+pip-*
+harness-writable-test-*.tmp
+*.tmp
 
 # 编辑器和操作系统文件
 .claude/
@@ -50,3 +65,7 @@ Thumbs.db
 
 # 仅供本地保留的旧报告备份
 readme.backup.md
+
+useless/*
+
+.trae/

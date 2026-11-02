@@ -36,18 +36,19 @@ const props = defineProps<{ title: string; icon: IconName }>()
   justify-content: center;
   min-height: calc(100vh - var(--topbar-h) - 44px);
   text-align: center;
+  background: transparent;
 }
 
 .orb {
   display: grid;
   place-items: center;
-  width: 60px;
-  height: 60px;
+  width: 44px;
+  height: 44px;
   margin-bottom: 16px;
   border-radius: 50%;
   color: var(--accent-cyan);
-  background: radial-gradient(circle at 35% 30%, rgba(53, 224, 255, 0.22), rgba(30, 70, 150, 0.25));
-  box-shadow: 0 0 30px rgba(53, 224, 255, 0.2);
+  border: 1px solid var(--line-strong);
+  background: transparent;
 }
 
 h2 {

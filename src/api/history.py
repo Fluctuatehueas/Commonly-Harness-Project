@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query
 
+from agent import project_store
 from agent.schema import (
     DeleteSessionResponse,
     Message,
@@ -88,6 +90,24 @@ def _task_description(args: Any) -> str:
     return str(description).strip() if description else ""
 
 
+def _message_reasoning(message: Any) -> str:
+    """从 checkpoint 的 AI 消息中读取思考内容，供历史轨迹树回放。"""
+    additional = _message_value(message, "additional_kwargs", {}) or {}
+    if isinstance(additional, dict):
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            value = additional.get(key)
+            if value:
+                return str(value)
+    content = _message_value(message, "content", None)
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") in {"reasoning", "thinking"}
+        )
+    return ""
+
+
 def serialize_messages(
     messages: list[Any],
     usage_by_message: dict[str, dict[str, int]] | None = None,
@@ -119,8 +139,20 @@ def serialize_messages(
         if role == "assistant":
             # AIMessage 可同时携带文本和工具调用，必须先保留文本的原始顺序。
             additional_kwargs = _message_value(message, "additional_kwargs", {}) or {}
+            source = str(additional_kwargs.get("source", "main"))
+            # 思考内容先于同一条 AI 消息的正文与工具调用到达，历史也按同样顺序回放。
+            reasoning = _message_reasoning(message)
+            if reasoning:
+                serialized.append(
+                    Message(
+                        id=f"reasoning-{index}",
+                        role="reasoning",
+                        content=reasoning,
+                        source=source,
+                        created_at=now,
+                    )
+                )
             if content:
-                source = str(additional_kwargs.get("source", "main"))
                 # 子 Agent 自身的文本是内部执行记录，用户历史只展示主 Agent 交付。
                 if source != "main":
                     continue
@@ -224,16 +256,36 @@ def _session_from_index(item: dict[str, Any], message_count: int) -> Session:
         updated_at=datetime.fromisoformat(item["updated_at"]),
         message_count=message_count,
         pinned=bool(item.get("pinned", False)),
+        project_id=item.get("project_id") or None,
     )
 
 
 @router.post("", response_model=Session)
 async def create_session(
     user_id: str = Query("anonymous", min_length=1),
+    project_id: str | None = Query(None, min_length=1),
 ) -> Session:
-    """创建一条尚未发送消息的会话，并立即返回给侧边栏。"""
+    """创建一条尚未发送消息的会话。
+
+    传入 ``project_id`` 时创建项目会话；不传则创建自由会话。
+    项目归属在创建时固定，后续不可更改。
+    """
+    if project_id is not None:
+        project = await asyncio.to_thread(
+            project_store.get_project, user_id, project_id
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="项目不存在")
+        if project["status"] == "unavailable":
+            raise HTTPException(status_code=422, detail="项目目录不可用")
     thread_id = str(uuid4())
-    await agent_loader.save_session(user_id, thread_id, DEFAULT_SESSION_TITLE)
+    await agent_loader.save_session(
+        user_id,
+        thread_id,
+        DEFAULT_SESSION_TITLE,
+        project_id=project_id,
+        bind_project=True,
+    )
     session = await agent_loader.get_session(user_id, thread_id)
     assert session is not None
     return _session_from_index(session, message_count=0)
@@ -297,9 +349,13 @@ async def update_session(
     body: SessionUpdateRequest,
     user_id: str = Query("anonymous", min_length=1),
 ) -> Session:
-    """重命名会话或切换置顶状态。"""
+    """重命名会话或切换置顶；项目归属在创建时固定，不允许修改。"""
     if await agent_loader.get_session(user_id, thread_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    if "project_id" in body.model_fields_set:
+        raise HTTPException(
+            status_code=422, detail="会话归属项目在创建时固定，不能修改"
+        )
     title = body.title.strip() if isinstance(body.title, str) else None
     if title is not None and not title:
         raise HTTPException(status_code=422, detail="标题不能为空")
@@ -325,3 +381,18 @@ async def delete_session(
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
     await agent_loader.delete_session(user_id, thread_id)
     return DeleteSessionResponse(success=True)
+
+
+# 前端会话设置的新契约路径：PATCH /sessions/{thread_id}。
+# 复用 /history 下的同一实现，避免两套更新逻辑。
+sessions_router = APIRouter(tags=["history"])
+
+
+@sessions_router.patch("/sessions/{thread_id}", response_model=Session, include_in_schema=False)
+async def update_session_by_sessions_path(
+    thread_id: str,
+    body: SessionUpdateRequest,
+    user_id: str = Query("anonymous", min_length=1),
+) -> Session:
+    """PATCH /sessions/{thread_id} 别名，行为与 /history/{thread_id} 一致。"""
+    return await update_session(thread_id=thread_id, body=body, user_id=user_id)

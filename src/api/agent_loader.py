@@ -25,8 +25,8 @@ from fastapi import HTTPException
 from langchain_core.messages import AIMessage
 
 from agent.backends.sandbox_manager import SandboxManager
+from agent import config as agent_config
 from agent.config import (
-    OPEN_SANDBOX_API_KEY,
     close_async_persistence,
     create_async_persistence,
 )
@@ -66,6 +66,7 @@ class AgentLoader:
         self._checkpointer: Any | None = None
         self._history_reader: ThreadHistoryReader | None = None
         self._sandbox_manager: SandboxManager | None = None
+        self._mcp_watch_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         """初始化持久化资源和 Agent 工厂，并在后台调度沙箱预热。"""
@@ -73,6 +74,12 @@ class AgentLoader:
             if self._initialized:
                 return
             from agent.main_agent import create_main_agent
+            from agent.mcp.runtime import mcp_runtime
+
+            # 启动阶段只加载 MCP 配置与 LKG 工具缓存，不建立任何连接。
+            # 真正的连接由首次 Agent 构图 / 前端 probe 触发（懒连接）。
+            await mcp_runtime.initialize()
+            mcp_runtime.set_structure_handler(self._on_mcp_structure_change)
 
             store, checkpointer = await create_async_persistence()
             manager = None
@@ -93,6 +100,18 @@ class AgentLoader:
             self._agent_factory = create_main_agent
             self._history_reader = reader
             self._initialized = True
+
+            # 文件监听：mcp_servers.yaml 变化后只重载配置，不主动连接。
+            # 工具名集合变化时清空图缓存，让下一次请求按新工具集重建。
+            self._mcp_watch_task = asyncio.create_task(
+                mcp_runtime.watch_config(),
+                name="mcp-config-watch",
+            )
+
+    async def _on_mcp_structure_change(self) -> None:
+        """MCP 工具名集合增删后，丢弃已缓存的 Agent 图。"""
+        logger.info("MCP 工具集结构变化，将按新工具集重建 Agent 图")
+        await self.reset_agents()
 
     @asynccontextmanager
     async def thread_operation(
@@ -157,13 +176,13 @@ class AgentLoader:
 
             # 每次请求都探测已持久化的沙箱；管理器会对失效实例创建替代品，
             # 并通过稳定代理让已缓存的 Agent 自动使用新后端。
-            # 未配置沙箱凭据时降级为纯对话模式（StateBackend），不阻断聊天。
+            # 未配置沙箱凭据时，Agent 只能读写项目文件，不能执行命令。
             sandbox_backend = None
-            if OPEN_SANDBOX_API_KEY:
+            if agent_config.OPEN_SANDBOX_API_KEY:
                 sandbox_backend = await self._sandbox_manager.get_backend(user_id)
             else:
-                logger.warning(
-                    "用户 %s 未配置 OPEN_SANDBOX_API_KEY，使用无沙箱的纯对话模式",
+                logger.info(
+                    "用户 %s 未配置沙箱，Agent 仅可读写项目文件（不能执行命令）",
                     user_id,
                 )
 
@@ -186,6 +205,48 @@ class AgentLoader:
             self._user_groups.clear()
             self._user_locks.clear()
 
+    async def reload_sandbox(self) -> None:
+        """系统设置保存沙箱配置后重建沙箱管理器与 Agent 图。
+
+        旧管理器会排空正在执行的操作并关闭本地客户端，但不会销毁远端沙箱；
+        新配置在下次请求时按需创建/连接。
+        """
+        await self.initialize()
+        async with self._lock:
+            previous = self._sandbox_manager
+            store = self._store
+            self._sandbox_manager = SandboxManager(store) if store is not None else None
+            manager = self._sandbox_manager
+            self._user_groups.clear()
+            self._user_locks.clear()
+        if previous is not None:
+            await previous.close()
+        if manager is not None:
+            await manager.initialize()
+
+    def sandbox_status(self) -> dict[str, Any]:
+        """返回当前执行环境模式，供前端提示“沙箱 / 本地运行”。"""
+        configured = bool(agent_config.OPEN_SANDBOX_API_KEY)
+        if configured:
+            notice = ""
+        else:
+            notice = (
+                "未配置沙箱服务，当前为项目工作区模式："
+                "Agent 只能读写项目文件，不能执行命令。"
+            )
+        if agent_config.USER_DATA_FALLBACK:
+            notice += (
+                f" 默认数据目录不可写，配置与索引已改写到 "
+                f"{agent_config.USER_DATA_DIR}。"
+            )
+        return {
+            "configured": configured,
+            "mode": "sandbox" if configured else "local",
+            "notice": notice,
+            "workspace_root": str(agent_config.USER_DATA_DIR),
+            "user_data_fallback": agent_config.USER_DATA_FALLBACK,
+        }
+
     async def shutdown(self) -> None:
         """释放当前进程内的 Agent 缓存和数据库连接。
 
@@ -193,6 +254,8 @@ class AgentLoader:
         服务下次启动后仍可使用相同的 user_id 和 thread_id 恢复持久化会话。
         """
         async with self._lock:
+            watch_task = self._mcp_watch_task
+            self._mcp_watch_task = None
             self._user_groups.clear()
             self._agent_factory = None
             self._initialized = False
@@ -204,18 +267,37 @@ class AgentLoader:
             manager = self._sandbox_manager
             self._sandbox_manager = None
             self._user_locks.clear()
+            if watch_task is not None:
+                watch_task.cancel()
+                try:
+                    await watch_task
+                except asyncio.CancelledError:
+                    pass
             try:
                 if manager is not None:
                     await manager.close()
             finally:
+                from agent.mcp.runtime import mcp_runtime
+
+                await mcp_runtime.shutdown()
                 if store is not None and checkpointer is not None:
                     await close_async_persistence(store, checkpointer)
 
-    async def save_session(self, user_id: str, thread_id: str, title: str) -> None:
+    async def save_session(
+        self,
+        user_id: str,
+        thread_id: str,
+        title: str,
+        *,
+        project_id: str | None = None,
+        bind_project: bool = False,
+    ) -> None:
         """将用户会话索引保存到 PostgreSQL 的 LangGraph Store。
 
         Store 使用 ``("sessions", user_id)`` 作为命名空间、``thread_id`` 作为 key，
         value 保存标题和创建/更新时间；完整对话消息仍由 PostgreSQL Checkpointer 保存。
+
+        ``bind_project`` 只在新会话创建时使用：项目归属在创建时确定，之后不可更改。
         """
         await self.initialize()
         assert self._store is not None
@@ -226,6 +308,8 @@ class AgentLoader:
         value = dict(existing.value) if existing is not None else {}
         existing_title = value.get("title")
         value.setdefault("pinned", False)
+        if bind_project:
+            value["project_id"] = project_id or None
         value.update(
             {
                 "thread_id": thread_id,
@@ -268,7 +352,10 @@ class AgentLoader:
         title: str | None = None,
         pinned: bool | None = None,
     ) -> dict[str, Any] | None:
-        """更新会话标题 / 置顶状态；只改元数据，不动消息与 updated_at。"""
+        """更新会话标题 / 置顶；只改元数据，不动消息与 updated_at。
+
+        会话的项目归属在创建时固定，不允许后续修改。
+        """
         await self.initialize()
         assert self._store is not None
         namespace = (*SESSION_NAMESPACE_PREFIX, user_id)
@@ -291,6 +378,36 @@ class AgentLoader:
         assert self._store is not None
         item = await self._store.aget((*SESSION_NAMESPACE_PREFIX, user_id), thread_id)
         return dict(item.value) if item is not None else None
+
+    async def get_sandbox_backend(self, user_id: str) -> Any:
+        """返回该用户当前可用的沙箱后端，供文件抽屉读取沙箱文件。"""
+        await self.initialize()
+        if self._sandbox_manager is None:
+            raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
+        return await self._sandbox_manager.get_backend(user_id)
+
+    async def resolve_project(self, user_id: str, thread_id: str) -> Any:
+        """解析会话模式：无项目为自由会话，项目不存在时同样按自由会话运行。"""
+        from agent import project_store
+
+        await self.initialize()
+        item = await self.get_session(user_id, thread_id)
+        project_id = str((item or {}).get("project_id") or "").strip() or None
+        return await asyncio.to_thread(project_store.resolve_project, user_id, project_id)
+
+    async def list_artifacts(
+        self, user_id: str, project_id: str, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """读取项目产物发布记录，按时间倒序返回。"""
+        await self.initialize()
+        assert self._store is not None
+        items = await self._store.asearch(
+            ("artifacts", user_id, project_id),
+            limit=max(1, min(limit, 1000)),
+        )
+        records = [dict(item.value) for item in items]
+        records.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return records
 
     async def get_thread_messages(self, thread_id: str) -> list[Any]:
         """恢复指定线程的 LangGraph 消息状态。"""

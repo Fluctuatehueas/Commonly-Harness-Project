@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ import yaml
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
+from agent.config import MEMORY_UPDATE_ASYNC
 from agent.schema import UserPreferences
 
 
@@ -20,6 +22,9 @@ PREFERENCES_FILENAME = "preferences.md"
 MAX_RECENT_QUERIES = 5
 MAX_QUERY_LENGTH = 160
 MIN_MESSAGE_LENGTH = 4
+
+# 后台记忆更新任务必须持有强引用，否则可能被事件循环提前回收。
+_background_tasks: set[asyncio.Task[Any]] = set()
 
 
 def preferences_file_path(user_id: str) -> str:
@@ -208,6 +213,52 @@ def _store_value(content: str, item: Any) -> dict[str, str]:
     }
 
 
+async def _persist_memory(
+    model: BaseChatModel,
+    store: Any,
+    *,
+    user_id: str,
+    user_message: str,
+    ai_summary: str,
+) -> None:
+    """完成一次记忆抽取与落库。
+
+    只接收文本，不持有 state / messages，避免后台任务把整轮上下文留在内存里。
+    """
+    query, preference_updates = await _extract_memory_update(
+        model,
+        user_message,
+        ai_summary,
+    )
+    # 摘要模型偶发返回空 query 时，保留原始用户消息，避免一次格式波动
+    # 让近期查询记录永久缺失。
+    if not query:
+        query = user_message[:MAX_QUERY_LENGTH]
+    if not query and not preference_updates:
+        return
+
+    path = preferences_file_path(user_id)
+    try:
+        item = await store.aget((user_id,), path)
+        preferences = _preferences_from_content(_store_content(item))
+        updated_preferences = _merge_preferred(preferences, preference_updates)
+        if query:
+            updated_preferences = _merge_recent_queries(updated_preferences, query)
+        await store.aput(
+            (user_id,),
+            path,
+            _store_value(_serialize_preferences(updated_preferences), item),
+            index=False,
+        )
+        logger.info(
+            "已自动更新用户长期记忆：has_query=%s，preference_update_count=%d",
+            bool(query),
+            len(preference_updates),
+        )
+    except Exception:
+        logger.warning("更新用户 %s 的近期查询失败", user_id, exc_info=True)
+
+
 class MemoryUpdateMiddleware(AgentMiddleware):
     """在每轮回答结束后自动维护当前用户的长期偏好。"""
 
@@ -223,7 +274,11 @@ class MemoryUpdateMiddleware(AgentMiddleware):
         user_id: str,
         store: Any,
     ) -> None:
-        """从已完成的 Agent 状态更新用户记忆，供 after-agent 钩子复用。"""
+        """从已完成的 Agent 状态更新用户记忆，供 after-agent 钩子复用。
+
+        只同步完成文本抽取；真正的记忆模型调用与落库默认放到后台，
+        避免在最终回答输出后阻塞本轮 ``done``。
+        """
         state_values = state if isinstance(state, dict) else getattr(state, "values", {})
         messages = (
             list(state_values.get("messages", []))
@@ -235,38 +290,40 @@ class MemoryUpdateMiddleware(AgentMiddleware):
         user_message = _last_user_message(messages)
         if user_message is None:
             return None
-        query, preference_updates = await _extract_memory_update(
+
+        coroutine = _persist_memory(
             self._model,
-            user_message,
-            _last_ai_summary(messages),
+            store,
+            user_id=user_id,
+            user_message=user_message,
+            ai_summary=_last_ai_summary(messages),
         )
-        # 摘要模型偶发返回空 query 时，保留原始用户消息，避免一次格式波动
-        # 让近期查询记录永久缺失。
-        if not query:
-            query = user_message[:MAX_QUERY_LENGTH]
-        if not query and not preference_updates:
+        if MEMORY_UPDATE_ASYNC:
+            self._spawn(coroutine, user_id)
             return None
-        path = preferences_file_path(user_id)
-        try:
-            item = await store.aget((user_id,), path)
-            preferences = _preferences_from_content(_store_content(item))
-            updated_preferences = _merge_preferred(preferences, preference_updates)
-            if query:
-                updated_preferences = _merge_recent_queries(updated_preferences, query)
-            await store.aput(
-                (user_id,),
-                path,
-                _store_value(_serialize_preferences(updated_preferences), item),
-                index=False,
-            )
-            logger.info(
-                "已自动更新用户长期记忆：has_query=%s，preference_update_count=%d",
-                bool(query),
-                len(preference_updates),
-            )
-        except Exception:
-            logger.warning("更新用户 %s 的近期查询失败", user_id, exc_info=True)
+        await coroutine
         return None
+
+    @staticmethod
+    def _spawn(coroutine: Any, user_id: str) -> None:
+        """把记忆更新放到后台；持有强引用并兜底异常日志。"""
+        task = asyncio.create_task(coroutine)
+        _background_tasks.add(task)
+
+        def _done(completed: asyncio.Task[Any]) -> None:
+            _background_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "后台记忆更新失败：user=%s",
+                    user_id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_done)
 
     async def aafter_agent(self, state: dict[str, Any], runtime: Any) -> None:
         """提取本轮查询摘要和明确偏好，并合并进 StoreBackend 偏好文件。"""

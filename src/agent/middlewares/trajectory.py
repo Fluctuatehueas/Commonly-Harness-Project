@@ -27,7 +27,7 @@ from langgraph.runtime import Runtime
 from agent.config import MODEL_CONTEXT_LIMIT, TRAJECTORY_MAX_TEXT
 from agent.trajectory_store import append_trajectory_event, truncate_text
 from agent.tools.async_sandbox_tools import START_ASYNC_TASK_TOOL_NAME
-from agent.tools.hitl_tool import request_additional_info
+from agent.tools.hitl_tool import request_additional_info, request_user_choice
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ SKILL_TOOLS = {
     "update_subagent_skill",
 }
 DELEGATION_TOOLS = {"task", START_ASYNC_TASK_TOOL_NAME}
-HITL_TOOL_NAMES = {request_additional_info.name}
+HITL_TOOL_NAMES = {request_additional_info.name, request_user_choice.name}
 
 
 def _now() -> datetime:
@@ -150,6 +150,8 @@ class TrajectoryMiddleware(AgentMiddleware):
         self._stats: dict[str, dict[str, int]] = {}
         self._started: dict[str, datetime] = {}
         self._contexts: dict[str, dict[str, Any]] = {}
+        # run_id -> 本轮根事件 ID，供 C# 按 parent_id 渲染轨迹树
+        self._run_root: dict[str, str] = {}
         # context 缺失时的兜底：thread_id -> run_id
         self._thread_runs: dict[str, str] = {}
 
@@ -211,7 +213,7 @@ class TrajectoryMiddleware(AgentMiddleware):
         self._stats[run_id] = {}
         snapshot = self._context_snapshot(messages)
         self._contexts[run_id] = snapshot
-        await self._emit(
+        event_id = await self._emit(
             runtime,
             run_id=run_id,
             event_type="run",
@@ -220,7 +222,27 @@ class TrajectoryMiddleware(AgentMiddleware):
             started=started,
             context=snapshot,
             preview=_last_user_text(messages),
+            graph="main",
         )
+        if event_id:
+            self._run_root[run_id] = event_id
+        # HITL 恢复：把用户提交的内容也落成一条轨迹事件，否则轨迹页只看到
+        # 「等待介入」，不知道后来用户回复了什么。
+        hitl_summary = str(getattr(context, "hitl_summary", "") or "")
+        if hitl_summary:
+            self._bump(run_id, "hitl")
+            await self._emit(
+                runtime,
+                run_id=run_id,
+                event_type="hitl",
+                label=f"人工回复：{hitl_summary[:60]}",
+                status=str(getattr(context, "hitl_status", "") or "answered"),
+                started=started,
+                ended=_now(),
+                preview=truncate_text(hitl_summary, self._max_text),
+                parent_id=event_id or "",
+                graph="main",
+            )
         return None
 
     async def aafter_agent(self, state: dict[str, Any], runtime: Runtime) -> None:
@@ -254,9 +276,11 @@ class TrajectoryMiddleware(AgentMiddleware):
             ended=ended,
             context=snapshot,
             summary=summary,
+            graph="main",
         )
         self._started.pop(run_id, None)
         self._contexts.pop(run_id, None)
+        self._run_root.pop(run_id, None)
         self._thread_runs.pop(thread_id, None)
         return None
 
@@ -289,6 +313,8 @@ class TrajectoryMiddleware(AgentMiddleware):
                     ended=ended,
                     context=snapshot,
                     result=truncate_text(exc, self._max_text),
+                    parent_id=self._run_root.get(run_id, ""),
+                    graph="main",
                 )
             raise
 
@@ -326,6 +352,8 @@ class TrajectoryMiddleware(AgentMiddleware):
                     result=truncate_text(_reasoning_text(ai_message), self._max_text),
                     tokens=_usage_tokens(ai_message),
                     tool_names=tool_names,
+                    parent_id=self._run_root.get(run_id, ""),
+                    graph="main",
                 )
             except Exception:
                 # 观测失败不能影响模型返回，否则监控中间件会变成故障点。
@@ -369,6 +397,8 @@ class TrajectoryMiddleware(AgentMiddleware):
                 args=truncate_text(_tool_args_text(args), self._max_text),
                 result=truncate_text(exc, self._max_text),
                 context=self._contexts.get(run_id, {}),
+                parent_id=self._run_root.get(run_id, ""),
+                graph="main",
             )
             raise
 
@@ -389,6 +419,8 @@ class TrajectoryMiddleware(AgentMiddleware):
                 args=truncate_text(_tool_args_text(args), self._max_text),
                 result=truncate_text(self._tool_result_text(result), self._max_text),
                 context=self._contexts.get(run_id, {}),
+                parent_id=self._run_root.get(run_id, ""),
+                graph="main",
             )
         except Exception:
             # 与模型路径一致：轨迹失败不影响工具结果返回。
@@ -431,16 +463,21 @@ class TrajectoryMiddleware(AgentMiddleware):
             return _tool_args_text(update)
         return str(result or "")
 
-    async def _emit(self, runtime: Runtime, **kwargs: Any) -> None:
-        """轨迹写入是旁路能力：任何异常都不能影响 Agent 主流程。"""
+    async def _emit(self, runtime: Runtime, **kwargs: Any) -> str | None:
+        """轨迹写入是旁路能力：任何异常都不能影响 Agent 主流程。
+
+        Returns:
+            成功时返回事件 ID；失败时返回 ``None``，调用方不得依赖它继续执行。
+        """
         try:
-            await self._emit_impl(runtime, **kwargs)
+            return await self._emit_impl(runtime, **kwargs)
         except Exception:
             logger.warning(
                 "记录轨迹事件失败：type=%s",
                 kwargs.get("event_type"),
                 exc_info=True,
             )
+            return None
 
     async def _emit_impl(
         self,
@@ -462,16 +499,24 @@ class TrajectoryMiddleware(AgentMiddleware):
         tool_names: list[str] | None = None,
         subagent_name: str = "",
         summary: dict[str, Any] | None = None,
-    ) -> None:
+        parent_id: str = "",
+        graph: str = "main",
+        step_id: str = "",
+        event_id: str = "",
+    ) -> str:
         _, user_id, thread_id = self._identity(runtime)
         if not user_id or not thread_id:
-            return
+            return ""
         duration_ms = (
             int((ended - started).total_seconds() * 1000) if ended is not None else None
         )
+        current_id = event_id or uuid4().hex
         event = {
-            "id": uuid4().hex,
+            "id": current_id,
             "run_id": run_id,
+            "parent_id": parent_id,
+            "graph": graph,
+            "step_id": step_id,
             "type": event_type,
             "label": label,
             "status": status,
@@ -496,3 +541,4 @@ class TrajectoryMiddleware(AgentMiddleware):
             thread_id=thread_id,
             event=event,
         )
+        return current_id

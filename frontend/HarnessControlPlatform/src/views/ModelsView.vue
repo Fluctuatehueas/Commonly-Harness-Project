@@ -4,7 +4,7 @@ import { onMounted } from 'vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import UiSwitch from '@/components/console/UiSwitch.vue'
-import { MODEL_CATALOG, useModelStore } from '@/stores/models'
+import { formatContext, useModelStore } from '@/stores/models'
 
 const store = useModelStore()
 onMounted(() => store.load())
@@ -28,35 +28,43 @@ onMounted(() => store.load())
                 <small>点击卡片选择，参数自动回填</small>
               </div>
             </div>
-            <div class="grid">
-              <button
-                v-for="m in MODEL_CATALOG"
-                :key="m.id"
-                class="card"
-                :class="{ selected: store.selectedId === m.id, active: store.current.model_name === m.id }"
-                type="button"
-                @click="store.select(m)"
-              >
-                <div class="card-top">
-                  <span class="avatar" :style="{ background: m.gradient }">{{ m.initial }}</span>
-                  <div class="meta">
-                    <strong>{{ m.name }}</strong>
-                    <span>{{ m.provider }}</span>
-                  </div>
-                  <span v-if="store.current.model_name === m.id" class="using">使用中</span>
-                  <span v-else-if="store.selectedId === m.id" class="picked"><AppIcon name="check" :size="12" />已选</span>
+            <div class="catalog-groups">
+              <section v-for="group in store.groupedCatalog" :key="group.provider" class="vendor-group">
+                <header class="vendor-head">
+                  <span class="vendor-name">{{ group.provider }}</span>
+                  <small>{{ group.models.length }} 个模型</small>
+                </header>
+                <div class="grid">
+                  <button
+                    v-for="m in group.models"
+                    :key="m.id"
+                    class="card"
+                    :class="{ selected: store.selectedId === m.id, active: store.current.model_name === m.id }"
+                    type="button"
+                    @click="store.select(m)"
+                  >
+                    <div class="card-top">
+                      <span class="avatar" :style="{ background: m.gradient }">{{ m.initial }}</span>
+                      <div class="meta">
+                        <strong>{{ m.name }}</strong>
+                        <span>{{ m.provider }}</span>
+                      </div>
+                      <span v-if="store.current.model_name === m.id" class="using">使用中</span>
+                      <span v-else-if="store.selectedId === m.id" class="picked"><AppIcon name="check" :size="12" />已选</span>
+                    </div>
+                    <div class="ctx">
+                      <AppIcon name="memory" :size="12" />
+                      {{ m.context }}
+                      <span class="temp">temp {{ m.temperature }}</span>
+                    </div>
+                    <div class="tags">
+                      <span v-for="t in m.features" :key="t" class="tag">{{ t }}</span>
+                    </div>
+                    <code v-if="m.baseUrl" class="url">{{ m.baseUrl }}</code>
+                    <span v-if="m.note" class="note">{{ m.note }}</span>
+                  </button>
                 </div>
-                <div class="ctx">
-                  <AppIcon name="memory" :size="12" />
-                  {{ m.context }}
-                  <span class="temp">temp {{ m.temperature }}</span>
-                </div>
-                <div class="tags">
-                  <span v-for="t in m.features" :key="t" class="tag">{{ t }}</span>
-                </div>
-                <code v-if="m.baseUrl" class="url">{{ m.baseUrl }}</code>
-                <span v-if="m.note" class="note">{{ m.note }}</span>
-              </button>
+              </section>
             </div>
           </section>
 
@@ -100,6 +108,29 @@ onMounted(() => store.load())
                 <UiSwitch v-model="store.form.thinking_enabled" />
               </div>
 
+              <div v-if="store.selected" class="ctx-row">
+                <div class="ctx-row-head">
+                  <span>上下文窗口 <em>HARNESS_MODEL_CONTEXT_LIMIT</em></span>
+                  <strong class="ctx-current">{{ formatContext(store.form.context_limit) }}</strong>
+                </div>
+                <div class="ctx-options">
+                  <button
+                    v-for="opt in store.selected.contextOptions"
+                    :key="opt"
+                    type="button"
+                    class="ctx-chip"
+                    :class="{ on: store.form.context_limit === opt }"
+                    @click="store.form.context_limit = opt"
+                  >
+                    {{ formatContext(opt) }}
+                  </button>
+                </div>
+                <p class="ctx-tip">
+                  只用于上下文监控与压缩阈值，不影响模型真实能力。DeepSeek V4 系列窗口 1M，
+                  V3 系列 128K；取服务端允许的最大输入 token 即可。
+                </p>
+              </div>
+
               <div v-if="store.selected" class="preview">
                 <strong>{{ store.selected.name }}</strong>
                 <p>推荐温度 {{ store.selected.temperature }} · {{ store.selected.context }}{{ store.selected.note ? ' · ' + store.selected.note : '' }}</p>
@@ -133,14 +164,84 @@ onMounted(() => store.load())
   padding: 18px 22px 26px;
 }
 
+.ctx-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+}
+
+.ctx-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.ctx-row-head em {
+  font-style: normal;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 10px;
+  color: var(--text-3);
+  margin-left: 6px;
+}
+
+.ctx-current {
+  font-size: 12.5px;
+  color: var(--accent-cyan);
+}
+
+/* 固定选项，横向换行，不出现滚动条 */
+.ctx-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  overflow: visible;
+}
+
+.ctx-chip {
+  padding: 4px 11px;
+  font-size: 11px;
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.ctx-chip:hover {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+
+.ctx-chip.on {
+  color: var(--text-1);
+  border-color: var(--accent);
+  background: rgba(91, 140, 255, 0.12);
+}
+
+.ctx-tip {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
 .think-row {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 11px 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(16, 32, 64, 0.4);
+  padding: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .think-text {
@@ -165,18 +266,18 @@ onMounted(() => store.load())
   align-items: center;
   gap: 8px;
   margin-bottom: 14px;
-  padding: 10px 14px;
+  padding: 9px 12px;
   font-size: 12px;
   color: var(--amber);
-  border: 1px solid rgba(255, 182, 72, 0.35);
-  border-radius: var(--radius-md);
-  background: rgba(255, 182, 72, 0.08);
+  border: 1px solid rgba(242, 176, 60, 0.3);
+  border-radius: var(--radius-sm);
+  background: rgba(242, 176, 60, 0.05);
 }
 
 .columns {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 16px;
+  gap: 0;
   align-items: start;
 }
 
@@ -195,35 +296,65 @@ onMounted(() => store.load())
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
   gap: 12px;
+}
+
+.catalog-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
   padding: 14px 16px 0;
+}
+
+.vendor-group {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.vendor-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.vendor-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.vendor-head small {
+  font-size: 10px;
+  color: var(--text-3);
 }
 
 .card {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 13px;
+  padding: 12px;
   text-align: left;
   color: var(--text-1);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--bg-card);
-  transition: all 0.18s;
+  border-radius: 0;
+  background: transparent;
+  transition: background 0.16s, border-color 0.16s;
 }
 
 .card:hover {
   border-color: var(--line-strong);
-  background: var(--bg-card-hover);
-  transform: translateY(-2px);
+  background: var(--bg-hover);
 }
 
 .card.selected {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), 0 6px 20px rgba(59, 120, 255, 0.25);
+  background: rgba(91, 140, 255, 0.06);
 }
 
 .card.active {
-  border-color: rgba(61, 220, 132, 0.5);
+  border-color: rgba(55, 208, 196, 0.45);
 }
 
 .card-top {
@@ -235,11 +366,11 @@ onMounted(() => store.load())
 .avatar {
   display: grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  font-size: 14px;
-  font-weight: 700;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
   color: #fff;
   flex: none;
 }
@@ -269,22 +400,22 @@ onMounted(() => store.load())
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 8px;
-  font-size: 10px;
-  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 9.5px;
+  border-radius: var(--radius-sm);
   flex: none;
 }
 
 .using {
-  color: var(--green);
-  border: 1px solid rgba(61, 220, 132, 0.4);
-  background: rgba(61, 220, 132, 0.08);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(55, 208, 196, 0.35);
+  background: transparent;
 }
 
 .picked {
-  color: #cfe3ff;
+  color: var(--text-1);
   border: 1px solid var(--accent);
-  background: rgba(79, 140, 255, 0.15);
+  background: rgba(91, 140, 255, 0.1);
 }
 
 .ctx {
@@ -312,12 +443,12 @@ onMounted(() => store.load())
 }
 
 .tag {
-  padding: 2px 8px;
-  font-size: 10.5px;
+  padding: 1px 7px;
+  font-size: 10px;
   color: var(--text-2);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  background: rgba(10, 20, 40, 0.5);
+  border-radius: var(--radius-sm);
+  background: transparent;
 }
 
 .url {
@@ -337,22 +468,25 @@ onMounted(() => store.load())
 .config {
   position: sticky;
   top: calc(var(--topbar-h) + 18px);
-  padding-bottom: 16px;
+  padding: 0 0 16px 20px;
+  border-left: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  background: transparent;
 }
 
 .dirty {
-  padding: 2px 9px;
-  font-size: 10.5px;
+  padding: 1px 8px;
+  font-size: 10px;
   color: var(--amber);
-  border: 1px solid rgba(255, 182, 72, 0.4);
-  border-radius: 999px;
+  border: 1px solid rgba(242, 176, 60, 0.4);
+  border-radius: var(--radius-sm);
 }
 
 .fields {
   display: flex;
   flex-direction: column;
   gap: 13px;
-  padding: 16px;
+  padding: 14px 16px 16px 0;
 }
 
 .fields label {
@@ -375,19 +509,19 @@ onMounted(() => store.load())
 }
 
 .fields input {
-  padding: 9px 12px;
-  font-size: 12.5px;
-  font-family: 'Cascadia Code', Consolas, monospace;
+  padding: 8px 11px;
+  font-size: 12px;
+  font-family: var(--font-mono);
   color: var(--text-1);
   border: 1px solid var(--line-strong);
-  border-radius: 9px;
-  background: rgba(6, 13, 28, 0.7);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
   outline: none;
 }
 
 .fields input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.15);
+  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.22);
 }
 
 .key-state {
@@ -402,7 +536,7 @@ onMounted(() => store.load())
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #ff6b6b;
+  background: var(--danger);
 }
 
 .key-state .dot.ok {
@@ -411,10 +545,11 @@ onMounted(() => store.load())
 }
 
 .preview {
-  padding: 10px 12px;
-  border: 1px dashed var(--line-strong);
-  border-radius: 10px;
-  background: rgba(16, 32, 64, 0.4);
+  padding: 9px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .preview strong {
@@ -433,25 +568,23 @@ onMounted(() => store.load())
   align-items: center;
   justify-content: center;
   gap: 7px;
-  padding: 11px;
-  font-size: 13px;
+  padding: 9px;
+  font-size: 12.5px;
   color: #fff;
   border: none;
-  border-radius: 11px;
-  background: linear-gradient(90deg, #3b78ff, #2a5cd6);
-  box-shadow: 0 6px 18px rgba(50, 110, 255, 0.35);
-  transition: all 0.18s;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  transition: filter 0.16s;
 }
 
 .save:hover {
-  filter: brightness(1.12);
+  filter: brightness(1.1);
 }
 
 .save:disabled {
   opacity: 0.45;
   cursor: not-allowed;
   filter: none;
-  box-shadow: none;
 }
 
 .hint {
@@ -469,19 +602,18 @@ onMounted(() => store.load())
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 11px 18px;
-  font-size: 12.5px;
-  border-radius: 11px;
-  border: 1px solid rgba(61, 220, 132, 0.4);
-  color: #c9f5db;
-  background: rgba(12, 40, 28, 0.92);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  padding: 10px 16px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(55, 208, 196, 0.35);
+  color: var(--text-1);
+  background: var(--bg-elevated);
 }
 
 .toast.err {
-  border-color: rgba(255, 93, 93, 0.45);
-  color: #ffd2d2;
-  background: rgba(56, 16, 20, 0.92);
+  border-color: rgba(226, 96, 94, 0.45);
+  color: var(--text-1);
+  background: var(--bg-elevated);
 }
 
 .toast-enter-active,

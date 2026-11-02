@@ -1,6 +1,6 @@
-"""从 FastMCP / 标准 MCP Server 加载 LangChain 工具。
+﻿"""从 FastMCP / 标准 MCP Server 加载 LangChain 工具。
 
-配置文件默认位于项目根目录 ``mcp_servers.yaml``，也可用
+配置文件默认使用统一的 ``mcp/servers.json``，也可用
 ``HARNESS_MCP_CONFIG_PATH`` 指定。支持两种常用传输：
 
 - ``stdio``：客户端以子进程方式启动 MCP Server；
@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -18,14 +19,31 @@ from typing import Any, Iterable
 
 import yaml
 
-from agent.config import PROJECT_ROOT
+from agent.config import MCP_CONFIG_PATH
 
 
 logger = logging.getLogger(__name__)
 
 MCP_CONFIG_ENV = "HARNESS_MCP_CONFIG_PATH"
-DEFAULT_MCP_CONFIG_PATH = PROJECT_ROOT / "mcp_servers.yaml"
+DEFAULT_MCP_CONFIG_PATH = MCP_CONFIG_PATH
 SUPPORTED_TRANSPORTS = {"stdio", "streamable_http", "sse"}
+# 只在本项目内使用、不传给 MCP 传输层的调度字段。
+MCP_LOCAL_KEYS = {
+    "description",
+    "enabled",
+    "optional",
+    "preconnect",
+    "criticality",
+    "namespace",
+    "allow_tools",
+    "deny_tools",
+    "connect_timeout_ms",
+    "call_timeout_ms",
+    "retry",
+    "health_check",
+    "pool",
+    "tags",
+}
 
 
 def mcp_config_path(path: str | Path | None = None) -> Path:
@@ -37,21 +55,40 @@ def mcp_config_path(path: str | Path | None = None) -> Path:
 
 
 def _validate_server(name: str, config: Any) -> dict[str, Any]:
-    """校验单个 MCP Server 的连接配置。"""
+    """校验单个 MCP Server 的连接配置。
+
+    支持两个项目内调度字段：
+    - ``enabled``：默认 ``true``；为 ``false`` 时不校验连接参数、也不会被加载。
+    - ``optional``：默认 ``false``；为 ``true`` 时连接失败只告警并跳过，
+      不阻断主 Agent 构图（用于尚未在本机安装的第三方视觉服务）。
+    """
     if not isinstance(config, dict):
         raise ValueError(f"MCP Server 配置必须是对象: {name}")
 
-    transport = str(config.get("transport", "")).strip().lower()
+    validated = dict(config)
+    enabled = validated.get("enabled", True)
+    optional = validated.get("optional", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"MCP Server {name} 的 enabled 必须是布尔值")
+    if not isinstance(optional, bool):
+        raise ValueError(f"MCP Server {name} 的 optional 必须是布尔值")
+    validated["enabled"] = enabled
+    validated["optional"] = optional
+
+    transport = str(validated.get("transport", "")).strip().lower()
     if transport in {"streamable-http", "http"}:
         transport = "streamable_http"
+    validated["transport"] = transport
+
+    if not enabled:
+        # 未启用的服务允许留空 command / url，方便先声明后安装。
+        return validated
+
     if transport not in SUPPORTED_TRANSPORTS:
         raise ValueError(
             f"MCP Server {name} 的 transport 无效: {transport!r}；"
             f"可选值: {sorted(SUPPORTED_TRANSPORTS)}"
         )
-
-    validated = dict(config)
-    validated["transport"] = transport
 
     if transport == "stdio":
         command = validated.get("command")
@@ -91,10 +128,14 @@ def load_mcp_config(
         logger.info("未找到 MCP 配置文件，跳过 MCP 工具加载: %s", resolved)
         return {"main_servers": [], "servers": {}}
 
-    with resolved.open(encoding="utf-8-sig") as config_file:
-        raw = yaml.safe_load(config_file) or {}
+    text = resolved.read_text(encoding="utf-8-sig")
+    try:
+        raw = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        # 兼容仍在使用 YAML 的旧配置或显式传入的 YAML 路径。
+        raw = yaml.safe_load(text) or {}
     if not isinstance(raw, dict):
-        raise ValueError(f"MCP 配置必须是 YAML 对象: {resolved}")
+        raise ValueError(f"MCP 配置必须是 JSON 对象: {resolved}")
 
     raw_servers = raw.get("servers", {})
     if not isinstance(raw_servers, dict):
@@ -133,8 +174,9 @@ async def load_mcp_tools_for_servers(
 ) -> list[Any]:
     """加载指定 MCP Server 的全部工具。
 
-    连接或工具发现失败会立即抛出 ``RuntimeError``，不会静默降级为
-    “没有工具”，以免 Agent 在缺少业务能力时继续运行。
+    - ``enabled: false`` 的 Server 直接跳过（尚未安装 / 未启用的第三方服务）。
+    - 连接或工具发现失败时，``optional: true`` 的 Server 只告警并跳过；
+      其余 Server 立即抛出 ``RuntimeError``，不静默降级为“没有工具”。
     """
     names = list(dict.fromkeys(str(name) for name in server_names if str(name)))
     if not names:
@@ -146,15 +188,38 @@ async def load_mcp_tools_for_servers(
     if unknown:
         raise ValueError(f"未定义的 MCP Server: {sorted(unknown)}")
 
+    selected: list[str] = []
+    for name in names:
+        if not servers[name].get("enabled", True):
+            logger.info("MCP Server %s 未启用，跳过工具加载", name)
+            continue
+        selected.append(name)
+    if not selected:
+        return []
+
     # 延迟导入：未使用 MCP 的项目不必在启动阶段加载适配器依赖。
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    client = MultiServerMCPClient({name: servers[name] for name in names})
+    # description / enabled / optional 只用于本项目调度，不能传给传输层。
+    connections = {
+        name: {
+            key: value
+            for key, value in servers[name].items()
+            if key not in MCP_LOCAL_KEYS
+        }
+        for name in selected
+    }
+    client = MultiServerMCPClient(connections)
     tools: list[Any] = []
-    for name in names:
+    for name in selected:
         try:
             server_tools = await client.get_tools(server_name=name)
         except Exception as error:
+            if servers[name].get("optional", False):
+                logger.warning(
+                    "可选 MCP Server %s 不可用，已跳过: %s", name, error
+                )
+                continue
             logger.exception("加载 MCP Server %s 的工具失败", name)
             raise RuntimeError(f"无法加载 MCP Server 的工具: {name}") from error
         logger.info("已从 MCP Server %s 加载 %d 个工具", name, len(server_tools))
