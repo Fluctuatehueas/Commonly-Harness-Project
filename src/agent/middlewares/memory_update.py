@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
+from langgraph.constants import TAG_NOSTREAM
 
 from agent.config import MEMORY_UPDATE_ASYNC
 from agent.schema import UserPreferences
@@ -107,7 +108,8 @@ User message: {user_message}
 Assistant response summary: {ai_summary}
 """
     try:
-        response = await model.ainvoke(prompt)
+        # 内部记忆抽取结果不得进入消息流。
+        response = await model.ainvoke(prompt, config={"tags": [TAG_NOSTREAM]})
         content = _message_text(response)
         start = content.find("{")
         end = content.rfind("}")

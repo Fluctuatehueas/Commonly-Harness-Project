@@ -14,7 +14,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.runtime import Runtime
 
-from agent.config import CONTEXT_ALERT_THRESHOLD, MODEL_CONTEXT_LIMIT
+import agent.config as agent_config
 
 
 logger = logging.getLogger(__name__)
@@ -25,12 +25,21 @@ class ContextWindowMonitorMiddleWare(AgentMiddleware):
 
     def __init__(
         self,
-        alert_threshold: float = CONTEXT_ALERT_THRESHOLD,
-        context_limit: int = MODEL_CONTEXT_LIMIT,
+        alert_threshold: float | None = None,
+        context_limit: int | None = None,
     ) -> None:
         super().__init__()
-        self.alert_threshold = float(alert_threshold)
-        self.context_limit = int(context_limit or 0)
+        # 每次构图时读当前配置，支持设置页热更新后重建 Agent 图。
+        self.alert_threshold = float(
+            alert_threshold
+            if alert_threshold is not None
+            else agent_config.CONTEXT_ALERT_THRESHOLD
+        )
+        self.context_limit = int(
+            context_limit
+            if context_limit is not None
+            else agent_config.MODEL_CONTEXT_LIMIT
+        )
 
     # ---------- 异步钩子 ----------
     # DeepAgents 统一走异步图；同时实现同步钩子会让中间件链出现两个同名节点，

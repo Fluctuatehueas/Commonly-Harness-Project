@@ -485,8 +485,30 @@ class MCPRuntime:
                 visible.append(server_id)
         return self.registry.tools_for_servers(visible)
 
-    async def tools_for_main_agent(self) -> list[Any]:
-        return await self.tools_for_servers(self.main_server_ids())
+    def main_tool_scope(self, integration_server_id: str | None = None) -> list[str]:
+        """计算主 Agent 可见的 MCP 服务范围。
+
+        非集成 MCP 始终作为公共能力；集成 MCP 只有绑定该后端的会话才可见，
+        避免一个后端会话误调用另一个后端的业务工具。
+        """
+        scope: list[str] = []
+        for server_id in self.main_server_ids():
+            config = self._config.servers.get(server_id)
+            if config is None or config.integration:
+                continue
+            scope.append(server_id)
+        if integration_server_id:
+            config = self._config.servers.get(integration_server_id)
+            if config is not None and config.integration:
+                scope.append(integration_server_id)
+        return list(dict.fromkeys(scope))
+
+    async def tools_for_main_agent(
+        self, integration_server_id: str | None = None,
+    ) -> list[Any]:
+        return await self.tools_for_servers(
+            self.main_tool_scope(integration_server_id)
+        )
 
     # ---------- 调用 ----------
 
@@ -922,6 +944,7 @@ class MCPRuntime:
                 (
                     server_id,
                     config.enabled,
+                    config.integration,
                     config.effective_namespace,
                     config.namespace_mode,
                     config.namespace_separator,

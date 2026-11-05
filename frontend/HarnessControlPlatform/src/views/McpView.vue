@@ -83,6 +83,8 @@ const addOpen = ref(false)
 const editingId = ref('')
 const jsonText = ref('')
 const importEnabled = ref(true)
+// 自定义 MCP：这是用户自己的后端项目，会出现在聊天侧栏【集成的项目】。
+const importIntegration = ref(false)
 const importing = ref(false)
 const addError = ref('')
 const preflightLoading = ref(false)
@@ -433,6 +435,7 @@ function openCreate() {
   pfInfoKey.value = ''
   addError.value = ''
   importEnabled.value = true
+  importIntegration.value = false
   forceImport.value = false
   addOpen.value = true
 }
@@ -477,6 +480,7 @@ async function openEdit(item: McpServerItem | McpServerDetail) {
   pfInfoKey.value = ''
   addError.value = ''
   importEnabled.value = detail.enabled
+  importIntegration.value = detail.integration
   forceImport.value = false
   addOpen.value = true
   schedulePreflight(200)
@@ -550,7 +554,11 @@ async function submitImport() {
   importing.value = true
   addError.value = ''
   try {
-    const result = await importMcpJson(jsonText.value, importEnabled.value)
+    const result = await importMcpJson(
+      jsonText.value,
+      importEnabled.value,
+      importIntegration.value,
+    )
     addOpen.value = false
     jsonText.value = ''
     preflight.value = null
@@ -583,6 +591,7 @@ function hoverMeta(item: McpServerItem): { label: string; value: string }[] {
 
 function hoverTags(item: McpServerItem): string[] {
   const tags = [stateMeta(item.state).label, transportLabel(item.transport)]
+  if (item.integration) tags.push('集成项目')
   if (!item.enabled) tags.push('已停用')
   if (item.criticality === 'required') tags.push('关键服务')
   return tags
@@ -766,6 +775,7 @@ onBeforeUnmount(() => {
             <div class="server-head">
               <code class="server-id">{{ item.server_id }}</code>
               <span class="state-label">{{ stateMeta(item.state).label }}</span>
+              <span v-if="item.integration" class="int-chip">集成</span>
               <span v-if="item.criticality === 'required'" class="req-chip">关键</span>
               <span v-if="!item.enabled" class="off-chip">已停用</span>
             </div>
@@ -922,6 +932,7 @@ onBeforeUnmount(() => {
               <dl class="kv-grid">
                 <dt>transport</dt><dd>{{ selected.transport }}</dd>
                 <dt>namespace</dt><dd>{{ selected.namespace }}</dd>
+                <dt>类型</dt><dd>{{ selected.integration ? '集成项目（自有后端 MCP）' : '通用 MCP' }}</dd>
                 <dt>criticality</dt><dd>{{ selected.criticality }}</dd>
                 <dt>preconnect</dt><dd>{{ selected.preconnect ? '是' : '否（懒连接）' }}</dd>
                 <dt>pool key</dt><dd class="mono">{{ selected.pool_key }}</dd>
@@ -1154,6 +1165,13 @@ onBeforeUnmount(() => {
               <span class="switch-row">
                 <span>启用配置</span>
                 <UiSwitch v-model="importEnabled" />
+              </span>
+              <span class="switch-row">
+                <span>
+                  集成项目
+                  <small class="switch-hint">这是我自己接入的后端 MCP，会出现在聊天侧栏</small>
+                </span>
+                <UiSwitch v-model="importIntegration" />
               </span>
             </div>
 
@@ -1554,6 +1572,21 @@ onBeforeUnmount(() => {
   color: var(--text-3);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+}
+
+.int-chip {
+  padding: 1px 6px;
+  font-size: 9px;
+  color: var(--accent-cyan);
+  border: 1px solid rgba(55, 208, 196, 0.35);
+  border-radius: var(--radius-sm);
+}
+
+.switch-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 9.5px;
+  color: var(--text-3);
 }
 
 .server-desc {

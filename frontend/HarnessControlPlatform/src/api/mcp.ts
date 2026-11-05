@@ -30,6 +30,8 @@ export interface McpServerItem {
   connection: McpConnection
   enabled: boolean
   preconnect: boolean
+  /** 用户自有后端项目封装成的 MCP（集成模式）。 */
+  integration: boolean
   criticality: 'required' | 'optional'
   namespace: string
   allow_tools: string[]
@@ -119,6 +121,7 @@ export interface McpServerPayload {
   headers: Record<string, string>
   enabled: boolean
   preconnect: boolean
+  integration: boolean
   criticality: 'required' | 'optional'
   namespace: string
   allow_tools: string[]
@@ -224,6 +227,7 @@ export function fetchMcpServers(params: {
   keyword?: string
   state?: string
   enabled?: boolean
+  integration?: boolean
 } = {}): Promise<McpServerList> {
   const query = new URLSearchParams()
   query.set('page', String(params.page ?? 1))
@@ -231,7 +235,18 @@ export function fetchMcpServers(params: {
   if (params.keyword) query.set('keyword', params.keyword)
   if (params.state) query.set('state', params.state)
   if (params.enabled !== undefined) query.set('enabled', String(params.enabled))
+  if (params.integration !== undefined) {
+    query.set('integration', String(params.integration))
+  }
   return request(`/mcp/servers?${query.toString()}`)
+}
+
+/** 聊天侧栏【集成的项目】：只返回用户自有后端 MCP，不触发连接。 */
+export function fetchMcpIntegrations(): Promise<{
+  items: McpServerItem[]
+  total: number
+}> {
+  return request('/mcp/integrations')
 }
 
 export function fetchMcpServer(serverId: string): Promise<McpServerDetail> {
@@ -342,10 +357,11 @@ export function preflightMcpJson(jsonText: string): Promise<McpPreflightResult> 
 export function importMcpJson(
   jsonText: string,
   enabled = true,
+  integration = false,
 ): Promise<McpImportResult> {
   return request('/mcp/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ json_text: jsonText, enabled }),
+    body: JSON.stringify({ json_text: jsonText, enabled, integration }),
   })
 }

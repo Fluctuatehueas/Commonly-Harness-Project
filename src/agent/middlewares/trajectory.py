@@ -24,7 +24,15 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.config import get_config
 from langgraph.runtime import Runtime
 
-from agent.config import MODEL_CONTEXT_LIMIT, TRAJECTORY_MAX_TEXT
+from agent.config import (
+    EVOLUTION_ENABLED,
+    EVOLUTION_TENANT_ID,
+    MODEL_CONTEXT_LIMIT,
+    TRAJECTORY_MAX_TEXT,
+)
+from agent.evolution.reward import append_reward, classify_tool_outcome
+from agent.evolution.tool_health import record_tool_health
+from agent.evolution.trace_governor import govern_event
 from agent.trajectory_store import append_trajectory_event, truncate_text
 from agent.tools.async_sandbox_tools import START_ASYNC_TASK_TOOL_NAME
 from agent.tools.hitl_tool import request_additional_info, request_user_choice
@@ -383,7 +391,7 @@ class TrajectoryMiddleware(AgentMiddleware):
             ended = _now()
             interrupted = type(exc).__name__ in {"GraphInterrupt", "Interrupt"}
             self._bump(run_id, "hitl" if interrupted else event_type)
-            await self._emit(
+            event_id = await self._emit(
                 request.runtime,
                 run_id=run_id,
                 event_type=event_type,
@@ -400,17 +408,30 @@ class TrajectoryMiddleware(AgentMiddleware):
                 parent_id=self._run_root.get(run_id, ""),
                 graph="main",
             )
+            if not interrupted:
+                await self._record_tool_evolution(
+                    request.runtime,
+                    run_id=run_id,
+                    event_id=event_id or "",
+                    tool_name=tool_name,
+                    status="error",
+                    result_text=str(exc),
+                    started=started,
+                    ended=ended,
+                    error=exc,
+                )
             raise
 
         ended = _now()
+        event_status = "error" if getattr(result, "status", None) == "error" else "done"
         try:
             self._bump(run_id, event_type)
-            await self._emit(
+            event_id = await self._emit(
                 request.runtime,
                 run_id=run_id,
                 event_type=event_type,
                 label=self._tool_label(tool_name, args, event_type),
-                status="error" if getattr(result, "status", None) == "error" else "done",
+                status=event_status,
                 started=started,
                 ended=ended,
                 tool_name=tool_name,
@@ -421,6 +442,16 @@ class TrajectoryMiddleware(AgentMiddleware):
                 context=self._contexts.get(run_id, {}),
                 parent_id=self._run_root.get(run_id, ""),
                 graph="main",
+            )
+            await self._record_tool_evolution(
+                request.runtime,
+                run_id=run_id,
+                event_id=event_id or "",
+                tool_name=tool_name,
+                status=event_status,
+                result_text=self._tool_result_text(result),
+                started=started,
+                ended=ended,
             )
         except Exception:
             # 与模型路径一致：轨迹失败不影响工具结果返回。
@@ -504,7 +535,7 @@ class TrajectoryMiddleware(AgentMiddleware):
         step_id: str = "",
         event_id: str = "",
     ) -> str:
-        _, user_id, thread_id = self._identity(runtime)
+        context_obj, user_id, thread_id = self._identity(runtime)
         if not user_id or not thread_id:
             return ""
         duration_ms = (
@@ -535,6 +566,18 @@ class TrajectoryMiddleware(AgentMiddleware):
             "source": "main",
             "summary": summary or {},
         }
+        tenant_id = str(
+            getattr(context_obj, "tenant_id", "") or EVOLUTION_TENANT_ID or "default"
+        )
+        try:
+            event = govern_event(
+                event,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+            )
+        except Exception:
+            logger.warning("轨迹治理失败，按原始事件落库", exc_info=True)
         await append_trajectory_event(
             getattr(runtime, "store", None),
             user_id=user_id,
@@ -542,3 +585,57 @@ class TrajectoryMiddleware(AgentMiddleware):
             event=event,
         )
         return current_id
+
+    async def _record_tool_evolution(
+        self,
+        runtime: Runtime,
+        *,
+        run_id: str,
+        event_id: str,
+        tool_name: str,
+        status: str,
+        result_text: str,
+        started: datetime,
+        ended: datetime,
+        error: BaseException | None = None,
+    ) -> None:
+        """把一次工具结果写入奖励账本与工具健康度。"""
+        if not EVOLUTION_ENABLED:
+            return
+        context_obj, user_id, thread_id = self._identity(runtime)
+        store = getattr(runtime, "store", None)
+        if not user_id or not thread_id or store is None:
+            return
+        value, category = classify_tool_outcome(
+            status=status,
+            result_text=result_text,
+            error=error,
+        )
+        tenant_id = str(
+            getattr(context_obj, "tenant_id", "") or EVOLUTION_TENANT_ID or "default"
+        )
+        duration_ms = int((ended - started).total_seconds() * 1000)
+        try:
+            await append_reward(
+                store,
+                user_id=user_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                execution_id=run_id,
+                event_id=event_id,
+                source="tool_outcome",
+                value=value,
+                category=category,
+                confidence=0.8,
+                evidence=result_text[:2000],
+            )
+            await record_tool_health(
+                store,
+                user_id=user_id,
+                tool_name=tool_name,
+                category=category,
+                reward_value=value,
+                duration_ms=duration_ms,
+            )
+        except Exception:
+            logger.warning("写入工具演进信号失败", exc_info=True)

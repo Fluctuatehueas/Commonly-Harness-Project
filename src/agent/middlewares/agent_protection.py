@@ -4,21 +4,24 @@ from __future__ import annotations
 
 from typing import Any
 
-from deepagents.middleware.summarization import (
-    SummarizationToolMiddleware,
-    create_summarization_middleware,
-)
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ToolCallLimitMiddleware,
 )
 from langchain_core.language_models import BaseChatModel
 
+from agent.context.budget import build_budget
+from agent.middlewares.context_compaction import (
+    HarnessCompactionToolMiddleware,
+    HarnessContextCompactionMiddleware,
+)
+
 
 COMPACTION_SYSTEM_PROMPT = """
-当已完成一段较长的任务、已消化子 Agent 的长报告，且接下来需要继续处理新阶段任务时，
-可调用 compact_conversation 压缩已不再需要逐条保留的中间过程。摘要必须保留已确认的结论、
-审批或补充信息状态、异步 task_id、关键资源 ID 与未完成事项。
+你可以在合适的时机主动调用 compact_conversation 压缩历史。判断标准：
+- 应当调用：当前子任务已经收敛、结论已确认；准备进入完全不同的新阶段；已消化子 Agent 的长报告。
+- 不应调用：正在推导中、关键工具调用尚未返回、等待人工审批或补充信息、答案尚未落定。
+- 压缩摘要必须保留：已确认结论、审批/补充信息状态、异步 task_id、关键资源 ID、文件路径与未完成事项。
 """.strip()
 
 
@@ -36,11 +39,16 @@ def build_agent_protection_middleware(
     因此手动和自动压缩会复用同一份状态和历史归档位置。调用次数只限制当前
     Agent run，避免长期会话因历史累计而失效。
     """
-    summarization = create_summarization_middleware(summary_model, backend)
+    # 压缩阈值按项目有效窗口计算，不再依赖模型 profile 的 1M 窗口。
+    summarization = HarnessContextCompactionMiddleware(
+        summary_model,
+        backend,
+        budget=build_budget(),
+    )
     middleware: list[Any] = [summarization]
     if enable_compaction_tool:
         middleware.append(
-            SummarizationToolMiddleware(
+            HarnessCompactionToolMiddleware(
                 summarization,
                 system_prompt=COMPACTION_SYSTEM_PROMPT,
             )

@@ -44,7 +44,9 @@ interface HostApproval {
   args: Record<string, unknown>
 }
 
-const props = defineProps<{ msg: ChatMsg }>()
+const props = withDefaults(defineProps<{ msg: ChatMsg; readonly?: boolean }>(), {
+  readonly: false,
+})
 const chat = useChatStore()
 
 const payload = computed(() => props.msg.payload || {})
@@ -228,7 +230,7 @@ function rejectHost() {
 </script>
 
 <template>
-  <div class="hitl panel" :class="{ resolved }">
+  <div class="hitl panel" :class="{ resolved, readonly: props.readonly }">
     <div class="glow"></div>
 
     <div class="head">
@@ -414,6 +416,12 @@ function rejectHost() {
   border: 1px solid rgba(53, 224, 255, 0.35);
   background: linear-gradient(180deg, rgba(18, 40, 78, 0.85), rgba(12, 26, 52, 0.9));
   animation: rise 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 归档会话只读：保留中断内容，但禁止任何提交操作 */
+.hitl.readonly {
+  pointer-events: none;
+  filter: saturate(0.6);
 }
 
 /* 浮现动画：上浮 + 缩放 + 光晕脉冲 */

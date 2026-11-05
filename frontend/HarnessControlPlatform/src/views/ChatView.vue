@@ -1,10 +1,11 @@
 <script setup lang="ts">
 // 首页：对话测试（顶栏菜单 + 左侧会话栏 + SSE 流式 + 文件预览）
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import UiSwitch from '@/components/console/UiSwitch.vue'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
+import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
@@ -15,6 +16,7 @@ import {
   deleteContextFile,
   fetchContextFormats,
   importContextUrl,
+  resolveContextFiles,
   uploadContextFile,
   type ContextFile,
   type ContextFormats,
@@ -70,6 +72,145 @@ const urlMode = ref(false)
 const urlDraft = ref('')
 const urlLoading = ref(false)
 
+// ---------- 未发送草稿持久化 ----------
+// 草稿按 thread_id 存进 localStorage：切换会话和重启程序后都能恢复。
+// 尚未创建会话时的输入统一存到 new 键，首次启动时再回填。
+const DRAFT_PREFIX = 'harness.chat.draft.'
+const NEW_DRAFT_KEY = 'new'
+const LAST_THREAD_KEY = 'harness.chat.lastThread'
+const DRAFT_SAVE_DELAY = 400
+
+interface DraftRecord {
+  text: string
+  files: ContextFile[]
+}
+
+let draftTimer: number | undefined
+// 恢复/清空输入期间暂停落盘，避免把中间态（空输入）覆盖成草稿。
+let draftLocked = false
+
+function isContextFile(value: unknown): value is ContextFile {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<ContextFile>
+  return (
+    typeof item.id === 'string' &&
+    typeof item.name === 'string' &&
+    typeof item.kind === 'string'
+  )
+}
+
+function draftKey(threadId: string | null): string {
+  return `${DRAFT_PREFIX}${threadId || NEW_DRAFT_KEY}`
+}
+
+function readDraft(threadId: string | null): DraftRecord | null {
+  try {
+    const raw = localStorage.getItem(draftKey(threadId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { text?: unknown; files?: unknown }
+    const text = typeof parsed.text === 'string' ? parsed.text : ''
+    const files = Array.isArray(parsed.files) ? parsed.files.filter(isContextFile) : []
+    if (!text.trim() && files.length === 0) return null
+    return { text, files }
+  } catch {
+    return null
+  }
+}
+
+function writeDraft(threadId: string | null, text: string, files: ContextFile[]): void {
+  try {
+    if (!text.trim() && files.length === 0) {
+      localStorage.removeItem(draftKey(threadId))
+      return
+    }
+    localStorage.setItem(draftKey(threadId), JSON.stringify({ text, files }))
+  } catch {
+    // 本地存储不可用时草稿只在当前页面内保留
+  }
+}
+
+function clearDraft(threadId: string | null): void {
+  try {
+    localStorage.removeItem(draftKey(threadId))
+  } catch {
+    // 忽略存储异常
+  }
+}
+
+function persistDraftNow(): void {
+  if (draftLocked) return
+  // 离线演示没有真实会话，草稿统一存到“未归属”槽，下次启动仍可回填。
+  const threadId = chat.demoMode ? null : chat.threadId
+  writeDraft(threadId, draft.value, [...pendingFiles.value])
+}
+
+function readLastThread(): string | null {
+  try {
+    return localStorage.getItem(LAST_THREAD_KEY)
+  } catch {
+    return null
+  }
+}
+
+/** 清空输入框与待发附件，只释放本地预览，不删除服务端文件。 */
+function resetInput(): void {
+  for (const url of Object.values(previews.value)) URL.revokeObjectURL(url)
+  draft.value = ''
+  pendingFiles.value = []
+  previews.value = {}
+  uploadError.value = ''
+}
+
+/** 恢复指定会话的草稿；附件按 ID 校验，失效的只提示、不阻塞恢复。 */
+async function restoreDraft(threadId: string | null): Promise<void> {
+  draftLocked = true
+  try {
+    const record = readDraft(threadId)
+    draft.value = record?.text ?? ''
+    pendingFiles.value = []
+    previews.value = {}
+    uploadError.value = ''
+    if (record && record.files.length) {
+      try {
+        const checked = await resolveContextFiles(
+          record.files.map((file) => file.id),
+          USER_ID,
+        )
+        pendingFiles.value = checked.files
+        const expired = record.files.filter((file) => checked.missing.includes(file.id))
+        if (expired.length) {
+          uploadError.value = `以下附件已过期，未恢复：${expired
+            .map((file) => file.name)
+            .join('、')}`
+        }
+        if (checked.missing.length) writeDraft(threadId, draft.value, checked.files)
+      } catch {
+        // 后端暂不可用：先展示本地记录，发送时再由后端校验
+        pendingFiles.value = record.files
+      }
+    }
+    await nextTick()
+    autoGrow()
+  } finally {
+    draftLocked = false
+  }
+}
+
+/** 新建会话前把当前输入存到原会话；附件保留在服务端供以后恢复。 */
+function stashCurrentDraft(): void {
+  if (draftTimer) window.clearTimeout(draftTimer)
+  // 输入为空时不要写盘：否则会把“未归属”草稿或已恢复的草稿误删。
+  if (!draft.value.trim() && pendingFiles.value.length === 0) return
+  persistDraftNow()
+}
+
+/** 新建会话后清理不属于任何会话的草稿及其附件，避免服务端残留。 */
+function discardUnownedDraft(): void {
+  const orphan = readDraft(null)
+  orphan?.files.forEach((file) => void deleteContextFile(file.id, USER_ID))
+  clearDraft(null)
+}
+
 const SUGGESTIONS = [
   '介绍一下 Harness 架构的六层设计',
   '帮我把“你好”写入 /notes.md 文件',
@@ -107,7 +248,11 @@ onMounted(async () => {
   }
   if (backendOnline.value) {
     chat.demoMode = false
-    void sessions.refresh()
+    // 进入对话页时做一次自动归档检查，不在后台常驻计时器。
+    await sessions.autoArchive()
+    // 启动恢复需要先拿到会话列表，才能校验上次的会话是否仍然存在。
+    await sessions.refresh()
+    void sessions.refreshArchived()
     formats.value = await fetchContextFormats()
     void settings.load()
     void fetchSandboxStatus()
@@ -116,9 +261,22 @@ onMounted(async () => {
       })
       .catch(() => undefined)
   }
-  // 从工作台“最近对话”进入时，恢复选中的会话
-  if (!chat.threadId && sessions.activeThreadId) {
-    void selectSession(sessions.activeThreadId)
+  // 优先恢复“从工作台最近对话进入”的会话，其次恢复上次关闭程序时的会话。
+  if (!chat.threadId) {
+    const target = sessions.activeThreadId || readLastThread()
+    const known = target && sessions.sessions.some((item) => item.thread_id === target)
+    // 会话列表加载失败（为空）时仍尝试恢复上次会话，历史接口可能依然可用。
+    if (backendOnline.value && target && (known || sessions.sessions.length === 0)) {
+      await selectSession(target)
+    } else {
+      // 没有可恢复的会话时，回填尚未创建会话的草稿。
+      await restoreDraft(null)
+    }
+  } else if (!chat.demoMode) {
+    // 同一页面重新挂载时（例如从设置页返回），沿用当前会话并恢复草稿。
+    await selectSession(chat.threadId)
+  } else {
+    await restoreDraft(null)
   }
   // 已经处于某个会话时，先记录文件基线，便于下一轮标记新增文件。
   if (sessions.activeThreadId) void files.prime(sessions.activeThreadId)
@@ -173,17 +331,6 @@ async function submitUrl() {
   } finally {
     urlLoading.value = false
   }
-}
-
-function clearPending() {
-  for (const file of pendingFiles.value) {
-    const url = previews.value[file.id]
-    if (url) URL.revokeObjectURL(url)
-    void deleteContextFile(file.id, USER_ID)
-  }
-  pendingFiles.value = []
-  previews.value = {}
-  uploadError.value = ''
 }
 
 async function onFilesPicked(event: Event) {
@@ -252,83 +399,89 @@ interface HistoryMessage {
 }
 
 async function selectSession(threadId: string) {
-  clearPending()
+  // 先把当前输入存回原会话，再切换；附件继续留在服务端等待恢复。
+  stashCurrentDraft()
+  draftLocked = true
+  resetInput()
   sessions.activeThreadId = threadId
   chat.activateThread(threadId)
   // 记录切换前的文件基线，下一轮结束时才能准确判断“本轮新增”。
   void files.prime(threadId)
   // 后台仍在运行的会话：保留实时缓冲，不能用 checkpoint 历史覆盖
-  if (chat.isThreadSending(threadId)) return
   try {
-    const res = await fetch(
-      `${API_BASE}/history/${threadId}/messages?user_id=${USER_ID}`,
-    )
-    if (!res.ok) throw new Error(String(res.status))
-    const data = (await res.json()) as {
-      messages: HistoryMessage[]
-      interrupt: Record<string, unknown> | null
-      session_usage?: {
-        input: number
-        output: number
-        total: number
-        rounds?: number
-        context_window?: number
-        context_used?: number
+    if (!chat.isThreadSending(threadId)) {
+      const res = await fetch(
+        `${API_BASE}/history/${threadId}/messages?user_id=${USER_ID}`,
+      )
+      if (!res.ok) throw new Error(String(res.status))
+      const data = (await res.json()) as {
+        messages: HistoryMessage[]
+        interrupt: Record<string, unknown> | null
+        session_usage?: {
+          input: number
+          output: number
+          total: number
+          rounds?: number
+          context_window?: number
+          context_used?: number
+        }
       }
-    }
-    const msgs: ChatMsg[] = data.messages.map((m, i) => {
-      if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content }
-      if (m.role === 'reasoning') {
+      const msgs: ChatMsg[] = data.messages.map((m, i) => {
+        if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content }
+        if (m.role === 'reasoning') {
+          return {
+            id: m.id || `h-r-${i}`,
+            kind: 'reasoning',
+            content: m.content,
+            source: m.source || 'main',
+          }
+        }
+        if (m.role === 'assistant') {
+          return { id: m.id || `h-a-${i}`, kind: 'assistant', content: m.content, tokens: m.tokens }
+        }
+        const name = m.tool_name || 'tool'
         return {
-          id: m.id || `h-r-${i}`,
-          kind: 'reasoning',
-          content: m.content,
-          source: m.source || 'main',
+          id: `h-t-${i}`,
+          kind: 'tool',
+          toolCallId: m.tool_call_id || m.id || `h-t-${i}`,
+          toolName: name,
+          category: categoryOf(name),
+          args: m.args || '',
+          result: m.text || '',
+          status: m.tool_status === 'error' ? 'error' : m.tool_status === 'calling' ? 'calling' : 'done',
+          source: m.source,
+          subagentName: m.role === 'delegation' && m.source && m.source !== 'main' ? m.source : undefined,
         }
-      }
-      if (m.role === 'assistant') {
-        return { id: m.id || `h-a-${i}`, kind: 'assistant', content: m.content, tokens: m.tokens }
-      }
-      const name = m.tool_name || 'tool'
-      return {
-        id: `h-t-${i}`,
-        kind: 'tool',
-        toolCallId: m.tool_call_id || m.id || `h-t-${i}`,
-        toolName: name,
-        category: categoryOf(name),
-        args: m.args || '',
-        result: m.text || '',
-        status: m.tool_status === 'error' ? 'error' : m.tool_status === 'calling' ? 'calling' : 'done',
-        source: m.source,
-        subagentName: m.role === 'delegation' && m.source && m.source !== 'main' ? m.source : undefined,
-      }
-    })
-    if (data.interrupt) {
-      const it = data.interrupt as { interrupt_id?: string; interrupt_type?: string }
-      msgs.push({
-        id: `h-i-${Date.now()}`,
-        kind: 'interrupt',
-        interruptId: it.interrupt_id,
-        interruptType: it.interrupt_type || 'unknown',
-        payload: data.interrupt,
       })
+      if (data.interrupt) {
+        const it = data.interrupt as { interrupt_id?: string; interrupt_type?: string }
+        msgs.push({
+          id: `h-i-${Date.now()}`,
+          kind: 'interrupt',
+          interruptId: it.interrupt_id,
+          interruptType: it.interrupt_type || 'unknown',
+          payload: data.interrupt,
+        })
+      }
+      const usage = data.session_usage
+        ? {
+            input: data.session_usage.input,
+            output: data.session_usage.output,
+            total: data.session_usage.total,
+            rounds: data.session_usage.rounds,
+            contextWindow: data.session_usage.context_window,
+            contextUsed: data.session_usage.context_used,
+          }
+        : null
+      chat.loadHistory(msgs, threadId, usage)
+      void hydrateTurnDurations(threadId, msgs)
+      stickToBottom.value = true
+      void scrollBottom()
     }
-    const usage = data.session_usage
-      ? {
-          input: data.session_usage.input,
-          output: data.session_usage.output,
-          total: data.session_usage.total,
-          rounds: data.session_usage.rounds,
-          contextWindow: data.session_usage.context_window,
-          contextUsed: data.session_usage.context_used,
-        }
-      : null
-    chat.loadHistory(msgs, threadId, usage)
-    void hydrateTurnDurations(threadId, msgs)
-    stickToBottom.value = true
-    void scrollBottom()
   } catch {
     chat.activateThread(threadId)
+  } finally {
+    await restoreDraft(threadId)
   }
 }
 
@@ -354,16 +507,48 @@ async function hydrateTurnDurations(threadId: string, msgs: ChatMsg[]) {
 }
 
 async function createSession() {
-  clearPending()
+  const previousThread = chat.threadId
+  // 新建会话前保留原会话草稿；新建后输入框从空白开始。
+  stashCurrentDraft()
+  draftLocked = true
+  resetInput()
   const id = await sessions.createSession()
   if (!id) {
     sessions.activeThreadId = null
     chat.newChat()
+    draftLocked = false
     return
   }
   sessions.activeThreadId = id
   chat.activateThread(id)
   void files.prime(id)
+  if (!previousThread) discardUnownedDraft()
+  draftLocked = false
+  // 新建后直接进入该会话的聊天界面，并把焦点放回输入框。
+  stickToBottom.value = true
+  await nextTick()
+  autoGrow()
+  void scrollBottom()
+  inputEl.value?.focus()
+}
+
+/** 在集成的项目下新建会话：会话绑定该后端 MCP，工具范围由后端隔离。 */
+async function createIntegrationSession(serverId: string) {
+  const previousThread = chat.threadId
+  stashCurrentDraft()
+  draftLocked = true
+  resetInput()
+  const id = await sessions.createSession(null, serverId)
+  draftLocked = false
+  if (!id) return
+  sessions.activeThreadId = id
+  chat.activateThread(id)
+  void files.prime(id)
+  if (!previousThread) discardUnownedDraft()
+  stickToBottom.value = true
+  await nextTick()
+  void scrollBottom()
+  inputEl.value?.focus()
 }
 
 /** 点击左侧项目条目：打开该项目下最近一条对话。 */
@@ -377,13 +562,30 @@ async function openProjectConversations(projectId: string) {
   await selectSession(latest.thread_id)
 }
 
-async function removeSession(threadId: string) {
-  await sessions.removeSession(threadId)
+/** 清理某个会话在本地的前端状态（草稿、实时缓冲、文件域）。 */
+function forgetSession(threadId: string) {
+  // 删除正在编辑的会话时，连带放弃未发送内容和附件。
+  if (chat.threadId === threadId) {
+    if (draftTimer) window.clearTimeout(draftTimer)
+    draftLocked = true
+    for (const file of pendingFiles.value) void deleteContextFile(file.id, USER_ID)
+    resetInput()
+    draftLocked = false
+  }
+  // 已存草稿的附件也要一并清理，避免服务端残留无引用文件。
+  const stored = readDraft(threadId)
+  stored?.files.forEach((file) => void deleteContextFile(file.id, USER_ID))
+  clearDraft(threadId)
   chat.releaseThread(threadId)
   files.forget(threadId)
   if (sessions.activeThreadId === threadId) {
     sessions.activeThreadId = null
   }
+}
+
+async function removeSession(threadId: string) {
+  forgetSession(threadId)
+  await sessions.removeSession(threadId)
 }
 
 async function renameSession(threadId: string, title: string) {
@@ -392,6 +594,18 @@ async function renameSession(threadId: string, title: string) {
 
 async function togglePin(threadId: string, pinned: boolean) {
   await sessions.setPinned(threadId, pinned)
+}
+
+/** 从归档管理弹窗打开只读会话。 */
+async function openArchivedSession(threadId: string) {
+  await selectSession(threadId)
+}
+
+/** 当前只读的归档会话恢复回侧边栏，输入框随之恢复。 */
+async function restoreActiveSession() {
+  const threadId = chat.threadId
+  if (!threadId) return
+  await sessions.setArchived(threadId, false)
 }
 
 // 运行中 / 等待介入 标识按 thread 同步到会话栏
@@ -565,6 +779,11 @@ const backendStatusClass = computed(() =>
   backendOnline.value === null ? 'checking' : backendOnline.value ? 'online' : 'offline',
 )
 
+// 归档会话只读：仍可回看聊天记录，但不再向 Agent 发送消息。
+const archivedActive = computed(() =>
+  sessions.isArchived(chat.threadId || sessions.activeThreadId),
+)
+
 async function scrollBottom() {
   await nextTick()
   const el = scroller.value
@@ -604,6 +823,48 @@ watch(draft, () => {
   void nextTick(autoGrow)
 })
 
+// 输入或附件变化后延迟落盘，避免每次按键都写 localStorage。
+watch(
+  [draft, pendingFiles],
+  () => {
+    if (draftTimer) window.clearTimeout(draftTimer)
+    draftTimer = window.setTimeout(persistDraftNow, DRAFT_SAVE_DELAY)
+  },
+  { deep: true },
+)
+
+// 记住最后打开的会话，供下次启动恢复。
+watch(
+  () => sessions.activeThreadId,
+  (threadId) => {
+    try {
+      if (threadId) localStorage.setItem(LAST_THREAD_KEY, threadId)
+      else localStorage.removeItem(LAST_THREAD_KEY)
+    } catch {
+      // 忽略存储异常
+    }
+  },
+)
+
+/** 关闭程序/隐藏页面时立即落盘，避免防抖窗口内的输入丢失。 */
+function flushDraft() {
+  if (draftTimer) window.clearTimeout(draftTimer)
+  persistDraftNow()
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === 'hidden') flushDraft()
+}
+
+window.addEventListener('beforeunload', flushDraft)
+document.addEventListener('visibilitychange', onVisibilityChange)
+
+onBeforeUnmount(() => {
+  flushDraft()
+  window.removeEventListener('beforeunload', flushDraft)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
+
 // ---------- 后端运行参数（思考 / 联网搜索） ----------
 const settingsDisabled = computed(
   () => chat.sending || settings.saving || settings.online === false,
@@ -634,8 +895,9 @@ const ctxPct = computed(() =>
     ? Math.min(100, Math.round((ctxUsed.value / ctxWindow.value) * 100))
     : 0,
 )
+// 阈值与后端软/硬水位对齐：0.70B / 0.88B 相对原始窗口约为 62% / 78%。
 const ctxTone = computed(() =>
-  ctxPct.value >= 85 ? 'danger' : ctxPct.value >= 60 ? 'warn' : 'ok',
+  ctxPct.value >= 78 ? 'danger' : ctxPct.value >= 62 ? 'warn' : 'ok',
 )
 const ctxDash = computed(
   () => `${(ctxPct.value / 100) * DONUT_CIRC} ${DONUT_CIRC}`,
@@ -724,7 +986,9 @@ watch(
 )
 
 async function submit() {
+  if (archivedActive.value) return
   if (!draft.value.trim() && pendingFiles.value.length === 0) return
+  const previousThread = chat.threadId
   // 没有会话时先建一个，确保 SSE 请求始终带着确定的 thread_id
   if (!chat.threadId && !chat.demoMode) {
     const id = await sessions.createSession()
@@ -737,6 +1001,9 @@ async function submit() {
   }
   const files = pendingFiles.value
   chat.send(draft.value, files)
+  // 已发送的草稿立即作废；之前没有会话时，同时清掉“未归属”草稿。
+  clearDraft(chat.threadId)
+  if (!previousThread) clearDraft(null)
   draft.value = ''
   // 已发送的附件不再重复引用；预览 URL 保留给消息气泡显示。
   pendingFiles.value = []
@@ -779,6 +1046,9 @@ async function submit() {
         @rename="renameSession"
         @pin="togglePin"
         @select-project="openProjectConversations"
+        @create-integration="createIntegrationSession"
+        @open-archived="openArchivedSession"
+        @archived-removed="forgetSession"
       />
 
       <section class="panel chat">
@@ -791,6 +1061,7 @@ async function submit() {
             </div>
           </div>
           <div class="controls">
+            <span v-if="archivedActive" class="chip archived-chip">归档只读</span>
             <span v-if="chat.threadId" class="chip">thread {{ chat.threadId.slice(0, 8) }}…</span>
             <button class="ghost" type="button" @click="showFiles = !showFiles">
               <AppIcon name="file" :size="13" /> 文件
@@ -890,7 +1161,7 @@ async function submit() {
               </div>
 
               <div v-if="turn.interrupt" class="row indent">
-                <InterruptCard :msg="turn.interrupt" />
+                <InterruptCard :msg="turn.interrupt" :readonly="archivedActive" />
               </div>
 
               <div v-for="note in turn.notes" :key="note.id" class="row center">
@@ -914,7 +1185,8 @@ async function submit() {
           </Transition>
         </div>
 
-        <footer class="input-bar">
+        <!-- 正常会话显示输入框；归档会话改为只读提示，明确区分两种状态 -->
+        <footer v-if="!archivedActive" class="input-bar">
           <!-- 发送框顶部：快速切换后端的思考模式与联网搜索 -->
           <div class="input-head">
             <div class="mode-toggles">
@@ -947,6 +1219,8 @@ async function submit() {
             </div>
             <span v-if="settingsHint" class="settings-hint">{{ settingsHint }}</span>
           </div>
+
+          <CompactionBanner :state="chat.compaction" />
 
           <div v-if="pendingFiles.length" class="pending-row">
             <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
@@ -989,7 +1263,7 @@ async function submit() {
                 class="attach"
                 :class="{ active: attachMenu }"
                 type="button"
-                :disabled="uploading || chat.sending"
+                :disabled="uploading || chat.sending || chat.compacting"
                 title="添加上下文：文件 / 图片 / 网络链接"
                 @click="attachMenu = !attachMenu"
               >
@@ -1030,7 +1304,7 @@ async function submit() {
               v-model="draft"
               rows="1"
               placeholder="输入消息，可附图片/文档/网页链接；Enter 发送 / Shift+Enter 换行"
-              :disabled="chat.sending"
+              :disabled="chat.sending || chat.compacting"
               @input="autoGrow"
               @keydown.enter.exact.prevent="submit"
             ></textarea>
@@ -1041,7 +1315,7 @@ async function submit() {
               v-else
               class="send"
               type="button"
-              :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading"
+              :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
               @click="submit"
             >
               <AppIcon name="send" :size="15" />
@@ -1061,6 +1335,9 @@ async function submit() {
               <span>当前上下文</span>
               <b>{{ formatExact(ctxUsed) }} tok</b>
               <em v-if="chat.sessionTokens.rounds">· {{ chat.sessionTokens.rounds }} 轮</em>
+              <span v-if="chat.compactionCount" class="compact-count">
+                已压缩 {{ chat.compactionCount }} 次
+              </span>
             </div>
 
             <div
@@ -1083,6 +1360,14 @@ async function submit() {
             </div>
           </div>
         </footer>
+
+        <div v-else class="archived-readonly">
+          <span class="ar-icon"><AppIcon name="archive" :size="14" /></span>
+          <span class="ar-text">该会话已归档，仅支持查看聊天记录，不会再被 Agent 读取。</span>
+          <button class="ar-restore" type="button" @click="restoreActiveSession">
+            恢复会话
+          </button>
+        </div>
       </section>
 
       <Transition name="slide">
@@ -1220,6 +1505,12 @@ async function submit() {
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: transparent;
+}
+
+.chip.archived-chip {
+  color: var(--amber);
+  border-color: rgba(255, 182, 72, 0.4);
+  background: rgba(255, 182, 72, 0.08);
 }
 
 .ghost {
@@ -1533,6 +1824,15 @@ async function submit() {
   opacity: 0.8;
 }
 
+.compact-count {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(124, 140, 255, 0.35);
+  color: #b8c4ff;
+  font-size: 10px;
+}
+
 /* 上下文窗口占用：圆形进度条 */
 .ctx-donut {
   position: relative;
@@ -1627,6 +1927,45 @@ async function submit() {
   padding: 12px 16px;
   border-top: 1px solid var(--line);
   background: transparent;
+}
+
+/* 归档会话的只读底栏：替代输入框，避免误以为还能继续对话 */
+.archived-readonly {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: rgba(255, 182, 72, 0.04);
+}
+
+.archived-readonly .ar-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--amber);
+}
+
+.archived-readonly .ar-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.archived-readonly .ar-restore {
+  flex: none;
+  height: 28px;
+  padding: 0 12px;
+  font-size: 11.5px;
+  color: var(--accent-cyan);
+  border: 1px solid rgba(55, 208, 196, 0.36);
+  border-radius: var(--radius-sm);
+  background: transparent;
+}
+
+.archived-readonly .ar-restore:hover {
+  background: rgba(55, 208, 196, 0.1);
 }
 
 /* 发送框顶部：思考模式 / 联网搜索快速开关 */

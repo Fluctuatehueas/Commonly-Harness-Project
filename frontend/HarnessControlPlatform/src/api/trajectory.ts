@@ -8,6 +8,7 @@ export type TrajectoryEventType =
   | 'skill'
   | 'delegation'
   | 'hitl'
+  | 'compaction'
 
 export interface TrajectoryTokens {
   input?: number
@@ -19,6 +20,45 @@ export interface TrajectoryContext {
   used_tokens?: number
   limit?: number
   pct?: number
+}
+
+export interface TrajectoryCompactionTrigger {
+  type?: string
+  used_tokens?: number
+  limit?: number
+  pct?: number
+  signals?: Record<string, number | boolean | string>
+}
+
+export interface TrajectoryCompactionResult {
+  before_tokens?: number
+  after_tokens?: number
+  saved_tokens?: number
+  summary_tokens?: number
+  summary_preview?: string
+  history_file?: string
+  anchors_total?: number
+}
+
+export interface TrajectoryCompactionEvaluation {
+  status?: string
+  fidelity?: number
+  timing?: string
+  anchors_total?: number
+  anchors_kept?: number
+  retrieval_cost?: { reads?: number; tokens?: number }
+  reason?: string
+}
+
+export interface TrajectoryCompactionBudget {
+  window?: number
+  reserve?: number
+  usable?: number
+  soft?: number
+  hard?: number
+  keep?: number
+  soft_pct?: number
+  hard_pct?: number
 }
 
 export interface TrajectoryEvent {
@@ -41,6 +81,25 @@ export interface TrajectoryEvent {
   source?: string
   summary?: Record<string, number>
   tool_names?: string[]
+  // 压缩事件附加字段
+  compaction_id?: string
+  budget?: TrajectoryCompactionBudget
+  trigger?: TrajectoryCompactionTrigger
+  scope?: {
+    cutoff_index?: number
+    messages_before?: number
+    messages_after?: number
+    layers?: string[]
+  }
+  compaction_result?: TrajectoryCompactionResult
+  evaluation?: TrajectoryCompactionEvaluation
+  integrity?: {
+    algo?: string
+    hash?: string
+    signature?: string
+    signed?: boolean
+    verified?: boolean
+  }
 }
 
 export interface TrajectorySummary {
@@ -49,8 +108,11 @@ export interface TrajectorySummary {
   skill_calls: number
   delegations: number
   hitl: number
+  compact_count: number
   tokens: TrajectoryTokens
   peak_context_tokens: number
+  min_context_tokens: number
+  tokens_saved: number
   duration_ms: number
   event_count: number
 }

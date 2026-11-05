@@ -44,6 +44,8 @@ class ServerUpsert(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
     preconnect: bool = False
+    # 自定义 MCP：用户自有后端项目，作为集成模式的业务能力入口。
+    integration: bool = False
     criticality: Literal["required", "optional"] = "optional"
     namespace: str | None = Field(None, max_length=32)
     allow_tools: list[str] = Field(default_factory=list)
@@ -63,6 +65,7 @@ class ServerUpsert(BaseModel):
             "transport": transport,
             "enabled": self.enabled,
             "preconnect": self.preconnect,
+            "integration": self.integration,
             "criticality": self.criticality,
             "namespace": self.namespace or self.server_id,
             "allow_tools": self.allow_tools,
@@ -104,6 +107,8 @@ class VendorImportRequest(BaseModel):
     json_text: str = Field("", max_length=200_000)
     json_data: dict[str, Any] | None = None
     enabled: bool = True
+    # 本次导入的服务是否属于用户自有后端项目（集成模式）。
+    integration: bool = False
 
 
 _AUTH_HEADER_KEYS = {
@@ -148,6 +153,8 @@ def _parse_vendor_payload(
             continue
         if not body.enabled:
             item["enabled"] = False
+        if body.integration:
+            item["integration"] = True
         normalized.append((server_id, item))
     return normalized, failed
 
@@ -180,12 +187,17 @@ def _preflight_entry(server_id: str, raw: dict[str, Any]) -> dict[str, Any]:
     if item["transport"] != "stdio":
         headers = item.get("headers") or {}
         needs_key = not _has_auth_header(headers)
-        hint = (
-            "这是网络传输的 MCP：通常需要在 JSON 的 headers 中配置 API Key"
-            "（如 Authorization: Bearer ${API_KEY}）。"
-            if needs_key
-            else ""
-        )
+        hints: list[str] = []
+        if needs_key:
+            hints.append(
+                "这是网络传输的 MCP：通常需要在 JSON 的 headers 中配置 API Key"
+                "（如 Authorization: Bearer ${API_KEY}）。"
+            )
+        if item["transport"] == "sse":
+            hints.append(
+                "URL 以 /sse 结尾，将按 SSE 传输连接。"
+            )
+        hint = "".join(hints)
         return {
             "server_id": server_id,
             "transport": "network",
@@ -337,6 +349,19 @@ async def import_config(body: VendorImportRequest) -> dict[str, Any]:
     }
 
 
+@router.get("/integrations")
+async def list_integrations() -> dict[str, Any]:
+    """返回用户自有后端项目的 MCP 列表；不会触发任何连接。
+
+    聊天侧栏的【集成的项目】只依赖本接口，连接状态按运行态返回，
+    用户需要先用 probe 建立连接后才能在该后端下操作会话。
+    """
+    items = [
+        item for item in mcp_runtime.details() if bool(item.get("integration"))
+    ]
+    return {"items": items, "total": len(items)}
+
+
 @router.get("/servers")
 async def list_servers(
     page: int = Query(1, ge=1),
@@ -344,6 +369,7 @@ async def list_servers(
     keyword: str = Query("", max_length=200),
     state: str = Query("", max_length=32),
     enabled: bool | None = Query(None),
+    integration: bool | None = Query(None),
 ) -> dict[str, Any]:
     """分页返回服务状态；该接口不会建立任何 MCP 连接。"""
     items = mcp_runtime.details()
@@ -366,6 +392,10 @@ async def list_servers(
         items = [item for item in items if item["state"].casefold() == state.casefold()]
     if enabled is not None:
         items = [item for item in items if item["enabled"] is enabled]
+    if integration is not None:
+        items = [
+            item for item in items if bool(item.get("integration")) is integration
+        ]
 
     total = len(items)
     pages = max((total + page_size - 1) // page_size, 1)

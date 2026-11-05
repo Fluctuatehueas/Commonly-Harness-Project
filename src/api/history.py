@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,8 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query
 
 from agent import project_store
+from agent.mcp.runtime import mcp_runtime
+from agent.mcp.types import ServerState
 from agent.schema import (
     DeleteSessionResponse,
     Message,
@@ -32,6 +35,9 @@ from api.message_utils import content_to_text, serialize_interrupt
 
 router = APIRouter(prefix="/history", tags=["history"])
 DEFAULT_SESSION_TITLE = "新会话"
+# 会话在多少天没有新记录后自动归档；0 表示关闭自动归档。
+ENV_KEY_ARCHIVE_DAYS = "HARNESS_SESSION_ARCHIVE_DAYS"
+DEFAULT_ARCHIVE_DAYS = 30
 
 
 def _user_display_content(content: Any) -> str:
@@ -257,6 +263,13 @@ def _session_from_index(item: dict[str, Any], message_count: int) -> Session:
         message_count=message_count,
         pinned=bool(item.get("pinned", False)),
         project_id=item.get("project_id") or None,
+        integration_server_id=item.get("integration_server_id") or None,
+        archived=bool(item.get("archived", False)),
+        archived_at=(
+            datetime.fromisoformat(item["archived_at"])
+            if item.get("archived_at")
+            else None
+        ),
     )
 
 
@@ -264,12 +277,17 @@ def _session_from_index(item: dict[str, Any], message_count: int) -> Session:
 async def create_session(
     user_id: str = Query("anonymous", min_length=1),
     project_id: str | None = Query(None, min_length=1),
+    integration_server_id: str | None = Query(None, min_length=1),
 ) -> Session:
     """创建一条尚未发送消息的会话。
 
-    传入 ``project_id`` 时创建项目会话；不传则创建自由会话。
-    项目归属在创建时固定，后续不可更改。
+    传入 ``project_id`` 时创建项目会话；传入 ``integration_server_id`` 时
+    创建绑定用户自有后端 MCP 的集成会话。两者互斥，归属在创建时固定。
     """
+    if project_id is not None and integration_server_id is not None:
+        raise HTTPException(
+            status_code=422, detail="项目会话与集成后端会话不能同时创建"
+        )
     if project_id is not None:
         project = await asyncio.to_thread(
             project_store.get_project, user_id, project_id
@@ -278,6 +296,21 @@ async def create_session(
             raise HTTPException(status_code=404, detail="项目不存在")
         if project["status"] == "unavailable":
             raise HTTPException(status_code=422, detail="项目目录不可用")
+    if integration_server_id is not None:
+        config = mcp_runtime.config_for(integration_server_id)
+        if config is None or not config.integration:
+            raise HTTPException(status_code=404, detail="集成项目不存在")
+        if not config.enabled:
+            raise HTTPException(status_code=422, detail="集成项目已停用")
+        runtime = mcp_runtime.runtime_for(integration_server_id)
+        if runtime is None or runtime.state not in {
+            ServerState.CONNECTED,
+            ServerState.DEGRADED,
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="集成项目未连接，请先在 MCP 服务页测试连接",
+            )
     thread_id = str(uuid4())
     await agent_loader.save_session(
         user_id,
@@ -285,6 +318,8 @@ async def create_session(
         DEFAULT_SESSION_TITLE,
         project_id=project_id,
         bind_project=True,
+        integration_server_id=integration_server_id,
+        bind_integration=True,
     )
     session = await agent_loader.get_session(user_id, thread_id)
     assert session is not None
@@ -294,9 +329,10 @@ async def create_session(
 @router.get("", response_model=SessionListResponse)
 async def list_sessions(
     user_id: str = Query("anonymous", min_length=1),
+    archived: bool = Query(False, description="true=返回已归档会话，false=返回正常会话"),
 ) -> SessionListResponse:
-    """获取当前用户已登记的会话列表。"""
-    indexed_sessions = await agent_loader.list_sessions(user_id)
+    """获取当前用户已登记的会话列表；``archived=true`` 时只返回已归档会话。"""
+    indexed_sessions = await agent_loader.list_sessions(user_id, archived=archived)
 
     # 索引只保存列表元数据；消息数由 DeepAgents 重建的框架状态决定。
     # 空会话也必须返回，否则首次打开时刚创建的“新会话”会被错误隐藏。
@@ -309,15 +345,37 @@ async def list_sessions(
     return SessionListResponse(sessions=sessions)
 
 
+def _archive_days() -> int:
+    """读取自动归档天数；未配置或非法时回落到 30 天，0 表示关闭。"""
+    raw = os.getenv(ENV_KEY_ARCHIVE_DAYS, "").strip()
+    try:
+        days = int(raw) if raw else DEFAULT_ARCHIVE_DAYS
+    except ValueError:
+        days = DEFAULT_ARCHIVE_DAYS
+    return max(days, 0)
+
+
+@router.post("/auto-archive")
+async def auto_archive_sessions(
+    user_id: str = Query("anonymous", min_length=1),
+) -> dict[str, Any]:
+    """按配置天数归档长期无新记录的会话。
+
+    前端只在进入对话页时调用一次，不在后台常驻计时器。
+    """
+    days = _archive_days()
+    archived = await agent_loader.archive_stale_sessions(user_id, days)
+    return {"archived": archived, "days": days}
+
+
 @router.get("/{thread_id}/messages", response_model=SessionMessagesResponse)
 async def get_session_messages(
     thread_id: str,
     user_id: str = Query("anonymous", min_length=1),
 ) -> SessionMessagesResponse:
-    """恢复当前用户指定会话的全部可展示消息。"""
+    """恢复当前用户指定会话的全部可展示消息；已归档会话允许只读查看。"""
     # 先检查会话索引，避免仅凭 thread_id 读取到其他用户的 checkpoint。
-    if await agent_loader.get_session(user_id, thread_id) is None:
-        raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    await agent_loader.require_session(user_id, thread_id, allow_archived=True)
     state = await agent_loader.get_thread_state(thread_id)
     interrupts = state.interrupts
     # 单轮消耗按最终回答消息 ID 回填；累计值直接透传给发送栏展示。
@@ -359,11 +417,21 @@ async def update_session(
     title = body.title.strip() if isinstance(body.title, str) else None
     if title is not None and not title:
         raise HTTPException(status_code=422, detail="标题不能为空")
+    # 归档 / 恢复属于管理操作，需要显式放行已归档会话。
+    session = await agent_loader.get_session(user_id, thread_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    if session.get("archived") and body.archived is None:
+        raise HTTPException(
+            status_code=409,
+            detail="会话已归档，请先恢复后再修改",
+        )
     updated = await agent_loader.update_session(
         user_id,
         thread_id,
         title=title,
         pinned=body.pinned,
+        archived=body.archived,
     )
     assert updated is not None
     messages = await agent_loader.get_thread_messages(thread_id)
@@ -375,10 +443,9 @@ async def delete_session(
     thread_id: str,
     user_id: str = Query("anonymous", min_length=1),
 ) -> DeleteSessionResponse:
-    """删除当前用户的一条会话及其 checkpoint 数据。"""
+    """删除当前用户的一条会话及其 checkpoint 数据（含已归档会话）。"""
     # 与读取接口使用同一所有权校验，防止跨用户删除已知的 thread_id。
-    if await agent_loader.get_session(user_id, thread_id) is None:
-        raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+    await agent_loader.require_session(user_id, thread_id, allow_archived=True)
     await agent_loader.delete_session(user_id, thread_id)
     return DeleteSessionResponse(success=True)
 

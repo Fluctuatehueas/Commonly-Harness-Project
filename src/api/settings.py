@@ -42,6 +42,24 @@ ENV_KEY_SANDBOX_LIFETIME = "OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS"
 ENV_KEY_SANDBOX_PREWARM = "OPEN_SANDBOX_PREWARM_ENABLED"
 ENV_KEY_SANDBOX_PROXY = "OPEN_SANDBOX_USE_SERVER_PROXY"
 
+# 上下文压缩配置键（v1.5 起支持设置页在线修改）。
+ENV_KEY_CTX_ALERT = "HARNESS_CONTEXT_ALERT_THRESHOLD"
+ENV_KEY_CTX_ENABLED = "HARNESS_CONTEXT_COMPACT_ENABLED"
+ENV_KEY_CTX_TRIGGER = "HARNESS_CONTEXT_COMPACT_TRIGGER"
+ENV_KEY_CTX_HARD = "HARNESS_CONTEXT_COMPACT_HARD"
+ENV_KEY_CTX_KEEP = "HARNESS_CONTEXT_COMPACT_KEEP"
+ENV_KEY_CTX_MIN_ROUNDS = "HARNESS_CONTEXT_COMPACT_MIN_ROUNDS"
+ENV_KEY_CTX_COOLDOWN = "HARNESS_CONTEXT_COMPACT_COOLDOWN"
+ENV_KEY_CTX_MAX_DEFER = "HARNESS_CONTEXT_COMPACT_MAX_DEFER"
+ENV_KEY_CTX_TIMEOUT = "HARNESS_CONTEXT_COMPACT_TIMEOUT"
+ENV_KEY_CTX_EVAL = "HARNESS_CONTEXT_COMPACT_EVAL_ENABLED"
+ENV_KEY_CTX_JUDGE = "HARNESS_CONTEXT_EVAL_JUDGE"
+ENV_KEY_CTX_HEARTBEAT = "HARNESS_CONTEXT_COMPACT_HEARTBEAT"
+
+# 会话自动归档：超过该天数没有新记录的会话会在进入对话页时自动归档。
+ENV_KEY_ARCHIVE_DAYS = "HARNESS_SESSION_ARCHIVE_DAYS"
+DEFAULT_ARCHIVE_DAYS = 30
+
 
 class ModelSettingsUpdate(BaseModel):
     """PUT /settings/model 请求体；None 字段不改动，api_key 空串视为不改动。"""
@@ -122,6 +140,147 @@ async def update_model_settings(body: ModelSettingsUpdate) -> dict[str, Any]:
 
     await agent_loader.reset_agents()
     return {"ok": True, "updated": sorted(updates), "current": _current_state()}
+
+
+# ============================================================
+# 上下文压缩配置
+# ============================================================
+
+
+class ContextSettingsUpdate(BaseModel):
+    """PUT /settings/context 请求体；None 表示不修改。"""
+
+    enabled: bool | None = None
+    trigger: float | None = Field(None, gt=0, le=1)
+    hard: float | None = Field(None, gt=0, le=1)
+    keep: float | None = Field(None, gt=0, le=1)
+    alert_threshold: float | None = Field(None, gt=0, le=1)
+    min_rounds: int | None = Field(None, ge=1, le=100)
+    cooldown: int | None = Field(None, ge=0, le=50)
+    max_defer: int | None = Field(None, ge=0, le=20)
+    timeout_seconds: int | None = Field(None, ge=5, le=300)
+    eval_enabled: bool | None = None
+    eval_judge: bool | None = None
+    heartbeat_seconds: int | None = Field(None, ge=2, le=60)
+
+
+def _context_state() -> dict[str, Any]:
+    """返回当前生效的压缩配置与推导出的预算数字。"""
+    from agent.context.budget import build_budget
+
+    budget = build_budget()
+    return {
+        "enabled": bool(agent_config.CONTEXT_COMPACT_ENABLED),
+        "trigger": float(agent_config.CONTEXT_COMPACT_TRIGGER),
+        "hard": float(agent_config.CONTEXT_COMPACT_HARD),
+        "keep": float(agent_config.CONTEXT_COMPACT_KEEP),
+        "alert_threshold": float(agent_config.CONTEXT_ALERT_THRESHOLD),
+        "min_rounds": int(agent_config.CONTEXT_COMPACT_MIN_ROUNDS),
+        "cooldown": int(agent_config.CONTEXT_COMPACT_COOLDOWN),
+        "max_defer": int(agent_config.CONTEXT_COMPACT_MAX_DEFER),
+        "timeout_seconds": int(agent_config.CONTEXT_COMPACT_TIMEOUT),
+        "eval_enabled": bool(agent_config.CONTEXT_COMPACT_EVAL_ENABLED),
+        "eval_judge": bool(agent_config.CONTEXT_COMPACT_EVAL_JUDGE),
+        "heartbeat_seconds": int(agent_config.CONTEXT_COMPACT_HEARTBEAT),
+        "budget": budget.as_dict(),
+    }
+
+
+@router.get("/settings/context")
+async def get_context_settings() -> dict[str, Any]:
+    """返回当前上下文压缩配置。"""
+    return _context_state()
+
+
+@router.put("/settings/context")
+async def update_context_settings(body: ContextSettingsUpdate) -> dict[str, Any]:
+    """写入 .env 并热重建 Agent 图，使新阈值立即生效。"""
+    current = _context_state()
+    trigger = float(body.trigger if body.trigger is not None else current["trigger"])
+    hard = float(body.hard if body.hard is not None else current["hard"])
+    keep = float(body.keep if body.keep is not None else current["keep"])
+    if not (0 < keep < trigger < hard <= 1):
+        raise HTTPException(
+            status_code=422,
+            detail="必须满足 0 < keep < trigger < hard <= 1",
+        )
+
+    updates: dict[str, str] = {}
+    if body.enabled is not None:
+        updates[ENV_KEY_CTX_ENABLED] = "true" if body.enabled else "false"
+    if body.trigger is not None:
+        updates[ENV_KEY_CTX_TRIGGER] = f"{trigger:g}"
+    if body.hard is not None:
+        updates[ENV_KEY_CTX_HARD] = f"{hard:g}"
+    if body.keep is not None:
+        updates[ENV_KEY_CTX_KEEP] = f"{keep:g}"
+    if body.alert_threshold is not None:
+        updates[ENV_KEY_CTX_ALERT] = f"{body.alert_threshold:g}"
+    if body.min_rounds is not None:
+        updates[ENV_KEY_CTX_MIN_ROUNDS] = str(body.min_rounds)
+    if body.cooldown is not None:
+        updates[ENV_KEY_CTX_COOLDOWN] = str(body.cooldown)
+    if body.max_defer is not None:
+        updates[ENV_KEY_CTX_MAX_DEFER] = str(body.max_defer)
+    if body.timeout_seconds is not None:
+        updates[ENV_KEY_CTX_TIMEOUT] = str(body.timeout_seconds)
+    if body.eval_enabled is not None:
+        updates[ENV_KEY_CTX_EVAL] = "true" if body.eval_enabled else "false"
+    if body.eval_judge is not None:
+        updates[ENV_KEY_CTX_JUDGE] = "true" if body.eval_judge else "false"
+    if body.heartbeat_seconds is not None:
+        updates[ENV_KEY_CTX_HEARTBEAT] = str(body.heartbeat_seconds)
+    if not updates:
+        raise HTTPException(status_code=422, detail="没有需要更新的字段")
+
+    try:
+        _update_env_file(updates)
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
+
+    # 热更新：重载配置常量，并清空用户级 Agent 图（下一次请求按新阈值重建）。
+    reload_model_config()
+    from api.agent_loader import agent_loader
+
+    await agent_loader.reset_agents()
+    return {"ok": True, "updated": sorted(updates), "current": _context_state()}
+
+
+# ============================================================
+# 会话自动归档配置
+# ============================================================
+
+
+class ArchiveSettingsUpdate(BaseModel):
+    """PUT /settings/archive 请求体；0 表示关闭自动归档。"""
+
+    days: int = Field(..., ge=0, le=3650)
+
+
+def _archive_state() -> dict[str, Any]:
+    raw = os.getenv(ENV_KEY_ARCHIVE_DAYS, "").strip()
+    try:
+        days = int(raw) if raw else DEFAULT_ARCHIVE_DAYS
+    except ValueError:
+        days = DEFAULT_ARCHIVE_DAYS
+    return {"days": max(days, 0)}
+
+
+@router.get("/settings/archive")
+async def get_archive_settings() -> dict[str, Any]:
+    """返回自动归档天数配置。"""
+    return _archive_state()
+
+
+@router.put("/settings/archive")
+async def update_archive_settings(body: ArchiveSettingsUpdate) -> dict[str, Any]:
+    """写入 .env 并同步运行中的环境变量，下一次进入对话页生效。"""
+    try:
+        _update_env_file({ENV_KEY_ARCHIVE_DAYS: str(body.days)})
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
+    os.environ[ENV_KEY_ARCHIVE_DAYS] = str(body.days)
+    return {"ok": True, "current": _archive_state()}
 
 
 # ============================================================
@@ -276,3 +435,30 @@ async def check_sandbox_port(
         "port": port,
         "message": "沙箱服务端口可达，配置已生效。",
     }
+
+
+# ============================================================
+# 评估驱动自动调参：注册 applier
+# ============================================================
+
+
+async def _apply_autotune_patch(patch: dict[str, float], reason: str) -> None:
+    """自动调参落地：写入 .env → 重载配置 → 重建用户 Agent 图。"""
+    updates = {
+        ENV_KEY_CTX_TRIGGER: f"{float(patch['trigger']):g}",
+        ENV_KEY_CTX_HARD: f"{float(patch['hard']):g}",
+        ENV_KEY_CTX_KEEP: f"{float(patch['keep']):g}",
+    }
+    _update_env_file(updates)
+    reload_model_config()
+    from api.agent_loader import agent_loader
+
+    await agent_loader.reset_agents()
+    import logging
+
+    logging.getLogger(__name__).info("[AutoTune] 已自动应用阈值：%s（%s）", updates, reason)
+
+
+from agent.context.autotune import set_applier as _set_autotune_applier  # noqa: E402
+
+_set_autotune_applier(_apply_autotune_patch)

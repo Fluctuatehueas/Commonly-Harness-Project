@@ -5,19 +5,27 @@ import { useRoute } from 'vue-router'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import UiSwitch from '@/components/console/UiSwitch.vue'
+import ContextTimeline from '@/components/trajectory/ContextTimeline.vue'
 import type { IconName } from '@/components/console/icons'
 import {
   fetchTrajectory,
   type TrajectoryEvent,
   type TrajectoryRun,
 } from '@/api/trajectory'
+import { fetchExperiences, type ExperienceRecord } from '@/api/evolution'
 import { USER_ID, useSessionStore } from '@/stores/sessions'
 
 const route = useRoute()
 const sessions = useSessionStore()
 
+type ActiveTab = 'trajectory' | 'context' | 'experience'
+
+const activeTab = ref<ActiveTab>('trajectory')
 const threadId = ref<string>('')
 const runs = ref<TrajectoryRun[]>([])
+const experiences = ref<ExperienceRecord[]>([])
+const experienceLoading = ref(false)
+const experienceError = ref('')
 const selectedRunId = ref<string>('')
 const selectedEventId = ref<string>('')
 const loading = ref(false)
@@ -33,6 +41,7 @@ const LANES = [
   { key: 'skill', label: '技能', color: '#8f7bff', icon: 'layers' },
   { key: 'delegation', label: '委派', color: '#f2b03c', icon: 'users' },
   { key: 'hitl', label: '人工介入', color: '#e2605e', icon: 'shield' },
+  { key: 'compaction', label: '压缩', color: '#b07cff', icon: 'layers' },
 ] as const
 
 const TYPE_META: Record<string, { label: string; icon: IconName; color: string }> = {
@@ -42,6 +51,7 @@ const TYPE_META: Record<string, { label: string; icon: IconName; color: string }
   skill: { label: '技能', icon: 'layers', color: '#8f7bff' },
   delegation: { label: '委派', icon: 'users', color: '#f2b03c' },
   hitl: { label: '人工介入', icon: 'shield', color: '#e2605e' },
+  compaction: { label: '上下文压缩', icon: 'layers', color: '#b07cff' },
 }
 
 // selectedRunId 为空表示查看整个会话的全部轮次
@@ -79,8 +89,11 @@ const summary = computed(() => {
     skill_calls: 0,
     delegations: 0,
     hitl: 0,
+    compact_count: 0,
     tokens: { input: 0, output: 0, total: 0 },
     peak_context_tokens: 0,
+    min_context_tokens: 0,
+    tokens_saved: 0,
     duration_ms: 0,
     event_count: 0,
   }
@@ -90,10 +103,19 @@ const summary = computed(() => {
     total.skill_calls += run.summary.skill_calls
     total.delegations += run.summary.delegations
     total.hitl += run.summary.hitl
+    total.compact_count += run.summary.compact_count || 0
     total.tokens.input += run.summary.tokens.input || 0
     total.tokens.output += run.summary.tokens.output || 0
     total.tokens.total += run.summary.tokens.total || 0
     total.peak_context_tokens = Math.max(total.peak_context_tokens, run.summary.peak_context_tokens)
+    // 最低占用取各轮最小值；0 表示该轮没有快照。
+    if (run.summary.min_context_tokens > 0) {
+      total.min_context_tokens =
+        total.min_context_tokens === 0
+          ? run.summary.min_context_tokens
+          : Math.min(total.min_context_tokens, run.summary.min_context_tokens)
+    }
+    total.tokens_saved += run.summary.tokens_saved || 0
     total.duration_ms += run.summary.duration_ms || 0
     total.event_count += run.summary.event_count
   }
@@ -233,6 +255,38 @@ function selectEvent(eventId: string) {
   selectedEventId.value = eventId
 }
 
+function experienceStateLabel(state: string) {
+  return (
+    {
+      active: '已启用',
+      proposed: '待确认',
+      verified: '已验证',
+      quarantined: '已隔离',
+      archived: '已归档',
+    }[state] || state
+  )
+}
+
+async function loadExperiences() {
+  experienceLoading.value = true
+  experienceError.value = ''
+  try {
+    const data = await fetchExperiences(USER_ID)
+    experiences.value = data.experiences
+  } catch (err) {
+    experienceError.value = (err as Error).message
+  } finally {
+    experienceLoading.value = false
+  }
+}
+
+function switchTab(tab: ActiveTab) {
+  activeTab.value = tab
+  if (tab === 'experience' && experiences.value.length === 0) {
+    void loadExperiences()
+  }
+}
+
 function eventRunLabel(event: TrajectoryEvent): string {
   const index = runNumber.value.get(event.run_id)
   return index ? `第${index}轮` : ''
@@ -329,6 +383,29 @@ onBeforeUnmount(stopTimer)
           </div>
         </div>
         <div class="head-controls">
+          <div class="tab-switch">
+            <button
+              type="button"
+              :class="{ active: activeTab === 'trajectory' }"
+              @click="switchTab('trajectory')"
+            >
+              轨迹
+            </button>
+            <button
+              type="button"
+              :class="{ active: activeTab === 'context' }"
+              @click="switchTab('context')"
+            >
+              上下文
+            </button>
+            <button
+              type="button"
+              :class="{ active: activeTab === 'experience' }"
+              @click="switchTab('experience')"
+            >
+              经验库
+            </button>
+          </div>
           <select v-model="threadId" class="session-select" :disabled="sessions.sessions.length === 0">
             <option value="">选择会话</option>
             <option v-for="item in sessions.sessions" :key="item.thread_id" :value="item.thread_id">
@@ -352,22 +429,71 @@ onBeforeUnmount(stopTimer)
         </div>
       </section>
 
-      <p v-if="error" class="error-note">{{ error }}</p>
+      <template v-if="activeTab === 'experience'">
+        <section class="panel experience-panel">
+          <header class="panel-head">
+            <strong>经验库</strong>
+            <small>Agent 从失败轨迹中提炼的可复用经验；只读展示</small>
+          </header>
+          <p v-if="experienceError" class="error-note">{{ experienceError }}</p>
+          <div v-if="experienceLoading" class="experience-empty">正在读取经验库…</div>
+          <div v-else-if="experiences.length === 0" class="experience-empty">
+            <p>当前还没有沉淀的经验。</p>
+            <small>Agent 遇到失败、用户纠正或验证失败后，会自动提炼经验。</small>
+          </div>
+          <div v-else class="experience-list">
+            <article
+              v-for="item in experiences"
+              :key="item.experience_id"
+              class="experience-card"
+            >
+              <header>
+                <span class="exp-state" :class="item.admission_state">
+                  {{ experienceStateLabel(item.admission_state) }}
+                </span>
+                <strong>{{ item.trigger }}</strong>
+              </header>
+              <p>{{ item.rule }}</p>
+              <div class="exp-meta">
+                <span>来源 {{ item.provenance }}</span>
+                <span>效用 {{ item.utility.toFixed(2) }}</span>
+                <span>置信 {{ item.confidence.toFixed(2) }}</span>
+                <span>命中 {{ item.hit_count }}</span>
+                <span>{{ timeLabel(item.updated_at) }}</span>
+              </div>
+              <div v-if="item.tags.length" class="exp-tags">
+                <span v-for="tag in item.tags" :key="tag">{{ tag }}</span>
+              </div>
+            </article>
+          </div>
+        </section>
+      </template>
 
-      <div v-if="!threadId" class="panel empty">
+      <template v-if="activeTab === 'context'">
+        <div v-if="!threadId" class="panel empty">
+          <div class="empty-orb"><AppIcon name="layers" :size="24" /></div>
+          <h3>还没有可查看的会话</h3>
+          <p>先在对话页发送一条消息，再回到这里查看上下文占用与压缩记录。</p>
+        </div>
+        <ContextTimeline v-else :runs="activeRuns" :selected-run-id="selectedRunId" />
+      </template>
+
+      <p v-if="activeTab === 'trajectory' && error" class="error-note">{{ error }}</p>
+
+      <div v-if="activeTab === 'trajectory' && !threadId" class="panel empty">
         <div class="empty-orb"><AppIcon name="workflow" :size="24" /></div>
         <h3>还没有可查看的会话</h3>
         <p>先在对话页发送一条消息，再回到这里查看执行轨迹。</p>
       </div>
 
-      <div v-else-if="runs.length === 0" class="panel empty">
+      <div v-else-if="activeTab === 'trajectory' && runs.length === 0" class="panel empty">
         <div class="empty-orb"><AppIcon name="workflow" :size="24" /></div>
         <h3>本会话还没有轨迹数据</h3>
         <p>轨迹由后端 TrajectoryMiddleware 记录；发一条消息后再刷新即可。</p>
         <p class="empty-hint">如果刚升级代码，旧会话不会补记历史过程。</p>
       </div>
 
-      <template v-else>
+      <template v-else-if="activeTab === 'trajectory'">
         <section class="summary">
           <div class="stat">
             <small>{{ selectedRunId ? '总耗时' : '累计耗时' }}</small>
@@ -399,6 +525,11 @@ onBeforeUnmount(stopTimer)
             <span class="stat-sub">
               / {{ events[events.length - 1]?.context?.limit || 0 }} tokens
             </span>
+          </div>
+          <div class="stat">
+            <small>压缩 / 节省</small>
+            <strong>{{ summary.compact_count || 0 }}</strong>
+            <span class="stat-sub">{{ (summary.tokens_saved || 0).toLocaleString('zh-CN') }} tok</span>
           </div>
         </section>
 
@@ -1267,6 +1398,120 @@ onBeforeUnmount(stopTimer)
 .empty-hint {
   margin-top: 6px !important;
   opacity: 0.7;
+}
+
+.tab-switch {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+}
+
+.tab-switch button {
+  padding: 5px 11px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text-3);
+  background: transparent;
+  border: 0;
+  border-radius: calc(var(--radius-sm) - 1px);
+  cursor: pointer;
+}
+
+.tab-switch button.active {
+  color: var(--text-1);
+  background: var(--bg-rail);
+}
+
+.experience-panel {
+  padding: 14px 16px 18px;
+}
+
+.experience-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.experience-card {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+}
+
+.experience-card header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.experience-card header strong {
+  font-size: 12.5px;
+  color: var(--text-1);
+}
+
+.experience-card > p {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.exp-state {
+  flex: none;
+  padding: 2px 7px;
+  font-size: 9.5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--text-3);
+}
+
+.exp-state.active {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+}
+
+.exp-state.quarantined {
+  color: var(--accent-red, #e2605e);
+  border-color: var(--accent-red, #e2605e);
+}
+
+.exp-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 8px;
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+
+.exp-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.exp-tags span {
+  padding: 1px 7px;
+  font-size: 9.5px;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.experience-empty {
+  padding: 18px 4px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.experience-empty p {
+  margin: 0 0 4px;
 }
 
 @media (max-width: 1200px) {

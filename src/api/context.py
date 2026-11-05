@@ -480,3 +480,40 @@ async def delete_context_file(file_id: str, user_id: str = Query(..., min_length
     if folder.is_dir():
         shutil.rmtree(folder, ignore_errors=True)
     return {"ok": True}
+
+
+class ResolveAttachmentsRequest(BaseModel):
+    """校验一组已上传附件是否仍然有效（用于恢复未发送草稿）。"""
+
+    user_id: str = Field(..., min_length=1, description="用户唯一标识")
+    ids: list[str] = Field(default_factory=list, description="附件 ID 列表")
+
+
+@router.post("/resolve")
+async def resolve_context_files(request: ResolveAttachmentsRequest) -> dict[str, Any]:
+    """按 ID 批量校验附件；已过期或非法 ID 单独返回，不整体报错。
+
+    前端恢复草稿时只保留有效附件，并提示用户哪些附件已失效。
+    """
+    files: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for file_id in dict.fromkeys(request.ids):
+        if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+            missing.append(file_id)
+            continue
+        try:
+            attachment = _to_attachment(request.user_id, file_id)
+        except HTTPException:
+            missing.append(file_id)
+            continue
+        files.append(
+            {
+                "id": attachment.id,
+                "name": attachment.name,
+                "ext": attachment.ext,
+                "kind": attachment.kind,
+                "mime": attachment.mime,
+                "size": attachment.size,
+            }
+        )
+    return {"files": files, "missing": missing}

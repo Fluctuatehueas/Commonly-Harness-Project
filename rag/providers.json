@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "providers": {
+    "rag_crm_knowledge": {
+      "provider_id": "rag_crm_knowledge",
+      "name": "CRM 知识库",
+      "protocol": "mcp",
+      "description": "CRM 客户、商机、积分与操作手册知识库",
+      "capabilities": [
+        "retrieve",
+        "ingest",
+        "list_documents",
+        "delete_document",
+        "stats",
+        "health"
+      ],
+      "knowledge_domains": [
+        "crm",
+        "customer",
+        "opportunity",
+        "point"
+      ],
+      "citation_format": "chunk",
+      "limits": {
+        "top_k_max": 20,
+        "max_chars_per_chunk": 2000
+      },
+      "tools": {
+        "retrieve": "rag_retrieve",
+        "ingest": "rag_ingest",
+        "list_documents": "rag_list_documents",
+        "delete_document": "rag_delete_document",
+        "stats": "rag_knowledge_stats",
+        "health": "rag_health",
+        "manifest": "rag_manifest"
+      },
+      "mcp_server_id": "crm-user-service",
+      "integration_server_id": "crm-user-service",
+      "source": "mcp_discovery"
+    }
+  }
+}

@@ -83,6 +83,92 @@ export interface SandboxCheckResult {
   message: string
 }
 
+export interface ContextBudgetInfo {
+  window: number
+  reserve: number
+  usable: number
+  soft: number
+  hard: number
+  keep: number
+  soft_pct: number
+  hard_pct: number
+}
+
+export interface ContextSettings {
+  enabled: boolean
+  trigger: number
+  hard: number
+  keep: number
+  alert_threshold: number
+  min_rounds: number
+  cooldown: number
+  max_defer: number
+  timeout_seconds: number
+  eval_enabled: boolean
+  eval_judge: boolean
+  heartbeat_seconds: number
+  budget: ContextBudgetInfo
+}
+
+export type ContextSettingsPatch = Partial<Omit<ContextSettings, 'budget'>>
+
+export interface ArchiveSettings {
+  /** 超过该天数没有新记录的会话自动归档；0 表示关闭。 */
+  days: number
+}
+
+export async function fetchArchiveSettings(): Promise<ArchiveSettings> {
+  const res = await fetch(`${API_BASE}/settings/archive`, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(6000),
+  })
+  if (!res.ok) throw new Error(`读取归档设置失败: HTTP ${res.status}`)
+  return (await res.json()) as ArchiveSettings
+}
+
+export async function updateArchiveSettings(
+  days: number,
+): Promise<ArchiveSettings> {
+  const res = await fetch(`${API_BASE}/settings/archive`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ days }),
+  })
+  const data = (await res.json().catch(() => ({}))) as {
+    detail?: string
+    current?: ArchiveSettings
+  }
+  if (!res.ok) throw new Error(data.detail || `保存归档设置失败: HTTP ${res.status}`)
+  if (!data.current) throw new Error('后端未返回最新归档设置')
+  return data.current
+}
+
+export async function fetchContextSettings(): Promise<ContextSettings> {
+  const res = await fetch(`${API_BASE}/settings/context`, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(6000),
+  })
+  if (!res.ok) throw new Error(`读取压缩配置失败: HTTP ${res.status}`)
+  return (await res.json()) as ContextSettings
+}
+
+export async function updateContextSettings(
+  patch: ContextSettingsPatch,
+): Promise<ContextSettings> {
+  const res = await fetch(`${API_BASE}/settings/context`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  const data = (await res.json().catch(() => ({}))) as {
+    detail?: string
+    current?: ContextSettings
+  }
+  if (!res.ok) throw new Error(data.detail || `保存压缩配置失败: HTTP ${res.status}`)
+  if (!data.current) throw new Error('后端未返回最新压缩配置')
+  return data.current
+}
+
 export async function fetchModelSettings(): Promise<ModelSettings> {
   const res = await fetch(`${API_BASE}/settings/model`, {
     signal: AbortSignal.timeout(4000),

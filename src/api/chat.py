@@ -43,6 +43,7 @@ from api.async_tasks import extract_async_task_id
 from api.async_tasks import router as async_tasks_router
 from api.context import build_user_content
 from api.context import router as context_router
+from api.evolution import router as evolution_router
 from api.history import router as history_router
 from api.history import sessions_router as history_sessions_router
 from api.settings import router as settings_router
@@ -50,6 +51,7 @@ from api.trajectory import router as trajectory_router
 from api.skills import router as skills_router
 from api.mcp import router as mcp_router
 from api.projects import router as projects_router
+from api.rag import router as rag_router
 from api.session_files import router as session_files_router
 from api.message_utils import (
     content_to_text,
@@ -182,6 +184,24 @@ def _get_stream_message(chunk: Any) -> tuple[Any, dict[str, Any]] | None:
     return token, metadata if isinstance(metadata, dict) else {}
 
 
+def _get_custom_event(chunk: Any) -> dict[str, Any] | None:
+    """提取中间件通过 StreamWriter 发出的自定义事件。
+
+    只接受主图（ns 为空）的压缩事件，避免子 Agent 压缩干扰聊天区状态。
+    """
+    if not isinstance(chunk, dict) or chunk.get("type") != "custom":
+        return None
+    if chunk.get("ns"):
+        return None
+    data = chunk.get("data")
+    if not isinstance(data, dict):
+        return None
+    event_type = str(data.get("type") or "")
+    if not event_type.startswith("compaction_"):
+        return None
+    return {"type": event_type, **{key: value for key, value in data.items() if key != "type"}}
+
+
 def _get_tool_chunks(token: Any) -> list[dict[str, Any]]:
     """读取模型增量消息中的工具调用分片。"""
     tool_call_chunks = getattr(token, "tool_call_chunks", None) or []
@@ -249,8 +269,18 @@ def _is_subagent_stream(source: str) -> bool:
 
 
 def _is_internal_middleware_stream(metadata: dict[str, Any]) -> bool:
-    """判断消息是否来自不应向用户展示的内部记忆更新模型调用。"""
-    return metadata.get("langgraph_node") == "MemoryUpdateMiddleware.after_agent"
+    """判断消息是否来自不应向用户展示的内部模型调用。
+
+    - 记忆更新中间件有自己的图节点名，按节点名识别；
+    - 摘要/压缩等内部调用由 LangChain 写入 ``lc_source`` 元数据；
+    - 其他内部调用统一带 ``nostream`` 标签（由 StreamMessagesHandler 直接丢弃）。
+    """
+    if metadata.get("langgraph_node") == "MemoryUpdateMiddleware.after_agent":
+        return True
+    if metadata.get("lc_source") in {"summarization", "tool_summarization"}:
+        return True
+    tags = metadata.get("tags")
+    return isinstance(tags, list) and "nostream" in tags
 
 
 def _get_subagent_name(value: Any) -> str | None:
@@ -322,6 +352,7 @@ async def _run_chat_turn(
         user_id=request.user_id,
         username=username,
         thread_id=thread_id,
+        tenant_id=request.tenant_id,
     )
 
     try:
@@ -546,6 +577,7 @@ async def _stream_response_unlocked(
             user_id=request.user_id,
             username=username,
             thread_id=thread_id,
+            tenant_id=request.tenant_id,
         )
         _attach_hitl_resume(context, request, is_resume)
         # 必须使用异步流式调用：MCP StructuredTool 不支持同步 invoke/stream。
@@ -555,7 +587,7 @@ async def _stream_response_unlocked(
             agent_input,
             config=config,
             context=context,
-            stream_mode=["messages", "values"],
+            stream_mode=["messages", "values", "custom"],
             subgraphs=True,
             version="v2",
         )
@@ -572,6 +604,9 @@ async def _stream_response_unlocked(
 
             stream_message = _get_stream_message(chunk)
             if stream_message is None:
+                custom_event = _get_custom_event(chunk)
+                if custom_event is not None:
+                    yield _create_sse_message({**custom_event, "thread_id": thread_id})
                 continue
             token, metadata = stream_message
             if _is_internal_middleware_stream(metadata):
@@ -833,8 +868,10 @@ app.include_router(async_tasks_router)
 app.include_router(settings_router)
 app.include_router(context_router)
 app.include_router(trajectory_router)
+app.include_router(evolution_router)
 app.include_router(skills_router)
 app.include_router(mcp_router)
+app.include_router(rag_router)
 app.include_router(projects_router)
 app.include_router(session_files_router)
 app.include_router(history_sessions_router)

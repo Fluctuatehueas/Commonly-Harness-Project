@@ -5,6 +5,7 @@ import HomeView from '@/views/HomeView.vue'
 import McpView from '@/views/McpView.vue'
 import ModelsView from '@/views/ModelsView.vue'
 import PlaceholderView from '@/views/PlaceholderView.vue'
+import RagView from '@/views/RagView.vue'
 import SettingsView from '@/views/SettingsView.vue'
 import SkillsView from '@/views/SkillsView.vue'
 import TrajectoryView from '@/views/TrajectoryView.vue'
@@ -26,7 +27,7 @@ const router = createRouter({
     { path: '/plugins', name: 'plugins', component: PlaceholderView, props: { title: '插件市场', icon: 'plug' } },
     { path: '/skills', name: 'skills', component: SkillsView },
     { path: '/mcp', name: 'mcp', component: McpView },
-    { path: '/kb', name: 'kb', component: PlaceholderView, props: { title: '知识库', icon: 'book' } },
+    { path: '/kb', name: 'kb', component: RagView },
     { path: '/models', name: 'models', component: ModelsView },
     { path: '/settings', name: 'settings', component: SettingsView },
     // 兼容旧地址

@@ -29,7 +29,6 @@ from agent.config import (
     MAIN_AGENT_MODEL_RUN_LIMIT,
     MAIN_AGENT_TOOL_RUN_LIMIT,
     MAIN_SKILLS_PATH,
-    MODEL_CONTEXT_LIMIT,
     SKILLS_ROOT,
     get_main_model,
     get_summary_model,
@@ -38,7 +37,10 @@ from agent.memory.prompts import build_system_prompt
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware
 from agent.middlewares.context_window_monitor import ContextWindowMonitorMiddleWare
+from agent.middlewares.evolution import EvolutionMiddleware
+from agent.middlewares.experience_injection import ExperienceInjectionMiddleware
 from agent.middlewares.memory_update import MemoryUpdateMiddleware
+from agent.middlewares.self_judge import SelfJudgeMiddleware
 from agent.middlewares.skills_sync import SandboxSkillsMiddleware
 from agent.middlewares.token_usage import TokenUsageMiddleware
 from agent.middlewares.trajectory import TrajectoryMiddleware
@@ -53,6 +55,7 @@ from agent.tools.async_sandbox_tools import create_async_sandbox_tools
 from agent.tools.document_tools import read_word_document
 from agent.tools.hitl_tool import request_additional_info, request_user_choice
 from agent.tools.host_tools import build_host_tools
+from agent.tools.rag_tools import create_rag_tools
 from agent.mcp.runtime import mcp_runtime
 from agent.tools.skill_tools import create_skill_management_tools
 from agent.tools.commom_tools import get_basic_tools
@@ -145,6 +148,7 @@ async def create_main_agent(
     store: Any,
     checkpointer: Any,
     sandbox_backend: SandboxBackendProxy | None,
+    integration_server_id: str | None = None,
 ) -> Any:
     """创建绑定用户身份、持久化资源和共享沙箱的主 Agent 图。
 
@@ -154,6 +158,8 @@ async def create_main_agent(
         checkpointer: 按 ``thread_id`` 保存和恢复 LangGraph 执行状态的组件。
         sandbox_backend: 用户级稳定沙箱代理；传 ``None`` 表示无沙箱的纯对话
             模式（文件工具落到线程状态，禁用技能同步与异步任务）。
+        integration_server_id: 会话绑定的集成 MCP；只有该后端与公共 MCP
+            的工具可用，其他集成后端的业务工具不会暴露。
 
     Returns:
         已配置主工具、子 Agent、中间件和持久化后端的 DeepAgents 图。
@@ -231,12 +237,15 @@ async def create_main_agent(
 
     # 主 Agent 只保留通用能力：MCP 公共工具、异步任务提交、信息补齐和技能管理。
     # MCP 工具在 Agent 构图时才按 scope 懒发现/取代理，不在进程启动时连接。
-    mcp_tools = await mcp_runtime.tools_for_main_agent()
+    mcp_tools = await mcp_runtime.tools_for_main_agent(integration_server_id)
+    # RAG 工具始终可用；无 Provider 时返回空结果，不阻断普通对话。
+    rag_tools = create_rag_tools()
     # 宿主能力默认关闭；开启后每个工具内部都会 interrupt 等待人工审批。
     host_tools = build_host_tools()
     main_tools = [
         *mcp_tools,
         *async_tools,
+        *rag_tools,
         *get_basic_tools(),
         *host_tools,
         request_additional_info,
@@ -274,6 +283,16 @@ async def create_main_agent(
         if host_tools
         else "- 所有命令、脚本、代码必须在隔离沙箱中执行；当前会直接拒绝本机执行。\n"
     )
+    integration_policy = ""
+    if integration_server_id:
+        integration_policy = (
+            "\n\n## 集成后端\n"
+            f"- 当前会话绑定用户自有后端 `{integration_server_id}`。"
+            "业务查询与写入必须使用该后端的 MCP 工具；"
+            "不要调用其他集成后端的工具，也不要编造业务数据。\n"
+            "- 该后端工具不可用时，明确告知用户后端服务不可达，"
+            "不要改用通用工具绕过业务边界。\n"
+        )
     execution_policy = (
         "\n\n## 文件与执行环境\n"
         "- 对话分两种模式：项目会话绑定本机项目目录；自由会话没有项目目录。\n"
@@ -289,10 +308,11 @@ async def create_main_agent(
         "- `/.commonharness/` 是项目保留目录，禁止读写。\n"
         f"{host_policy}"
     )
+    base_prompt = f"{search_policy_prompt}{integration_policy}{execution_policy}"
     full_system_prompt = (
-        f"{search_policy_prompt}{execution_policy}\n\n{delegation_instructions}"
+        f"{base_prompt}\n\n{delegation_instructions}"
         if delegation_instructions
-        else f"{search_policy_prompt}{execution_policy}"
+        else base_prompt
     )
 
     # 中间件顺序具有语义：before_* 按声明顺序运行，after_* 反序运行。
@@ -304,11 +324,16 @@ async def create_main_agent(
         subagents=[*sync_subagents, *async_subagents],
         middleware=[
             ContextInjectionMiddleware(),
+            # 演进模块默认开启；关闭对应环境变量后内部直接短路。
+            ExperienceInjectionMiddleware(),
+            SelfJudgeMiddleware(get_summary_model()),
             # 只读观测：上下文占用日志 + 过程轨迹落库，不修改 state。
             ContextWindowMonitorMiddleWare(),
             # after_agent 把最终回答的 Token 消耗累计写入 Store（会话统计）。
             TokenUsageMiddleware(),
-            TrajectoryMiddleware(context_limit=MODEL_CONTEXT_LIMIT),
+            # 轨迹结束事件落库后，再异步执行经验/归因/候选编排。
+            EvolutionMiddleware(get_summary_model()),
+            TrajectoryMiddleware(context_limit=agent_config.MODEL_CONTEXT_LIMIT),
             *skill_middleware,
             # 自动摘要 + 主动压缩 + 模型/工具调用上限。
             *build_agent_protection_middleware(

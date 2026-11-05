@@ -30,6 +30,15 @@ class HarnessContext:
     # 由轨迹中间件写进本轮轨迹，供「轨迹」页展示「已回复」记录。
     hitl_summary: str = ""
     hitl_status: str = ""
+    # 集成模式的部署级租户标识；个人模式为空，演进模块回退到 default。
+    tenant_id: str = ""
+    # 演进模块在单轮内的临时状态：是否已注入经验、注入了哪些经验、
+    # 自检是否失败以及风险等级。进程内上下文，不落库。
+    evolution_experience_injected: bool = False
+    evolution_experience_ids: str = ""
+    evolution_verification_failed: bool = False
+    evolution_verification_reason: str = ""
+    evolution_risk_tier: str = ""
 
 
 @dataclass
@@ -63,6 +72,8 @@ class ChatRequest(BaseModel):
     user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
     username: Optional[str] = Field(None, min_length=1, description="用户名")
     name: Optional[str] = Field(None, min_length=1, description="username 的兼容字段")
+    # 集成模式下由网关注入；个人模式为空，演进模块回退到 default。
+    tenant_id: str = Field("", description="部署级租户标识")
     attachments: List[str] = Field(
         default_factory=list,
         description="上下文附件 ID 列表（先调用 /context/upload 获得）",
@@ -92,6 +103,7 @@ class ResumeChatRequest(BaseModel):
     resume: Dict[str, Any] = Field(..., description="补充信息或人工审批决策")
     user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
     username: Optional[str] = Field(None, min_length=1, description="用户名")
+    tenant_id: str = Field("", description="部署级租户标识")
 
     @model_validator(mode="after")
     def set_username(self) -> "ResumeChatRequest":
@@ -149,15 +161,22 @@ class Session(BaseModel):
     pinned: bool = Field(False, description="是否置顶")
     # 会话归属的项目（工作区目录）ID；null 表示归入「对话」分组。
     project_id: Optional[str] = Field(None, description="所属项目 ID")
+    # 会话绑定的集成 MCP 服务 ID；null 表示普通会话。
+    integration_server_id: Optional[str] = Field(
+        None, description="所属集成项目（自定义 MCP）的 server_id"
+    )
+    archived: bool = Field(False, description="是否已归档（软删除）")
+    archived_at: Optional[datetime] = Field(None, description="归档时间；未归档为 null")
 
 
 class SessionUpdateRequest(BaseModel):
-    """会话重命名 / 置顶 / 归属项目请求；None 表示不修改该字段。"""
+    """会话重命名 / 置顶 / 归档 / 归属项目请求；None 表示不修改该字段。"""
 
     title: Optional[str] = Field(
         None, min_length=1, max_length=120, description="新的会话标题"
     )
     pinned: Optional[bool] = Field(None, description="是否置顶")
+    archived: Optional[bool] = Field(None, description="是否归档（true=归档，false=恢复）")
     # 显式传 null 表示移回「对话」组；未传则保持原归属。
     project_id: Optional[str] = Field(None, description="所属项目 ID，null 表示移出项目")
 
@@ -213,7 +232,8 @@ class UserGroup:
 
     username: str  # 用户最近一次使用的名称
     thread_ids: set[str] = field(default_factory=set)  # 用户关联的会话 ID
-    agent: Any | None = None  # 用户专属的 Agent 实例
+    # 按工具范围缓存 Agent："" 为普通会话，集成 MCP 的 server_id 为绑定后端。
+    agents: dict[str, Any] = field(default_factory=dict)
 
 # ============================================================
 # 网络搜索数据模型

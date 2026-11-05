@@ -28,7 +28,6 @@ fastmcp inspect mcp_demo_server.py      查看FastMCP信息
 Linux 时区同步
 
 timedatectl set-timezone Asia/Shanghai
-然后再同步时间：
 yum install -y chrony
 systemctl restart chronyd
 chronyc -a makestep

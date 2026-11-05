@@ -1,33 +1,29 @@
-﻿# RAG模块
+# RAG 模块
 
-将分为两种RAG模式
-1. 传统RAG
-2. GraphRAG
+集成模式下 Harness 只做 **Provider 注册、检索编排、引用归一化与灌入转发**，
+不保存知识原文、切片、向量与 Embedding。
 
----
+完整设计见：[RAG 模块项目设计](../../docs/core_design/RAG模块设计.md)
 
-|维度|更适合传统 RAG|更适合 GraphRAG|
-|---|---|---|
-|问题类型|单跳事实问答、FAQ、片段解释|	多跳关系推理、跨文档归纳、全局摘要（“主要主题”“主要风险”）|
-|语料特征|	实体稀疏、叙事性强、文档间关联弱|	实体密集、跨文档关联强（法务、投研、医药、供应链）|
-|更新频率|	实时/高频更新|	批量低频更新（周/月级）|
-|规模|	小语料（<50文档）或极致成本敏感|	中大规模语料（千级文档以上），全局问题有价值|
-|核心约束|	需要毫秒级响应、快速上线|	需要答案的全面性与可追溯性，能接受更高延迟与构建成本|
+## 文件
 
+| 文件 | 职责 |
+| :-- | :-- |
+| `types.py` | Provider 配置、运行状态、错误、MCP 默认工具名 |
+| `config_store.py` | `providers.json` 原子读写、校验、密钥掩码、鉴权解析 |
+| `runtime.py` | 注册、健康检查、检索、灌入/知识管理转发、MCP 发现 |
+| `../api/rag.py` | `/rag/*` REST API |
+| `../agent/tools/rag_tools.py` | Agent 的 `knowledge_search` 工具 |
 
----
-## 一、传统RAG
-> 文档切块 → 向量化 → 语义相似度检索 Top-K 片段 → 拼接生成  
+## 支持的接入方式
 
-**RAG搭建**  
+1. **HTTP/OpenAPI Provider**：`endpoint` 指向 RAG 服务的 API base。
+2. **MCP Provider**：复用已接入的 MCP 服务，通过 `tools` 映射调用检索/灌入工具。
+3. **MCP 发现**：MCP 后端暴露 `rag_manifest` 工具，Harness 调用后自动注册 Provider。
 
-|组件|	常见选项|	适用场景|
-|---|---|---|
-|编排框架|	LlamaIndex / LangChain|	纯RAG优先LlamaIndex（默认配置更完善、代码量更少）；若RAG只是更大Agent工作流的一部分，LangChain更灵活|
-|向量数据库|	ChromaDB / Milvus / Qdrant / pgvector|	开发验证用ChromaDB；生产按规模与运维偏好选择Milvus（大规模）、Qdrant（轻量高性能）或已有PG生态下的pgvector|
-|Embedding|	BGE系列 / Qwen3 Embedding / OpenAI text-embedding-3|	中文优先BGE；需本地化或尺寸灵活选Qwen3；追求快速上线选OpenAI API|
-|重排序|	BGE-Reranker / Cohere Rerank / 各类Cross-Encoder|	对检索精度有要求的场景，作为向量召回后的第二道筛选|
-|生成模型|	DeepSeek / Qwen / 闭源API|	根据数据合规要求、成本与效果综合选择|
+## 配置与密钥
 
-
-## 二、
+- 源码模式：`rag/providers.json`
+- 打包模式：`USER_DATA_DIR/rag/providers.json`
+- 覆盖：`HARNESS_RAG_ROOT` / `HARNESS_RAG_CONFIG_PATH`
+- 密钥只保存 `secret_ref`（环境变量名或 `${VAR}`），运行时解析，前端不回显明文。

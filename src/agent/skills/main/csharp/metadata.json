@@ -1,4 +1,0 @@
-{
-  "name": "csharp",
-  "description": "Use this skill whenever the user asks to write, create, review, explain, refactor, or debug C# code, .NET projects, or C#-related questions. Covers project scaffolding, coding conventions, async/await pitfalls, LINQ, null handling, and how to compile/run when dotnet or mono is unavailable in the sandbox."
-}

@@ -18,7 +18,7 @@ import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from fastapi import HTTPException
@@ -108,6 +108,11 @@ class AgentLoader:
                 name="mcp-config-watch",
             )
 
+    @property
+    def store(self) -> Any | None:
+        """公开 Store 只读入口，供轨迹/经验/演进 API 使用。"""
+        return self._store
+
     async def _on_mcp_structure_change(self) -> None:
         """MCP 工具名集合增删后，丢弃已缓存的 Agent 图。"""
         logger.info("MCP 工具集结构变化，将按新工具集重建 Agent 图")
@@ -130,10 +135,27 @@ class AgentLoader:
         finally:
             self._active_threads.discard(thread_id)
 
-    async def require_session(self, user_id: str, thread_id: str) -> None:
-        """在访问已指定的会话前检查归属。"""
-        if await self.get_session(user_id, thread_id) is None:
+    async def require_session(
+        self,
+        user_id: str,
+        thread_id: str,
+        *,
+        allow_archived: bool = False,
+    ) -> dict[str, Any]:
+        """在访问已指定的会话前检查归属。
+
+        默认拒绝已归档会话，保证归档后 Agent 不再读取或写入该会话；
+        只读查看、恢复、永久删除等管理操作需显式传入 ``allow_archived``。
+        """
+        session = await self.get_session(user_id, thread_id)
+        if session is None:
             raise HTTPException(status_code=404, detail="会话不存在或无权访问")
+        if session.get("archived") and not allow_archived:
+            raise HTTPException(
+                status_code=409,
+                detail="会话已归档，请先在「归档会话」中恢复后再继续对话",
+            )
+        return session
 
     def create_config(
         self,
@@ -164,6 +186,13 @@ class AgentLoader:
         assert self._checkpointer is not None
         assert self._sandbox_manager is not None
 
+        # 会话可绑定一个用户自有后端的 MCP；该会话的 Agent 只加载该后端的
+        # 集成工具，不加载其他集成后端，避免跨后端误调用业务工具。
+        session = await self.get_session(user_id, thread_id)
+        integration_server_id = str(
+            (session or {}).get("integration_server_id") or ""
+        )
+
         # 用户级锁防止重复构建；沙箱探测和构图不会阻塞其他用户。
         async with self._user_locks.setdefault(user_id, asyncio.Lock()):
             group = self._user_groups.get(user_id)
@@ -186,8 +215,9 @@ class AgentLoader:
                     user_id,
                 )
 
-            if group.agent is None:
-                group.agent = await self._agent_factory(
+            agent = group.agents.get(integration_server_id)
+            if agent is None:
+                agent = await self._agent_factory(
                     self.create_config(
                         thread_id=thread_id,
                         user_id=user_id,
@@ -196,8 +226,10 @@ class AgentLoader:
                     store=self._store,
                     checkpointer=self._checkpointer,
                     sandbox_backend=sandbox_backend,
+                    integration_server_id=integration_server_id or None,
                 )
-            return group.agent
+                group.agents[integration_server_id] = agent
+            return agent
 
     async def reset_agents(self) -> None:
         """清空用户级 Agent 缓存；模型热更新后，下次请求用新模型重建。"""
@@ -291,13 +323,16 @@ class AgentLoader:
         *,
         project_id: str | None = None,
         bind_project: bool = False,
+        integration_server_id: str | None = None,
+        bind_integration: bool = False,
     ) -> None:
         """将用户会话索引保存到 PostgreSQL 的 LangGraph Store。
 
         Store 使用 ``("sessions", user_id)`` 作为命名空间、``thread_id`` 作为 key，
         value 保存标题和创建/更新时间；完整对话消息仍由 PostgreSQL Checkpointer 保存。
 
-        ``bind_project`` 只在新会话创建时使用：项目归属在创建时确定，之后不可更改。
+        ``bind_project`` / ``bind_integration`` 只在新会话创建时使用：归属在创建时
+        确定，之后不可更改。
         """
         await self.initialize()
         assert self._store is not None
@@ -308,8 +343,12 @@ class AgentLoader:
         value = dict(existing.value) if existing is not None else {}
         existing_title = value.get("title")
         value.setdefault("pinned", False)
+        value.setdefault("archived", False)
+        value.setdefault("archived_at", None)
         if bind_project:
             value["project_id"] = project_id or None
+        if bind_integration:
+            value["integration_server_id"] = integration_server_id or None
         value.update(
             {
                 "thread_id": thread_id,
@@ -325,15 +364,24 @@ class AgentLoader:
         )
         await self._store.aput(namespace, thread_id, value, index=False)
 
-    async def list_sessions(self, user_id: str) -> list[dict[str, Any]]:
-        """读取当前用户已登记的会话索引，并按更新时间倒序返回。"""
+    async def list_sessions(
+        self, user_id: str, *, archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        """读取当前用户已登记的会话索引，并按更新时间倒序返回。
+
+        ``archived=False`` 只返回正常会话，``archived=True`` 只返回已归档会话。
+        """
         await self.initialize()
         assert self._store is not None
         items = await self._store.asearch(
             (*SESSION_NAMESPACE_PREFIX, user_id),
             limit=1_000,
         )
-        sessions = [dict(item.value) for item in items]
+        sessions = [
+            dict(item.value)
+            for item in items
+            if bool(item.value.get("archived", False)) == archived
+        ]
         # 置顶优先；组内按最后消息时间倒序。
         return sorted(
             sessions,
@@ -351,8 +399,9 @@ class AgentLoader:
         *,
         title: str | None = None,
         pinned: bool | None = None,
+        archived: bool | None = None,
     ) -> dict[str, Any] | None:
-        """更新会话标题 / 置顶；只改元数据，不动消息与 updated_at。
+        """更新会话标题 / 置顶 / 归档；只改元数据，不动消息与 updated_at。
 
         会话的项目归属在创建时固定，不允许后续修改。
         """
@@ -367,8 +416,38 @@ class AgentLoader:
             value["title"] = title
         if pinned is not None:
             value["pinned"] = bool(pinned)
+        if archived is not None:
+            value["archived"] = bool(archived)
+            value["archived_at"] = (
+                datetime.now(timezone.utc).isoformat() if archived else None
+            )
         await self._store.aput(namespace, thread_id, value, index=False)
         return value
+
+    async def archive_stale_sessions(self, user_id: str, days: int) -> int:
+        """把超过 ``days`` 天没有新记录的会话自动归档，返回本次归档数量。
+
+        置顶会话视为用户明确保留，不参与自动归档；``days <= 0`` 表示关闭。
+        """
+        if days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        archived_count = 0
+        for session in await self.list_sessions(user_id, archived=False):
+            if session.get("pinned"):
+                continue
+            try:
+                updated_at = datetime.fromisoformat(str(session.get("updated_at", "")))
+            except ValueError:
+                continue
+            # 兼容历史上未带时区的 ISO 字符串。
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            if updated_at >= cutoff:
+                continue
+            await self.update_session(user_id, session["thread_id"], archived=True)
+            archived_count += 1
+        return archived_count
 
     async def get_session(
         self, user_id: str, thread_id: str,
@@ -550,7 +629,8 @@ class AgentLoader:
     async def delete_session(self, user_id: str, thread_id: str) -> bool:
         """删除用户会话的 checkpoint 数据和会话索引。"""
         async with self.thread_operation(thread_id):
-            await self.require_session(user_id, thread_id)
+            # 永久删除需要能清理已归档会话。
+            await self.require_session(user_id, thread_id, allow_archived=True)
             return await self._delete_session(user_id, thread_id)
 
     async def _delete_session(self, user_id: str, thread_id: str) -> bool:

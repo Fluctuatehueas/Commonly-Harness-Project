@@ -49,6 +49,24 @@ interface SseEvent {
   [key: string]: unknown
 }
 
+export interface CompactionState {
+  active: boolean
+  compactionId: string
+  phase: 'compacting' | 'evaluating' | 'exiting'
+  startedAt: number
+  usedTokens: number
+  limit: number
+  window: number
+  pct: number
+  reason: string
+  degraded?: boolean
+  error?: string
+  // 已收到压缩结束事件，等待最短展示时长后再退场
+  exiting?: boolean
+  // 进入“评估”阶段的时间，用于保证该阶段有最短展示时长
+  evaluatingAt?: number
+}
+
 interface ThreadChat {
   messages: ChatMsg[]
   sending: boolean
@@ -60,6 +78,15 @@ interface ThreadChat {
   turnDurations: Record<string, number>
   // 当前进行中的用户轮次，用于回填耗时
   activeTurnKey: string | null
+  // 当前压缩状态（临时提示，不落历史）
+  compaction: CompactionState | null
+  compactionCount: number
+  // 压缩期间到达的正文 token，结束后按序回放
+  compactionBuffer: string
+  // 压缩动画的定时器（阶段最短时长与退场）
+  compactionTimers: number[]
+  // 压缩进度看门狗：长时间没有心跳则提示连接可能已断开
+  compactionWatchdog: number | null
 }
 
 const SKILL_TOOLS = new Set([
@@ -71,6 +98,84 @@ const SKILL_TOOLS = new Set([
 ])
 const DELEGATION_TOOLS = new Set(['task', 'start_async_task'])
 const EMPTY_MESSAGES: ChatMsg[] = []
+
+// 压缩动画时长：保证“压缩 → 评估 → 退场”三步都看得见。
+const COMPACTION_MIN_STAGE_MS = 700
+const COMPACTION_EXIT_MS = 340
+
+/** 压缩阶段最短展示时间，避免摘要太快导致动画一闪而过。 */
+function stageWait(startedAt: number, minMs = COMPACTION_MIN_STAGE_MS): number {
+  return Math.max(minMs - (Date.now() - startedAt), 0)
+}
+
+function removeCompactionNotes(state: ThreadChat) {
+  state.messages = state.messages.filter((message) => !message.id.startsWith('cp-note-'))
+}
+
+function clearCompactionTimers(state: ThreadChat) {
+  for (const timer of state.compactionTimers) window.clearTimeout(timer)
+  state.compactionTimers = []
+}
+
+function scheduleCompaction(state: ThreadChat, delay: number, run: () => void) {
+  const timer = window.setTimeout(() => {
+    state.compactionTimers = state.compactionTimers.filter((item) => item !== timer)
+    run()
+  }, delay)
+  state.compactionTimers = [...state.compactionTimers, timer]
+}
+
+const COMPACTION_STALE_MS = 20000
+
+/** 压缩期间每收到一次进度就重置看门狗；超时说明连接可能已断。 */
+function armCompactionWatchdog(state: ThreadChat) {
+  if (state.compactionWatchdog) window.clearTimeout(state.compactionWatchdog)
+  state.compactionWatchdog = window.setTimeout(() => {
+    if (state.compaction?.active && !state.compaction.exiting) {
+      state.compaction = {
+        ...state.compaction,
+        error: '压缩进度长时间无响应，连接可能已断开',
+      }
+      const note = state.messages.find(
+        (message) => message.id === `cp-note-${state.compaction?.compactionId}`,
+      )
+      if (note) note.content = '压缩进度长时间无响应，请刷新后重试'
+    }
+  }, COMPACTION_STALE_MS)
+}
+
+function clearCompactionWatchdog(state: ThreadChat) {
+  if (state.compactionWatchdog) window.clearTimeout(state.compactionWatchdog)
+  state.compactionWatchdog = null
+}
+
+/** 压缩结束后更新会话上下文占用。 */
+function applyCompactionUsage(state: ThreadChat, evt: SseEvent) {
+  const after = Number(evt.after_tokens || 0)
+  const rawWindow = Number(evt.window || evt.limit || 0)
+  if (!state.sessionTokens || after <= 0) return
+  state.sessionTokens.contextUsed = after
+  if (rawWindow > 0) state.sessionTokens.contextWindow = rawWindow
+}
+
+/** 压缩结束后把缓冲的正文回放到当前气泡。 */
+function flushCompactionBuffer(state: ThreadChat) {
+  const text = state.compactionBuffer
+  state.compactionBuffer = ''
+  if (!text) return
+  const last = [...state.messages].reverse().find((message) => message.kind === 'assistant')
+  if (last && last.streaming) {
+    last.content = `${last.content || ''}${text}`
+    return
+  }
+  state.messages.push({
+    id: uid('a'),
+    kind: 'assistant',
+    content: text,
+    streaming: true,
+    at: Date.now(),
+  })
+}
 
 let seq = 0
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${seq++}`
@@ -150,6 +255,11 @@ export const useChatStore = defineStore('chat', () => {
       sessionTokens: null,
       turnDurations: {},
       activeTurnKey: null,
+      compaction: null,
+      compactionCount: 0,
+      compactionBuffer: '',
+      compactionTimers: [],
+      compactionWatchdog: null,
     }
   }
 
@@ -187,6 +297,11 @@ export const useChatStore = defineStore('chat', () => {
   const pendingInterrupt = computed(() => current.value?.pendingInterrupt ?? null)
   const sessionTokens = computed(() => current.value?.sessionTokens ?? null)
   const turnDurations = computed(() => current.value?.turnDurations ?? {})
+  const compaction = computed(() => current.value?.compaction ?? null)
+  const compacting = computed(
+    () => Boolean(current.value?.compaction?.active && current.value.compaction.phase !== 'exiting'),
+  )
+  const compactionCount = computed(() => current.value?.compactionCount ?? 0)
   const isEmpty = computed(() => messages.value.length === 0)
 
   // 后台仍在运行的会话集合，供侧边栏动画使用
@@ -228,6 +343,11 @@ export const useChatStore = defineStore('chat', () => {
         ? String(evt.parent_tool_call_id)
         : undefined
       const text = String(evt.content || '')
+      // 压缩期间不往气泡里追加内容，先缓冲；退场动画开始时统一回放。
+      if (state.compaction?.active && !state.compaction.exiting && kind === 'assistant') {
+        state.compactionBuffer += text
+        return
+      }
       const last = state.messages[state.messages.length - 1]
       if (
         last &&
@@ -312,6 +432,103 @@ export const useChatStore = defineStore('chat', () => {
         state.pendingInterrupt = msg
         break
       }
+      case 'compaction_start': {
+        const compactionId = String(evt.compaction_id || uid('cp'))
+        const used = Number(evt.used_tokens || 0)
+        const limit = Number(evt.limit || 0)
+        const windowSize = Number(evt.window || limit || 0)
+        const pct = Number(evt.pct || 0)
+        clearCompactionTimers(state)
+        state.thinking = true
+        state.compaction = {
+          active: true,
+          compactionId,
+          phase: 'compacting',
+          startedAt: Date.now(),
+          usedTokens: used,
+          limit,
+          window: windowSize,
+          pct,
+          reason: String(evt.trigger_type || 'soft'),
+        }
+        // 聊天区只放一条临时提示，任务结束后由 compaction_end 移除，不写历史。
+        state.messages.push({
+          id: `cp-note-${compactionId}`,
+          kind: 'system',
+          content: `正在压缩与评估上下文 · 已用 ${used.toLocaleString('zh-CN')} / ${limit.toLocaleString('zh-CN')}（${Math.round(pct * 100)}%）`,
+          at: Date.now(),
+        })
+        armCompactionWatchdog(state)
+        break
+      }
+      case 'compaction_progress': {
+        if (!state.compaction || state.compaction.exiting) break
+        armCompactionWatchdog(state)
+        const next = String(evt.phase || '')
+        if (next !== 'verify' || state.compaction.phase === 'evaluating') break
+        // 进入“评估”阶段前保证“压缩”阶段至少展示一段时间。
+        scheduleCompaction(state, stageWait(state.compaction.startedAt), () => {
+          if (!state.compaction || state.compaction.exiting) return
+          state.compaction = {
+            ...state.compaction,
+            phase: 'evaluating',
+            evaluatingAt: Date.now(),
+          }
+        })
+        break
+      }
+      case 'compaction_end': {
+        clearCompactionWatchdog(state)
+        const current = state.compaction
+        if (!current) {
+          // 页面未处于压缩态：只更新占用统计。
+          applyCompactionUsage(state, evt)
+          break
+        }
+        const degraded = Boolean(evt.degraded)
+        const note = state.messages.find(
+          (message) => message.id === `cp-note-${current.compactionId}`,
+        )
+        if (degraded && note) note.content = '上下文压缩失败，已使用兜底策略继续'
+
+        const beginExit = () => {
+          if (!state.compaction || state.compaction.compactionId !== current.compactionId) {
+            return
+          }
+          // 退场动画开始时立即恢复被中断的正文输出。
+          state.compaction.exiting = true
+          state.compaction.phase = 'exiting'
+          if (note && !degraded) note.content = '上下文已压缩，继续执行'
+          flushCompactionBuffer(state)
+          applyCompactionUsage(state, evt)
+          if (String(evt.status || 'done') !== 'skipped') state.compactionCount += 1
+          scheduleCompaction(state, COMPACTION_EXIT_MS, () => {
+            removeCompactionNotes(state)
+            if (state.compaction?.compactionId === current.compactionId) {
+              state.compaction = null
+            }
+          })
+        }
+
+        // 压缩阶段 + 评估阶段都必须至少各展示一次，再进入退场。
+        const evaluatingAt = current.evaluatingAt ?? Date.now()
+        if (current.phase === 'compacting') {
+          // 用新对象替换，避免与退场定时器里的旧引用混淆。
+          state.compaction = { ...current, phase: 'evaluating', evaluatingAt }
+        }
+        scheduleCompaction(state, stageWait(evaluatingAt), beginExit)
+        break
+      }
+      case 'compaction_error': {
+        if (state.compaction) {
+          state.compaction.error = String(evt.message || '压缩失败')
+          const note = state.messages.find(
+            (message) => message.id === `cp-note-${state.compaction?.compactionId}`,
+          )
+          if (note) note.content = '上下文压缩失败，已使用兜底策略继续'
+        }
+        break
+      }
       case 'done': {
         if (typeof evt.round_limit === 'number' && evt.round_limit > 0) {
           roundLimit.value = evt.round_limit
@@ -356,6 +573,19 @@ export const useChatStore = defineStore('chat', () => {
         for (const message of state.messages) {
           if (message.streaming) message.streaming = false
         }
+        // 压缩提示属于临时的运行状态，结束后不留在聊天记录里。
+        if (state.compaction?.exiting) {
+          // 退场动画进行中：交给定时器收尾，避免动画被截断。
+          scheduleCompaction(state, COMPACTION_EXIT_MS, () => {
+            removeCompactionNotes(state)
+            state.compaction = null
+          })
+        } else {
+          clearCompactionTimers(state)
+          removeCompactionNotes(state)
+          state.compaction = null
+        }
+        state.compactionBuffer = ''
         state.sending = false
         state.thinking = false
         state.controller = null
@@ -376,6 +606,11 @@ export const useChatStore = defineStore('chat', () => {
         for (const message of state.messages) {
           if (message.streaming) message.streaming = false
         }
+        removeCompactionNotes(state)
+        clearCompactionTimers(state)
+        clearCompactionWatchdog(state)
+        state.compaction = null
+        state.compactionBuffer = ''
         state.sending = false
         state.thinking = false
         state.controller = null
@@ -531,6 +766,11 @@ export const useChatStore = defineStore('chat', () => {
     if (!state) return
     state.controller?.abort()
     state.controller = null
+    clearCompactionTimers(state)
+    clearCompactionWatchdog(state)
+    removeCompactionNotes(state)
+    state.compaction = null
+    state.compactionBuffer = ''
     state.sending = false
     state.thinking = false
     state.activeTurnKey = null
@@ -554,6 +794,10 @@ export const useChatStore = defineStore('chat', () => {
         msgs.find((m) => m.kind === 'interrupt' && !m.resolved) || null
       state.sessionTokens =
         sessionUsage && sessionUsage.total > 0 ? sessionUsage : null
+      clearCompactionTimers(state)
+      clearCompactionWatchdog(state)
+      state.compaction = null
+      state.compactionBuffer = ''
     }
     threadId.value = tid
     lastError.value = ''
@@ -715,6 +959,9 @@ export const useChatStore = defineStore('chat', () => {
     roundLimit,
     sessionTokens,
     turnDurations,
+    compaction,
+    compacting,
+    compactionCount,
     isEmpty,
     turnVersion,
     lastTurnThreadId,

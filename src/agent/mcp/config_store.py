@@ -21,6 +21,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -214,6 +215,20 @@ def _normalize_transport(value: Any) -> Transport:
     raise _config_error(f"不支持的 transport: {value!r}")
 
 
+def _looks_like_sse_url(url: Any) -> bool:
+    """``/sse`` 结尾的 URL 按 SSE 端点处理。
+
+    Spring AI、FastMCP 等 SSE 服务把事件流挂在 ``/sse``，而消息提交走另一个
+    端点；Streamable HTTP 客户端会对同一 URL 发 POST，服务端只会拒绝。
+    很多客户端（包括编辑器内置 MCP）会按 URL 自动识别，这里保持一致。
+    """
+    try:
+        path = urlparse(str(url or "")).path.rstrip("/").lower()
+    except ValueError:
+        return False
+    return path.endswith("/sse")
+
+
 # ============================================================
 # 厂商配置 JSON 解析
 # ============================================================
@@ -310,12 +325,24 @@ def normalize_vendor_entry(server_id: str, raw: dict[str, Any]) -> dict[str, Any
         raise _config_error(
             "服务配置缺少 command（stdio）或 url（网络传输）", server_id=server_id
         )
+    if (
+        transport is Transport.STREAMABLE_HTTP
+        and _looks_like_sse_url(url)
+    ):
+        transport = Transport.SSE
 
     enabled_value = raw.get("enabled")
     enabled = (
         bool(enabled_value)
         if isinstance(enabled_value, bool)
         else not bool(raw.get("disabled", False))
+    )
+
+    integration_value = raw.get("integration")
+    integration = (
+        bool(integration_value)
+        if isinstance(integration_value, bool)
+        else str(raw.get("kind") or "").strip().lower() == "integration"
     )
 
     payload: dict[str, Any] = {
@@ -325,6 +352,7 @@ def normalize_vendor_entry(server_id: str, raw: dict[str, Any]) -> dict[str, Any
             else transport.value
         ),
         "enabled": enabled,
+        "integration": integration,
         "namespace": server_id,
     }
     if isinstance(raw.get("description"), str) and raw["description"].strip():
@@ -431,6 +459,9 @@ def _build_server(
     preconnect = raw.get("preconnect", False)
     if not isinstance(preconnect, bool):
         raise _config_error("preconnect 必须是布尔值", server_id=server_id)
+    integration = raw.get("integration", False)
+    if not isinstance(integration, bool):
+        raise _config_error("integration 必须是布尔值", server_id=server_id)
     optional_legacy = bool(raw.get("optional", False))
     criticality = str(
         raw.get("criticality", "optional" if optional_legacy else "optional")
@@ -482,6 +513,14 @@ def _build_server(
     connection: dict[str, Any] = {}
     if enabled:
         connection = _build_connection(server_id, raw, transport)
+        # 已经落盘的 streamable_http 配置如果指向 /sse，也按 SSE 连接，
+        # 避免用户必须重新导入一次配置才能生效。
+        if (
+            transport is Transport.STREAMABLE_HTTP
+            and _looks_like_sse_url(connection.get("url"))
+        ):
+            transport = Transport.SSE
+            connection["transport"] = Transport.SSE.value
 
     retry_raw = _merge_dicts(
         defaults.get("retry") or {},
@@ -509,6 +548,7 @@ def _build_server(
         description=str(raw.get("description", "")),
         enabled=enabled,
         preconnect=preconnect,
+        integration=integration,
         criticality=criticality,
         namespace=namespace,
         allow_tools=list(allow_tools),
@@ -688,6 +728,13 @@ class McpConfigStore:
         merged["transport"] = str(payload.get("transport", existing.get("transport", "stdio")))
 
         raw["servers"][server_id] = merged
+        # 集成 MCP 不进入主 Agent 的默认工具范围，避免其他会话误用后端工具。
+        if merged.get("integration") is True:
+            main_servers = raw.get("main_servers", [])
+            if isinstance(main_servers, list):
+                raw["main_servers"] = [
+                    name for name in main_servers if name != server_id
+                ]
         # 先完整校验，再写盘
         self._validate_raw(raw)
         self._write(raw)
@@ -753,10 +800,22 @@ class McpConfigStore:
             servers[server_id] = self._preserve_masked(dict(payload), existing)
 
         # 粘贴导入即视为要接入主 Agent，避免用户还要手工维护 main_servers。
+        # 集成 MCP 只服务于绑定它的会话，不进入主 Agent 的默认工具范围。
         main_servers = raw.get("main_servers", [])
         if not isinstance(main_servers, list):
             main_servers = []
+        integration_ids = {
+            server_id
+            for server_id, payload in entries
+            if payload.get("integration") is True
+        }
+        if integration_ids:
+            main_servers = [
+                name for name in main_servers if name not in integration_ids
+            ]
         for server_id, payload in entries:
+            if payload.get("integration") is True:
+                continue
             if payload.get("enabled", True) and server_id not in main_servers:
                 main_servers.append(server_id)
         raw["main_servers"] = main_servers

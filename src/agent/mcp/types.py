@@ -150,6 +150,7 @@ class NamespacePolicy:
 LOCAL_CONFIG_KEYS = {
     "description",
     "enabled",
+    "integration",
     "optional",
     "criticality",
     "preconnect",
@@ -180,6 +181,8 @@ class ServerConfig:
     description: str = ""
     enabled: bool = True
     preconnect: bool = False
+    # 集成模式：用户自有后端项目封装成的 MCP，而非网络上的通用 MCP 服务。
+    integration: bool = False
     criticality: str = "optional"
     namespace: str = ""
     allow_tools: list[str] = field(default_factory=list)
@@ -216,6 +219,7 @@ class ServerConfig:
                 "deny_tools": self.deny_tools,
                 "enabled": self.enabled,
                 "preconnect": self.preconnect,
+                "integration": self.integration,
             }
         )
 
@@ -260,6 +264,7 @@ class ServerConfig:
             "connection": connection,
             "enabled": self.enabled,
             "preconnect": self.preconnect,
+            "integration": self.integration,
             "criticality": self.criticality,
             "namespace": self.effective_namespace,
             "allow_tools": self.allow_tools,

@@ -234,6 +234,14 @@ def reload_model_config() -> None:
     global VISION_MODEL_NAME, VISION_BASE_URL, VISION_API_KEY
     global _MAIN_MODEL, _SUMMARY_MODEL, _VISION_MODEL
     global _MODEL_RATE_LIMITER
+    global CONTEXT_COMPACT_ENABLED, CONTEXT_COMPACT_TRIGGER, CONTEXT_COMPACT_HARD
+    global CONTEXT_COMPACT_KEEP, CONTEXT_COMPACT_MIN_ROUNDS
+    global CONTEXT_COMPACT_COOLDOWN, CONTEXT_COMPACT_MAX_DEFER
+    global CONTEXT_COMPACT_TIMEOUT, CONTEXT_COMPACT_EVAL_ENABLED
+    global CONTEXT_COMPACT_EVAL_JUDGE, CONTEXT_COMPACT_HEARTBEAT
+    global CONTEXT_ALERT_THRESHOLD
+    global CONTEXT_AUTOTUNE_ENABLED, CONTEXT_AUTOTUNE_INTERVAL
+    global COMPACTION_SIGNING_KEY
     load_dotenv(PROJECT_ROOT / ".env", override=True)
     _MODEL_RATE_LIMITER = None
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -253,16 +261,59 @@ def reload_model_config() -> None:
     _MAIN_MODEL = None
     _SUMMARY_MODEL = None
     _VISION_MODEL = None
+    # 上下文压缩参数同样支持热更新；重建 Agent 图后新阈值生效。
+    CONTEXT_ALERT_THRESHOLD = float(os.getenv("HARNESS_CONTEXT_ALERT_THRESHOLD", "0.70"))
+    CONTEXT_COMPACT_ENABLED = _env_flag("HARNESS_CONTEXT_COMPACT_ENABLED", True)
+    CONTEXT_COMPACT_TRIGGER = float(os.getenv("HARNESS_CONTEXT_COMPACT_TRIGGER", "0.70"))
+    CONTEXT_COMPACT_HARD = float(os.getenv("HARNESS_CONTEXT_COMPACT_HARD", "0.88"))
+    CONTEXT_COMPACT_KEEP = float(os.getenv("HARNESS_CONTEXT_COMPACT_KEEP", "0.25"))
+    CONTEXT_COMPACT_MIN_ROUNDS = int(os.getenv("HARNESS_CONTEXT_COMPACT_MIN_ROUNDS", "6"))
+    CONTEXT_COMPACT_COOLDOWN = int(os.getenv("HARNESS_CONTEXT_COMPACT_COOLDOWN", "3"))
+    CONTEXT_COMPACT_MAX_DEFER = int(os.getenv("HARNESS_CONTEXT_COMPACT_MAX_DEFER", "3"))
+    CONTEXT_COMPACT_TIMEOUT = int(os.getenv("HARNESS_CONTEXT_COMPACT_TIMEOUT", "60"))
+    CONTEXT_COMPACT_EVAL_ENABLED = _env_flag("HARNESS_CONTEXT_COMPACT_EVAL_ENABLED", True)
+    CONTEXT_COMPACT_EVAL_JUDGE = _env_flag("HARNESS_CONTEXT_EVAL_JUDGE", False)
+    CONTEXT_COMPACT_HEARTBEAT = int(os.getenv("HARNESS_CONTEXT_COMPACT_HEARTBEAT", "5"))
+    CONTEXT_AUTOTUNE_ENABLED = _env_flag("HARNESS_CONTEXT_AUTOTUNE_ENABLED", True)
+    CONTEXT_AUTOTUNE_INTERVAL = int(os.getenv("HARNESS_CONTEXT_AUTOTUNE_INTERVAL", "20"))
+    COMPACTION_SIGNING_KEY = os.getenv("HARNESS_COMPACTION_SIGNING_KEY", "")
 
 
 # ============================================================
 # 上下文窗口监控与轨迹记录
 # ============================================================
-# 模型上下文窗口上限（tokens）。只用于监控和占比展示，不影响模型调用本身；
-# 不同模型可按需通过环境变量覆盖。
+# 模型上下文窗口上限（tokens）。既是展示口径，也是压缩判定分母；
+# 不同模型可通过环境变量覆盖。
 MODEL_CONTEXT_LIMIT = int(os.getenv("HARNESS_MODEL_CONTEXT_LIMIT", "128000"))
-# 上下文占用告警阈值（0~1）；只写日志，不改变 Agent 状态。
-CONTEXT_ALERT_THRESHOLD = float(os.getenv("HARNESS_CONTEXT_ALERT_THRESHOLD", "0.82"))
+# 上下文占用告警阈值（0~1）；与软水位对齐，只写日志，不改变 Agent 状态。
+CONTEXT_ALERT_THRESHOLD = float(os.getenv("HARNESS_CONTEXT_ALERT_THRESHOLD", "0.70"))
+
+# ---------- 上下文压缩 ----------
+# 是否启用自动压缩；关闭后行为退化为“不压缩”。
+CONTEXT_COMPACT_ENABLED = _env_flag("HARNESS_CONTEXT_COMPACT_ENABLED", True)
+# 软水位 / 硬水位 / 保留预算，均相对可用预算 B = window - reserve。
+CONTEXT_COMPACT_TRIGGER = float(os.getenv("HARNESS_CONTEXT_COMPACT_TRIGGER", "0.70"))
+CONTEXT_COMPACT_HARD = float(os.getenv("HARNESS_CONTEXT_COMPACT_HARD", "0.88"))
+CONTEXT_COMPACT_KEEP = float(os.getenv("HARNESS_CONTEXT_COMPACT_KEEP", "0.25"))
+# 少于该轮次不压缩，避免短会话频繁压缩。
+CONTEXT_COMPACT_MIN_ROUNDS = int(os.getenv("HARNESS_CONTEXT_COMPACT_MIN_ROUNDS", "6"))
+# 距离上次压缩至少间隔的模型调用次数。
+CONTEXT_COMPACT_COOLDOWN = int(os.getenv("HARNESS_CONTEXT_COMPACT_COOLDOWN", "3"))
+# 命中软水位但信号不宜压缩时，最多延迟次数；超过后强制压缩。
+CONTEXT_COMPACT_MAX_DEFER = int(os.getenv("HARNESS_CONTEXT_COMPACT_MAX_DEFER", "3"))
+# 摘要调用超时（秒）。
+CONTEXT_COMPACT_TIMEOUT = int(os.getenv("HARNESS_CONTEXT_COMPACT_TIMEOUT", "60"))
+# 压缩评估开关（v1 为规则评估，零额外模型调用）。
+CONTEXT_COMPACT_EVAL_ENABLED = _env_flag("HARNESS_CONTEXT_COMPACT_EVAL_ENABLED", True)
+# LLM 时机裁判（v1.5）：额外一次摘要模型调用，默认关闭。
+CONTEXT_COMPACT_EVAL_JUDGE = _env_flag("HARNESS_CONTEXT_EVAL_JUDGE", False)
+# 压缩进度心跳间隔（秒），用于长时间摘要期间维持 SSE 活跃与前端断线检测。
+CONTEXT_COMPACT_HEARTBEAT = int(os.getenv("HARNESS_CONTEXT_COMPACT_HEARTBEAT", "5"))
+# v2 评估驱动自动调参：每累计 N 次压缩评估自动小步调整阈值。
+CONTEXT_AUTOTUNE_ENABLED = _env_flag("HARNESS_CONTEXT_AUTOTUNE_ENABLED", True)
+CONTEXT_AUTOTUNE_INTERVAL = int(os.getenv("HARNESS_CONTEXT_AUTOTUNE_INTERVAL", "20"))
+# 压缩回执可选 HMAC 签名密钥；为空时只做 sha256 完整性摘要。
+COMPACTION_SIGNING_KEY = os.getenv("HARNESS_COMPACTION_SIGNING_KEY", "")
 # 轨迹事件中单字段（参数 / 结果 / 模型输出）最大保留字符数，防止 Store 行膨胀。
 TRAJECTORY_MAX_TEXT = int(os.getenv("HARNESS_TRAJECTORY_MAX_TEXT", "4000"))
 # 长期记忆更新是否放到后台执行。同步执行会阻塞本轮 done（多一次模型调用）。
@@ -478,6 +529,37 @@ MCP_CONFIG_PATH = Path(
     or MCP_ROOT / "servers.json"
 )
 
+
+def _rag_root() -> Path:
+    """RAG Provider 注册表目录。
+
+    集成模式下 Harness 不落知识原文与向量，只保存 Provider 的连接配置；
+    源码模式跟随项目 ``rag/``，打包后跟随用户数据目录。
+    """
+    override = (os.getenv("HARNESS_RAG_ROOT") or "").strip()
+    if override:
+        root = Path(override).expanduser()
+    else:
+        frozen = bool(getattr(sys, "frozen", False))
+        root = (USER_DATA_DIR / "rag") if frozen else (PROJECT_ROOT / "rag")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        fallback = Path(tempfile.gettempdir()) / "CommonHarness" / "rag"
+        fallback.mkdir(parents=True, exist_ok=True)
+        logger.warning(
+            "RAG 目录创建失败，已回退到 %s（%s）", fallback, type(error).__name__
+        )
+        root = fallback
+    return root.resolve()
+
+
+RAG_ROOT = _rag_root()
+RAG_CONFIG_PATH = Path(
+    (os.getenv("HARNESS_RAG_CONFIG_PATH") or "").strip()
+    or RAG_ROOT / "providers.json"
+)
+
 _MCP_WORKSPACE_ROOT: Path | None = None
 
 
@@ -679,3 +761,62 @@ async def close_async_persistence(store: Any, checkpointer: Any) -> None:
         await checkpointer.conn.close()
     finally:
         await store.conn.close()
+
+
+# ============================================================
+# Agent 自我迭代与演进
+# ============================================================
+# 所有演进模块默认开启，作为系统底层规则引擎运行。
+# 环境变量只用于关闭某个模块做效果对比、排障或成本控制。
+EVOLUTION_ENABLED = _env_flag("HARNESS_EVOLUTION_ENABLED", True)
+EVOLUTION_MODE = os.getenv("HARNESS_EVOLUTION_MODE", "auto_low_risk")
+
+EVOLUTION_TRAJECTORY_ENABLED = _env_flag("HARNESS_EVOLUTION_TRAJECTORY", True)
+EVOLUTION_REDACTION_ENABLED = _env_flag("HARNESS_EVOLUTION_REDACTION", True)
+EVOLUTION_REWARD_ENABLED = _env_flag("HARNESS_EVOLUTION_REWARD", True)
+EVOLUTION_TOOL_HEALTH_ENABLED = _env_flag("HARNESS_EVOLUTION_TOOL_HEALTH", True)
+EVOLUTION_EXPERIENCE_ENABLED = _env_flag("HARNESS_EVOLUTION_EXPERIENCE", True)
+EVOLUTION_EXPERIENCE_INJECTION_ENABLED = _env_flag(
+    "HARNESS_EVOLUTION_EXPERIENCE_INJECTION", True
+)
+EVOLUTION_JUDGE_ENABLED = _env_flag("HARNESS_EVOLUTION_JUDGE", True)
+EVOLUTION_ATTRIBUTION_ENABLED = _env_flag("HARNESS_EVOLUTION_ATTRIBUTION", True)
+EVOLUTION_CONTROL_PLANE_ENABLED = _env_flag(
+    "HARNESS_EVOLUTION_CONTROL_PLANE", True
+)
+EVOLUTION_SHARING_ENABLED = _env_flag("HARNESS_EVOLUTION_SHARING", True)
+
+EVOLUTION_REPLAY_TIER = os.getenv("HARNESS_EVOLUTION_REPLAY_TIER", "approx")
+EVOLUTION_KEEP_REASONING = _env_flag("HARNESS_EVOLUTION_KEEP_REASONING", False)
+EVOLUTION_EXPERIENCE_MAX_ITEMS = int(
+    os.getenv("HARNESS_EVOLUTION_EXPERIENCE_MAX_ITEMS", "200")
+)
+EVOLUTION_EXPERIENCE_MIN_UTILITY = float(
+    os.getenv("HARNESS_EVOLUTION_EXPERIENCE_MIN_UTILITY", "0.2")
+)
+EVOLUTION_EXPERIENCE_TTL_DAYS = int(
+    os.getenv("HARNESS_EVOLUTION_EXPERIENCE_TTL_DAYS", "90")
+)
+EVOLUTION_EXPERIENCE_INJECT_LIMIT = int(
+    os.getenv("HARNESS_EVOLUTION_EXPERIENCE_INJECT_LIMIT", "3")
+)
+EVOLUTION_JUDGE_RISK_TIER = os.getenv("HARNESS_EVOLUTION_JUDGE_RISK_TIER", "t1")
+EVOLUTION_VERIFIER_TIMEOUT = int(
+    os.getenv("HARNESS_EVOLUTION_VERIFIER_TIMEOUT", "30")
+)
+EVOLUTION_REWARD_SAMPLE_RATE = float(
+    os.getenv("HARNESS_EVOLUTION_REWARD_SAMPLE_RATE", "1.0")
+)
+EVOLUTION_TOOL_HEALTH_MIN_SAMPLES = int(
+    os.getenv("HARNESS_EVOLUTION_TOOL_HEALTH_MIN_SAMPLES", "20")
+)
+EVOLUTION_CONTROL_MIN_SAMPLES = int(
+    os.getenv("HARNESS_EVOLUTION_CONTROL_MIN_SAMPLES", "3")
+)
+EVOLUTION_SHADOW_RATE = float(os.getenv("HARNESS_EVOLUTION_SHADOW_RATE", "0.05"))
+EVOLUTION_CANARY_RATE = float(os.getenv("HARNESS_EVOLUTION_CANARY_RATE", "0.05"))
+EVOLUTION_REQUIRE_HUMAN_APPROVAL = _env_flag(
+    "HARNESS_EVOLUTION_REQUIRE_HUMAN_APPROVAL", True
+)
+EVOLUTION_BUILD_VERSION = os.getenv("HARNESS_BUILD_VERSION", "dev")
+EVOLUTION_TENANT_ID = (os.getenv("HARNESS_TENANT_ID") or "").strip()

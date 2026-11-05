@@ -61,6 +61,20 @@ export async function deleteContextFile(id: string, userId: string): Promise<voi
   }).catch(() => undefined)
 }
 
+// 恢复草稿时校验附件是否仍然有效；失效 ID 单独返回，便于提示用户。
+export async function resolveContextFiles(
+  ids: string[],
+  userId: string,
+): Promise<{ files: ContextFile[]; missing: string[] }> {
+  const res = await fetch(`${API_BASE}/context/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, ids }),
+  })
+  if (!res.ok) throw new Error(`校验附件失败: HTTP ${res.status}`)
+  return (await res.json()) as { files: ContextFile[]; missing: string[] }
+}
+
 // 抓取公网链接并转成上下文附件（后端会做内网/大小校验）
 export async function importContextUrl(url: string, userId: string): Promise<ContextFile> {
   const res = await fetch(`${API_BASE}/context/url`, {

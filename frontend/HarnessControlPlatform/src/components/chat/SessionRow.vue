@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 单条会话行：置顶标记 / 运行状态 / 重命名 / 删除
-import { nextTick, ref } from 'vue'
+// 单条会话行：置顶标记 / 运行状态 / 更多操作（置顶、重命名、归档、删除）
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { SessionItem } from '@/stores/sessions'
 
@@ -20,11 +20,49 @@ const emit = defineEmits<{
   rename: [threadId: string, title: string]
   remove: [threadId: string]
   pin: [threadId: string, pinned: boolean]
+  archive: [threadId: string]
 }>()
 
 const editing = ref(false)
 const editTitle = ref('')
 const inputEl = ref<HTMLInputElement | null>(null)
+
+// 「更多」菜单挂在 body 上，避免被侧边栏滚动容器裁切。
+interface MenuPosition {
+  top?: number
+  bottom?: number
+  right: number
+}
+const menu = ref<MenuPosition | null>(null)
+
+function toggleMenu(event: MouseEvent) {
+  if (menu.value) {
+    menu.value = null
+    return
+  }
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  const right = Math.max(window.innerWidth - rect.right, 8)
+  // 下方空间不足时向上展开，避免菜单落到底部被视口截断。
+  const openUp = window.innerHeight - rect.bottom < 184
+  menu.value = openUp
+    ? { bottom: window.innerHeight - rect.top + 4, right }
+    : { top: rect.bottom + 4, right }
+}
+
+function closeMenu() {
+  menu.value = null
+}
+
+onMounted(() => {
+  // 捕获阶段监听可以收到侧边栏内部的滚动事件。
+  window.addEventListener('scroll', closeMenu, true)
+  window.addEventListener('resize', closeMenu)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('scroll', closeMenu, true)
+  window.removeEventListener('resize', closeMenu)
+})
 
 function fmtTime(iso: string) {
   try {
@@ -56,6 +94,26 @@ function commitRename() {
   }
 }
 
+function chooseRename() {
+  closeMenu()
+  void startRename()
+}
+
+function choosePin() {
+  closeMenu()
+  emit('pin', props.session.thread_id, !props.session.pinned)
+}
+
+function chooseArchive() {
+  closeMenu()
+  emit('archive', props.session.thread_id)
+}
+
+function chooseRemove() {
+  closeMenu()
+  emit('remove', props.session.thread_id)
+}
+
 </script>
 
 <template>
@@ -65,6 +123,7 @@ function commitRename() {
       active: props.active,
       running: props.running && !props.active,
       indent: props.indent,
+      'menu-open': Boolean(menu),
     }"
     role="button"
     tabindex="0"
@@ -95,26 +154,47 @@ function commitRename() {
 
     <div class="actions">
       <button
-        class="act"
+        class="more"
         type="button"
-        :class="{ pinned: props.session.pinned }"
-        :title="props.session.pinned ? '取消置顶' : '置顶'"
-        @click.stop="emit('pin', props.session.thread_id, !props.session.pinned)"
+        title="更多操作"
+        aria-haspopup="menu"
+        @click.stop="toggleMenu($event)"
       >
-        <AppIcon :name="props.session.pinned ? 'unpin' : 'pin'" :size="10" />
-      </button>
-      <button class="act" type="button" title="重命名" @click.stop="startRename">
-        <AppIcon name="edit" :size="10" />
-      </button>
-      <button
-        class="act del"
-        type="button"
-        title="删除"
-        @click.stop="emit('remove', props.session.thread_id)"
-      >
-        <AppIcon name="close" :size="10" />
+        <AppIcon name="more" :size="18" />
       </button>
     </div>
+
+    <Teleport to="body">
+      <div v-if="menu" class="row-menu-mask" @click.stop="closeMenu"></div>
+      <div
+        v-if="menu"
+        class="row-menu"
+        role="menu"
+        :style="{
+          top: menu.top === undefined ? undefined : `${menu.top}px`,
+          bottom: menu.bottom === undefined ? undefined : `${menu.bottom}px`,
+          right: `${menu.right}px`,
+        }"
+        @click.stop
+      >
+        <button type="button" role="menuitem" @click="choosePin">
+          <AppIcon :name="props.session.pinned ? 'unpin' : 'pin'" :size="12" />
+          <span>{{ props.session.pinned ? '取消置顶' : '置顶' }}</span>
+        </button>
+        <button type="button" role="menuitem" @click="chooseRename">
+          <AppIcon name="edit" :size="12" />
+          <span>重命名</span>
+        </button>
+        <button type="button" role="menuitem" @click="chooseArchive">
+          <AppIcon name="archive" :size="12" />
+          <span>归档</span>
+        </button>
+        <button type="button" role="menuitem" class="danger" @click="chooseRemove">
+          <AppIcon name="trash" :size="12" />
+          <span>删除</span>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -201,14 +281,13 @@ function commitRename() {
 
 .actions {
   position: absolute;
-  right: 4px;
-  top: 50%;
+  right: 2px;
+  top: 1px;
+  bottom: 1px;
   display: flex;
-  align-items: center;
-  gap: 1px;
-  padding-left: 14px;
-  transform: translateY(-50%);
-  background: linear-gradient(90deg, transparent, var(--bg-panel) 28%);
+  align-items: stretch;
+  padding-left: 10px;
+  background: linear-gradient(90deg, transparent, var(--bg-panel) 32%);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease;
@@ -216,6 +295,7 @@ function commitRename() {
 
 .srow:hover .actions,
 .srow.active .actions,
+.srow.menu-open .actions,
 .srow:focus-within .actions {
   opacity: 1;
   pointer-events: auto;
@@ -223,15 +303,17 @@ function commitRename() {
 
 .srow:hover .time,
 .srow.active .time,
+.srow.menu-open .time,
 .srow:focus-within .time {
   opacity: 0;
 }
 
-.act {
+/* 更多按钮：上下各留 1px，尽量撑满行高，让图标更大更醒目 */
+.more {
   display: grid;
   place-items: center;
-  width: 20px;
-  height: 20px;
+  width: 26px;
+  margin: 1px 0;
   padding: 0;
   color: var(--text-3);
   border: 0;
@@ -239,17 +321,70 @@ function commitRename() {
   background: transparent;
 }
 
-.act:hover {
+.more:hover {
   color: var(--accent-cyan);
   background: var(--bg-hover);
 }
 
-.act.pinned {
+.more :deep(svg) {
+  width: 18px;
+  height: 18px;
+}
+
+/* 更多操作菜单：Teleport 到 body，避免被侧边栏滚动容器裁切 */
+.row-menu-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 74;
+}
+
+.row-menu {
+  position: fixed;
+  z-index: 75;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 136px;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: 0 8px 24px rgba(2, 6, 14, 0.5);
+}
+
+.row-menu button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 11px;
+  text-align: left;
+  color: var(--text-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+}
+
+.row-menu button:hover {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+.row-menu button :deep(svg) {
+  flex: none;
   color: var(--accent-cyan);
 }
 
-.del:hover {
+.row-menu button.danger {
   color: var(--danger);
+}
+
+.row-menu button.danger :deep(svg) {
+  color: var(--danger);
+}
+
+.row-menu button.danger:hover {
   background: rgba(226, 96, 94, 0.12);
 }
 

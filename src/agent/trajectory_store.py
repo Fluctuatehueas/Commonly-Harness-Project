@@ -70,6 +70,39 @@ async def append_trajectory_event(
         )
 
 
+async def update_trajectory_event(
+    store: Any,
+    *,
+    user_id: str,
+    thread_id: str,
+    event: dict[str, Any],
+) -> None:
+    """按同一 key 覆盖已有轨迹事件（用于补写异步评估结果）。"""
+    if store is None or not user_id or not thread_id:
+        return
+    event_id = str(event.get("id") or "")
+    run_id = str(event.get("run_id", ""))
+    started_at = str(event.get("start", ""))
+    if not event_id:
+        return
+    key = f"{run_id}:{started_at}:{event_id}"
+    try:
+        await store.aput(
+            trajectory_namespace(user_id, thread_id),
+            key,
+            dict(event),
+            index=False,
+        )
+    except Exception:
+        logger.warning(
+            "更新轨迹事件失败：user=%s thread=%s type=%s",
+            user_id,
+            thread_id,
+            event.get("type"),
+            exc_info=True,
+        )
+
+
 async def list_trajectory_events(
     store: Any,
     *,

@@ -4,12 +4,18 @@ import { onMounted, reactive, ref } from 'vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import UiSwitch from '@/components/console/UiSwitch.vue'
+import InfoHint from '@/components/common/InfoHint.vue'
 import { useDisplayStore } from '@/stores/display'
 import { useSettingsStore } from '@/stores/settings'
 import {
   checkSandboxPort,
+  fetchArchiveSettings,
+  fetchContextSettings,
   fetchSandboxSettings,
+  updateArchiveSettings,
+  updateContextSettings,
   updateSandboxSettings,
+  type ContextSettings,
   type LocalEnvironment,
   type SandboxSettings,
   type StoragePaths,
@@ -133,9 +139,128 @@ function clearApiKey() {
   if (clearKey.value) form.apiKey = ''
 }
 
+// ---------- 上下文压缩 ----------
+const ctx = ref<ContextSettings | null>(null)
+const ctxLoading = ref(true)
+const ctxSaving = ref(false)
+const ctxError = ref('')
+const ctxMessage = ref('')
+const ctxForm = reactive({
+  enabled: true,
+  trigger: 0.7,
+  hard: 0.88,
+  keep: 0.25,
+  min_rounds: 6,
+  cooldown: 3,
+  max_defer: 3,
+  timeout_seconds: 60,
+  eval_enabled: true,
+  eval_judge: false,
+  heartbeat_seconds: 5,
+})
+
+function fillContext(data: ContextSettings) {
+  ctx.value = data
+  ctxForm.enabled = data.enabled
+  ctxForm.trigger = data.trigger
+  ctxForm.hard = data.hard
+  ctxForm.keep = data.keep
+  ctxForm.min_rounds = data.min_rounds
+  ctxForm.cooldown = data.cooldown
+  ctxForm.max_defer = data.max_defer
+  ctxForm.timeout_seconds = data.timeout_seconds
+  ctxForm.eval_enabled = data.eval_enabled
+  ctxForm.eval_judge = data.eval_judge
+  ctxForm.heartbeat_seconds = data.heartbeat_seconds
+}
+
+async function loadContext() {
+  ctxLoading.value = true
+  ctxError.value = ''
+  try {
+    fillContext(await fetchContextSettings())
+  } catch (err) {
+    ctxError.value = (err as Error).message
+  } finally {
+    ctxLoading.value = false
+  }
+}
+
+async function saveContext() {
+  ctxSaving.value = true
+  ctxError.value = ''
+  ctxMessage.value = ''
+  try {
+    fillContext(
+      await updateContextSettings({
+        enabled: ctxForm.enabled,
+        trigger: Number(ctxForm.trigger),
+        hard: Number(ctxForm.hard),
+        keep: Number(ctxForm.keep),
+        min_rounds: Number(ctxForm.min_rounds),
+        cooldown: Number(ctxForm.cooldown),
+        max_defer: Number(ctxForm.max_defer),
+        timeout_seconds: Number(ctxForm.timeout_seconds),
+        eval_enabled: ctxForm.eval_enabled,
+        eval_judge: ctxForm.eval_judge,
+        heartbeat_seconds: Number(ctxForm.heartbeat_seconds),
+      }),
+    )
+    ctxMessage.value = '已写入 .env 并重建 Agent 图，下一轮对话按新阈值生效'
+  } catch (err) {
+    ctxError.value = (err as Error).message
+  } finally {
+    ctxSaving.value = false
+  }
+}
+
+function fmtToken(value?: number): string {
+  return (value || 0).toLocaleString('zh-CN')
+}
+
+// ---------- 会话归档 ----------
+const archiveDays = ref(30)
+const archiveLoading = ref(true)
+const archiveSaving = ref(false)
+const archiveError = ref('')
+const archiveMessage = ref('')
+
+async function loadArchive() {
+  archiveLoading.value = true
+  archiveError.value = ''
+  try {
+    archiveDays.value = (await fetchArchiveSettings()).days
+  } catch (err) {
+    archiveError.value = (err as Error).message
+  } finally {
+    archiveLoading.value = false
+  }
+}
+
+async function saveArchive() {
+  if (archiveSaving.value) return
+  archiveSaving.value = true
+  archiveError.value = ''
+  archiveMessage.value = ''
+  try {
+    const data = await updateArchiveSettings(Number(archiveDays.value))
+    archiveDays.value = data.days
+    archiveMessage.value =
+      data.days === 0
+        ? '已关闭自动归档'
+        : `已设置：${data.days} 天无新记录自动归档`
+  } catch (err) {
+    archiveError.value = (err as Error).message
+  } finally {
+    archiveSaving.value = false
+  }
+}
+
 onMounted(() => {
   void settings.load()
   void loadSandbox()
+  void loadContext()
+  void loadArchive()
 })
 </script>
 
@@ -218,6 +343,148 @@ onMounted(() => {
             <span v-else-if="settings.error">{{ settings.error }}</span>
             <span v-else>保存后会重置已缓存的 Agent 图，下一轮对话立即生效（不会中断正在进行的一轮）。</span>
           </div>
+      </section>
+
+      <!-- 上下文压缩：阈值与评估策略 -->
+      <section class="settings-module">
+        <header class="module-head">
+          <span class="module-icon"><AppIcon name="layers" :size="16" /></span>
+          <div class="module-heading">
+            <h2>上下文压缩</h2>
+            <p>软 / 硬水位、保留预算与评估策略；保存后写入 .env 并重建 Agent 图</p>
+          </div>
+          <button class="ghost-btn" type="button" :disabled="ctxSaving || ctxLoading" @click="saveContext">
+            <AppIcon name="check" :size="12" />
+            {{ ctxSaving ? '保存中…' : '保存压缩配置' }}
+          </button>
+        </header>
+
+        <div v-if="ctxLoading" class="sandbox-loading">正在读取压缩配置…</div>
+        <template v-else>
+          <div v-if="ctx" class="ctx-budget">
+            <span>窗口 <b>{{ fmtToken(ctx.budget.window) }}</b></span>
+            <span>可用 <b>{{ fmtToken(ctx.budget.usable) }}</b></span>
+            <span>软水位 <b>{{ fmtToken(ctx.budget.soft) }}</b></span>
+            <span>硬水位 <b>{{ fmtToken(ctx.budget.hard) }}</b></span>
+            <span>保留 <b>{{ fmtToken(ctx.budget.keep) }}</b></span>
+          </div>
+
+          <div class="sandbox-grid">
+            <label class="field">
+              <span>软水位（相对可用预算）<InfoHint title="软水位" text="上下文用掉一部分后，系统提前开始整理，避免拖到快满才动手。数值越小，整理越早、越频繁；单位是“可用预算”的比例，例如 0.70 表示用到七成时开始整理。" /></span>
+              <input v-model.number="ctxForm.trigger" type="number" step="0.01" min="0.05" max="0.99" />
+            </label>
+            <label class="field">
+              <span>硬水位（强制压缩）<InfoHint title="硬水位" text="上下文到达这个比例时必须整理，即使助手正忙也会执行。应明显高于软水位，留出提前整理的余地。" /></span>
+              <input v-model.number="ctxForm.hard" type="number" step="0.01" min="0.05" max="1" />
+            </label>
+            <label class="field">
+              <span>保留预算<InfoHint title="保留预算" text="整理后至少要原样保留的最近对话比例。留得越多越不容易丢细节，但节省的空间变少；留得太少可能丢掉刚发生的关键信息。" /></span>
+              <input v-model.number="ctxForm.keep" type="number" step="0.01" min="0.05" max="0.99" />
+            </label>
+            <label class="field">
+              <span>首次压缩最少轮次<InfoHint title="首次压缩最少轮次" text="会话至少聊过这么多轮才允许第一次整理，避免刚开始对话就被压缩。整理过一次后不再受此限制。" /></span>
+              <input v-model.number="ctxForm.min_rounds" type="number" min="1" max="100" />
+            </label>
+            <label class="field">
+              <span>冷却（模型调用次数）<InfoHint title="冷却" text="两次整理之间至少间隔多少次模型调用，防止刚整理完又马上再整理、反复折腾上下文。" /></span>
+              <input v-model.number="ctxForm.cooldown" type="number" min="0" max="50" />
+            </label>
+            <label class="field">
+              <span>最大延迟次数<InfoHint title="最大延迟次数" text="助手正处在工具调用链中时可以先推迟整理。这里设置最多能推迟几次，超过就强制执行，保证上下文不会溢出。" /></span>
+              <input v-model.number="ctxForm.max_defer" type="number" min="0" max="20" />
+            </label>
+            <label class="field">
+              <span>摘要超时（秒）<InfoHint title="摘要超时" text="生成摘要的最长等待时间。超时后系统会改用“保留关键信息 + 最近消息”的兜底方案，保证对话能继续。" /></span>
+              <input v-model.number="ctxForm.timeout_seconds" type="number" min="5" max="300" />
+            </label>
+            <label class="field">
+              <span>进度心跳（秒）<InfoHint title="进度心跳" text="整理期间系统每隔多久向页面汇报一次进度。心跳也用于判断连接是否掉线，间隔太大时会误判为断线。" /></span>
+              <input v-model.number="ctxForm.heartbeat_seconds" type="number" min="2" max="60" />
+            </label>
+          </div>
+
+          <ul class="sandbox-switches">
+            <li>
+              <div class="text">
+                <strong>启用自动压缩</strong>
+                <span>关闭后达到水位也不压缩，仅保留监控与手动 compact_conversation</span>
+              </div>
+              <UiSwitch v-model="ctxForm.enabled" />
+            </li>
+            <li>
+              <div class="text">
+                <strong>规则评估</strong>
+                <span>锚点保真、时机标签与成本回执；零额外模型调用</span>
+              </div>
+              <UiSwitch v-model="ctxForm.eval_enabled" />
+            </li>
+            <li>
+              <div class="text">
+                <strong>
+                  LLM 时机裁判
+                  <InfoHint
+                    title="LLM 时机裁判"
+                    text="整理结束后，额外让模型回看这次整理发生得是否合适：结论已收敛算合适，推导中途算过早。结果会写进轨迹，用于后续自动调参。开启后每次整理会多一次模型调用。"
+                    tone="accent"
+                  />
+                </strong>
+                <span>压缩结束后异步调用摘要模型判断时机，额外一次调用，默认关闭</span>
+              </div>
+              <UiSwitch v-model="ctxForm.eval_judge" />
+            </li>
+          </ul>
+
+          <div class="foot" :class="{ warn: Boolean(ctxError) }">
+            <AppIcon :name="ctxError ? 'shield' : 'server'" :size="13" />
+            <span v-if="ctxError">{{ ctxError }}</span>
+            <span v-else-if="ctxMessage">{{ ctxMessage }}</span>
+            <span v-else>修改会重建用户级 Agent 图；正在运行的一轮不受影响，下一轮按新阈值判断。</span>
+          </div>
+        </template>
+      </section>
+
+      <!-- 会话归档：长期无新记录的会话自动归档 -->
+      <section class="settings-module">
+        <header class="module-head">
+          <span class="module-icon"><AppIcon name="archive" :size="16" /></span>
+          <div class="module-heading">
+            <h2>会话归档</h2>
+            <p>超过设定天数没有新记录的会话会在进入对话页时自动归档；归档后不再被 Agent 读取</p>
+          </div>
+          <button
+            class="ghost-btn"
+            type="button"
+            :disabled="archiveSaving || archiveLoading"
+            @click="saveArchive"
+          >
+            <AppIcon name="check" :size="12" />
+            {{ archiveSaving ? '保存中…' : '保存归档设置' }}
+          </button>
+        </header>
+
+        <div v-if="archiveLoading" class="sandbox-loading">正在读取归档配置…</div>
+        <template v-else>
+          <div class="sandbox-grid">
+            <label class="field">
+              <span>
+                自动归档天数
+                <InfoHint
+                  title="自动归档天数"
+                  text="会话超过这么多天没有新记录时，会在你进入对话页的那一刻自动归档。检测只在进入对话页时执行一次，不会在后台常驻计时器。填 0 表示关闭自动归档；置顶会话不会被自动归档。"
+                />
+              </span>
+              <input v-model.number="archiveDays" type="number" min="0" max="3650" />
+            </label>
+          </div>
+
+          <div class="foot" :class="{ warn: Boolean(archiveError) }">
+            <AppIcon :name="archiveError ? 'shield' : 'archive'" :size="13" />
+            <span v-if="archiveError">{{ archiveError }}</span>
+            <span v-else-if="archiveMessage">{{ archiveMessage }}</span>
+            <span v-else>默认 30 天；0 表示关闭。归档会话可在对话页左下角的「归档会话」中恢复或永久删除。</span>
+          </div>
+        </template>
       </section>
 
       <!-- 沙箱服务配置：未配置时给出安全提示 -->
@@ -550,6 +817,32 @@ onMounted(() => {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px 14px;
   padding: 14px 16px 2px;
+}
+
+/* 压缩预算概览 */
+.ctx-budget {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 14px 16px 0;
+}
+
+.ctx-budget span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ctx-budget b {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-1);
 }
 
 .field {
