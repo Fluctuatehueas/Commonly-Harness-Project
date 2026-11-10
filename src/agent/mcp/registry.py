@@ -108,11 +108,14 @@ class MCPProxyTool(BaseTool):
 
 
 def _cache_path(server_id: str) -> Path:
+    """MCP 工具元数据缓存按用户隔离，避免同名服务的工具集串用。"""
+    from agent.identity import current_user_id, safe_user_id
+
     safe = "".join(
         char if char.isalnum() or char in {"_", "-"} else "_"
         for char in server_id
     )
-    return CACHE_ROOT / safe / "tools.json"
+    return CACHE_ROOT / "users" / safe_user_id(current_user_id()) / safe / "tools.json"
 
 
 class ToolRegistry:

@@ -17,12 +17,14 @@ description: |
   不执行业务操作、不编造槽位、不做业务判断、不输出 JSON 以外的内容。
   由主 Agent 在对话入口委派，输出供下游路由 / 执行子 Agent 使用。
 
-# 空列表是合法的：本子 Agent 只依靠提示词完成翻译，不调用业务工具。
-tools: []
+# 空列表是合法的：本子 Agent 主要依靠提示词完成翻译。
+# 置信度不足时必须调用 request_additional_info 向用户追问。
+tools:
+  - request_additional_info
 
-# 硬性只读：在工具层拒绝写类与执行类工具。
-# 不用 permissions：路径级权限拦不住 execute 这类 shell 工具。
-deny_tools: ["write_file", "edit_file", "delete", "execute"]
+# 文件读写工具由 FilesystemMiddleware 自动注入；禁止命令执行。
+# 需要落盘时可以把意图 JSON 写到指定路径，但默认只返回 JSON。
+deny_tools: ["execute"]
 
 # 子 Agent 技能应放在 /skills/subagents/intent_parsing/ 下，
 # 并通过 skill-management 的 assign_skill 分配（需要沙箱）。
@@ -98,9 +100,27 @@ system_prompt: |
   - 当 `need_clarification = false` 时，`clarification_question` 必须为 `null`。
   - `out_of_scope` / `chitchat` / `help` 一律 `need_clarification = false`。
 
+  ## 置信度门禁（硬性，必须执行）
+
+  1. 先按上面的规则内部完成一次解析，得到 `intent`、`slots` 与自评 `confidence`。
+  2. 如果 `confidence < 0.95` 或 `need_clarification = true`，**禁止直接返回结果**，
+     必须调用 `request_additional_info` 向用户提问：
+     - `information_needed`：一句话说明还缺什么、为什么要问；
+     - `context`：把你已经解析出的部分（已识别的意图与槽位）告诉用户，方便补充；
+     - `fields_json`：只对有明确字段名的缺失项使用，例如
+       `[{"name":"target","label":"操作对象","type":"text","required":true}]`；
+       开放式澄清留空即可。
+  3. 收到用户回复后，把回复合入上下文，重新解析并重新计算 `confidence`。
+  4. 只要 `confidence` 仍低于 0.95，就继续调用 `request_additional_info` 追问；
+     每轮只问最关键的一组信息，不要重复问用户已经回答过的内容。
+  5. 只有 `confidence >= 0.95` 且关键槽位齐全时，才输出最终 JSON 交给主 Agent。
+  6. 如果用户明确表示"无法再补充/就按现在这样"，不再追问，但仍要如实返回
+     `confidence` 与 `missing_slots`，让主 Agent 决定是否继续。
+
   ## confidence
 
   `confidence` 是你对 `intent` 判定的**自评置信度**，取值 0~1，保留两位小数。它不参与任何业务判断，仅用于下游决定是否触发澄清或人工复核。无法判断时给 `0.0` 并把 intent 置为 `unknown`。
+  注意：门禁判断使用你内部的真实置信度；最终输出里的 `confidence` 必须是**用户补充之后**的最新值。
 
   ## 输出格式（严格）
 

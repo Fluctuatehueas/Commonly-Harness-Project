@@ -31,7 +31,6 @@ import yaml
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
-from agent.config import DISABLED_SKILLS_ROOT, SKILLS_ROOT
 from agent.tools.skill_tools import (
     MAIN_SKILLS_DIRECTORY,
     SKILL_NAME_PATTERN,
@@ -95,12 +94,28 @@ def _relative_parts(target: str, name: str) -> tuple[str, ...]:
     return (*_target_parts(target), _validate_skill_name(name))
 
 
+def _roots() -> tuple[Path, Path]:
+    """当前用户的（启用, 停用）技能根目录。
+
+    技能库和停用目录都位于 ``USER_DATA_DIR/users/{user_id}/`` 下，
+    不同用户的增删改互不可见。
+    """
+    from agent.identity import current_user_id
+    from agent.user_data import (
+        user_disabled_skills_root,
+        user_skills_root,
+    )
+
+    uid = current_user_id()
+    return user_skills_root(uid), user_disabled_skills_root(uid)
+
+
 def _enabled_path(target: str, name: str) -> Path:
-    return SKILLS_ROOT.joinpath(*_relative_parts(target, name))
+    return _roots()[0].joinpath(*_relative_parts(target, name))
 
 
 def _disabled_path(target: str, name: str) -> Path:
-    return DISABLED_SKILLS_ROOT.joinpath(*_relative_parts(target, name))
+    return _roots()[1].joinpath(*_relative_parts(target, name))
 
 
 def _read_frontmatter(directory: Path) -> dict[str, Any]:
@@ -215,9 +230,10 @@ def _collect(root: Path, enabled: bool) -> list[dict[str, Any]]:
 
 
 def _list_all() -> list[dict[str, Any]]:
-    """合并启用/停用技能；同名同归属以启用版本为准。"""
-    enabled_items = _collect(SKILLS_ROOT, True)
-    disabled_items = _collect(DISABLED_SKILLS_ROOT, False)
+    """合并当前用户的启用/停用技能；同名同归属以启用版本为准。"""
+    root, disabled_root = _roots()
+    enabled_items = _collect(root, True)
+    disabled_items = _collect(disabled_root, False)
     seen = {(item["target"], item["name"]) for item in enabled_items}
     merged = enabled_items + [
         item for item in disabled_items if (item["target"], item["name"]) not in seen
@@ -326,6 +342,8 @@ def _job_public(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _create_job(kind: str, label: str) -> dict[str, Any]:
+    from agent.identity import current_user_id
+
     _prune_jobs()
     job_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
@@ -342,6 +360,8 @@ def _create_job(kind: str, label: str) -> dict[str, Any]:
         "created_at": now,
         "updated_at": now,
         "_updated_ts": time.time(),
+        # 安装任务按用户隔离：任务列表只回传当前用户发起的任务。
+        "_user_id": current_user_id(),
     }
     _INSTALL_JOBS[job_id] = job
     return job
@@ -373,7 +393,7 @@ async def _run_download_job(job_id: str, url: str) -> None:
     """后台执行 URL 技能安装，并把阶段写回任务表。"""
     _update_job(job_id, status="running", stage="downloading", message="正在下载技能包")
     try:
-        installed = await asyncio.to_thread(download_skill, SKILLS_ROOT, url)
+        installed = await asyncio.to_thread(download_skill, _roots()[0], url)
         _update_job(job_id, stage="validating", message="正在校验技能元信息")
         name = str(installed.get("skill_name") or "")
         try:
@@ -402,8 +422,13 @@ async def _run_archive_job(job_id: str, data: bytes, fallback: str) -> None:
     """后台执行 ZIP 技能包安装。"""
     _update_job(job_id, status="running", stage="extracting", message="正在解压技能包")
     try:
+        root, disabled_root = _roots()
         item = await asyncio.to_thread(
-            _install_archive, SKILLS_ROOT, data, fallback_name=fallback
+            _install_archive,
+            root,
+            data,
+            fallback_name=fallback,
+            disabled_root=disabled_root,
         )
         _update_job(job_id, stage="refreshing", message="正在刷新 Agent 技能")
         await _refresh_agents()
@@ -431,10 +456,13 @@ def _start_task(job: dict[str, Any], coroutine: Any) -> None:
 
 @router.get("/jobs")
 async def list_install_jobs() -> dict[str, Any]:
-    """返回最近安装任务，供页面刷新后恢复底部进度卡。"""
+    """返回当前用户最近的安装任务，供页面刷新后恢复底部进度卡。"""
+    from agent.identity import current_user_id
+
     _prune_jobs()
+    uid = current_user_id()
     jobs = sorted(
-        _INSTALL_JOBS.values(),
+        (job for job in _INSTALL_JOBS.values() if job.get("_user_id") == uid),
         key=lambda item: float(item["_updated_ts"]),
         reverse=True,
     )
@@ -443,8 +471,10 @@ async def list_install_jobs() -> dict[str, Any]:
 
 @router.get("/jobs/{job_id}")
 async def get_install_job(job_id: str) -> dict[str, Any]:
+    from agent.identity import current_user_id
+
     job = _INSTALL_JOBS.get(job_id)
-    if job is None:
+    if job is None or job.get("_user_id") != current_user_id():
         raise HTTPException(status_code=404, detail="安装任务不存在或已过期")
     return _job_public(job)
 
@@ -486,11 +516,12 @@ class SkillTargetRequest(BaseModel):
 
 @router.get("/storage")
 async def get_storage() -> dict[str, Any]:
-    """返回技能库真实落盘位置与安装限制，供前端提示用户。"""
+    """返回当前用户技能库真实落盘位置与安装限制。"""
+    root, disabled_root = _roots()
     return {
-        "skills_root": str(SKILLS_ROOT),
-        "main_root": str(SKILLS_ROOT / MAIN_SKILLS_DIRECTORY),
-        "disabled_root": str(DISABLED_SKILLS_ROOT),
+        "skills_root": str(root),
+        "main_root": str(root / MAIN_SKILLS_DIRECTORY),
+        "disabled_root": str(disabled_root),
         "max_package_mb": MAX_PACKAGE_BYTES // (1024 * 1024),
     }
 
@@ -649,8 +680,14 @@ async def create_skill(body: SkillCreateRequest) -> dict[str, Any]:
     return _item(MAIN_SKILLS_DIRECTORY, name, directory, True)
 
 
-def _install_archive(skills_root: Path, data: bytes, *, fallback_name: str) -> dict[str, Any]:
-    """校验、解压并安装一个 ZIP 技能包到主 Agent 目录。"""
+def _install_archive(
+    skills_root: Path,
+    data: bytes,
+    *,
+    fallback_name: str,
+    disabled_root: Path | None = None,
+) -> dict[str, Any]:
+    """校验、解压并安装一个 ZIP 技能包到当前用户的主 Agent 目录。"""
     main_directory = skills_root / MAIN_SKILLS_DIRECTORY
     main_directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=main_directory) as temporary_name:
@@ -667,7 +704,8 @@ def _install_archive(skills_root: Path, data: bytes, *, fallback_name: str) -> d
         metadata = parse_skill_metadata(source_directory)
         name = _safe_skill_name(str(metadata.get("name") or fallback_name))
         target_directory = main_directory / name
-        if target_directory.exists() or (DISABLED_SKILLS_ROOT / MAIN_SKILLS_DIRECTORY / name).exists():
+        disabled_root = disabled_root or _roots()[1]
+        if target_directory.exists() or (disabled_root / MAIN_SKILLS_DIRECTORY / name).exists():
             raise HTTPException(status_code=409, detail=f"技能 '{name}' 已存在")
         shutil.move(str(source_directory), str(target_directory))
         return _item(

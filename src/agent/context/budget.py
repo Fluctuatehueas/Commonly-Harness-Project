@@ -59,13 +59,24 @@ def build_budget(window: int | None = None) -> ContextBudget:
     输出预留 ``R = max(8000, 0.12 * window)``，剩余为可用预算 ``B``；
     soft/hard/keep 均是相对 ``B`` 的比例。比例非法时回退文档默认值。
     """
-    limit = max(int(window or config.MODEL_CONTEXT_LIMIT), 1)
+    # 预算跟随当前用户的模型窗口与压缩阈值，避免不同用户互相影响。
+    try:
+        from agent.identity import current_user_id
+        from agent.user_data import context_settings, model_settings
+
+        uid = current_user_id()
+        user_context = context_settings(uid)
+        user_window = model_settings(uid)["context_limit"]
+    except Exception:  # noqa: BLE001 - 配置不可用时退回部署默认值
+        user_context = {}
+        user_window = config.MODEL_CONTEXT_LIMIT
+    limit = max(int(window or user_window or config.MODEL_CONTEXT_LIMIT), 1)
     reserve = max(8000, int(limit * 0.12))
     usable = max(limit - reserve, 1)
 
-    trigger = _ratio(config.CONTEXT_COMPACT_TRIGGER, 0.70)
-    hard = _ratio(config.CONTEXT_COMPACT_HARD, 0.88)
-    keep = _ratio(config.CONTEXT_COMPACT_KEEP, 0.25)
+    trigger = _ratio(user_context.get("trigger", config.CONTEXT_COMPACT_TRIGGER), 0.70)
+    hard = _ratio(user_context.get("hard", config.CONTEXT_COMPACT_HARD), 0.88)
+    keep = _ratio(user_context.get("keep", config.CONTEXT_COMPACT_KEEP), 0.25)
     # 保证 keep < trigger < hard，否则压缩后仍可能超预算。
     if not keep < trigger:
         keep = 0.25

@@ -88,11 +88,30 @@ class ExperienceInjectionMiddleware(AgentMiddleware):
             return await handler(request)
 
         try:
+            import json
+
             setattr(context, "evolution_experience_injected", True)
             setattr(
                 context,
                 "evolution_experience_ids",
                 ",".join(record.experience_id for record in records),
+            )
+            # 前端只在轨迹顶部渲染命中标签；该字段不写入轨迹存储。
+            setattr(
+                context,
+                "evolution_experience_items",
+                json.dumps(
+                    [
+                        {
+                            "id": record.experience_id,
+                            # 经验条目没有单独名称字段，用触发场景作为展示名。
+                            "name": (record.trigger or record.rule)[:40],
+                            "rule": record.rule[:200],
+                        }
+                        for record in records
+                    ],
+                    ensure_ascii=False,
+                ),
             )
         except Exception:
             pass

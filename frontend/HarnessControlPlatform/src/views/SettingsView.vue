@@ -1,9 +1,27 @@
 <script setup lang="ts">
 // 系统设置：对话展示控制 + 后端运行参数（思考 / 联网搜索）+ 沙箱服务配置
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, type Component } from 'vue'
+import { ElMessage } from 'element-plus'
+import {
+  ArrowRight,
+  Avatar,
+  ChatDotRound,
+  Check,
+  Clock,
+  Connection,
+  Cpu,
+  Folder,
+  FolderOpened,
+  Lock,
+  MagicStick,
+  Monitor,
+  Operation,
+  Reading,
+  Tools,
+  View,
+  Warning,
+} from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
-import AppIcon from '@/components/console/AppIcon.vue'
-import UiSwitch from '@/components/console/UiSwitch.vue'
 import InfoHint from '@/components/common/InfoHint.vue'
 import { useDisplayStore } from '@/stores/display'
 import { useSettingsStore } from '@/stores/settings'
@@ -24,6 +42,17 @@ import type { IconName } from '@/components/console/icons'
 
 const display = useDisplayStore()
 const settings = useSettingsStore()
+
+// 展示项图标：项目独有图标改用 Element Plus 图标
+const ROW_ICONS: Partial<Record<IconName, Component>> = {
+  sparkles: MagicStick,
+  wrench: Tools,
+  book: Reading,
+  bot: Avatar,
+  clock: Clock,
+  eye: View,
+  message: ChatDotRound,
+}
 
 interface Row {
   key: keyof ReturnType<typeof useDisplayStore>['prefs']
@@ -50,17 +79,16 @@ const sandboxLoading = ref(true)
 const sandboxSaving = ref(false)
 const sandboxChecking = ref(false)
 const sandboxError = ref('')
-const sandboxMessage = ref('')
 const showRuntimes = ref(false)
 const clearKey = ref(false)
 
 const form = reactive({
   host: '127.0.0.1',
-  port: 18083,
+  port: 18083 as number | undefined,
   apiKey: '',
   image: 'myagent-sandbox:1',
-  defaultTimeout: 120,
-  lifetime: 86400,
+  defaultTimeout: 120 as number | undefined,
+  lifetime: 86400 as number | undefined,
   prewarm: true,
   useServerProxy: true,
 })
@@ -92,7 +120,6 @@ async function saveSandbox() {
   if (sandboxSaving.value) return
   sandboxSaving.value = true
   sandboxError.value = ''
-  sandboxMessage.value = ''
   try {
     await updateSandboxSettings({
       host: form.host.trim(),
@@ -106,7 +133,7 @@ async function saveSandbox() {
       use_server_proxy: form.useServerProxy,
     })
     clearKey.value = false
-    sandboxMessage.value = '沙箱配置已保存并重建管理器，下一轮对话生效。'
+    ElMessage.success('沙箱配置已保存并重建管理器，下一轮对话生效。')
     await loadSandbox()
   } catch (err) {
     sandboxError.value = (err as Error).message
@@ -119,11 +146,10 @@ async function checkPort() {
   if (sandboxChecking.value) return
   sandboxChecking.value = true
   sandboxError.value = ''
-  sandboxMessage.value = ''
   try {
     const result = await checkSandboxPort(form.host.trim(), Number(form.port))
     if (result.reachable) {
-      sandboxMessage.value = result.message
+      ElMessage.success(result.message)
     } else {
       sandboxError.value = result.message
     }
@@ -144,19 +170,18 @@ const ctx = ref<ContextSettings | null>(null)
 const ctxLoading = ref(true)
 const ctxSaving = ref(false)
 const ctxError = ref('')
-const ctxMessage = ref('')
 const ctxForm = reactive({
   enabled: true,
-  trigger: 0.7,
-  hard: 0.88,
-  keep: 0.25,
-  min_rounds: 6,
-  cooldown: 3,
-  max_defer: 3,
-  timeout_seconds: 60,
+  trigger: 0.7 as number | undefined,
+  hard: 0.88 as number | undefined,
+  keep: 0.25 as number | undefined,
+  min_rounds: 6 as number | undefined,
+  cooldown: 3 as number | undefined,
+  max_defer: 3 as number | undefined,
+  timeout_seconds: 60 as number | undefined,
   eval_enabled: true,
   eval_judge: false,
-  heartbeat_seconds: 5,
+  heartbeat_seconds: 5 as number | undefined,
 })
 
 function fillContext(data: ContextSettings) {
@@ -189,7 +214,6 @@ async function loadContext() {
 async function saveContext() {
   ctxSaving.value = true
   ctxError.value = ''
-  ctxMessage.value = ''
   try {
     fillContext(
       await updateContextSettings({
@@ -206,7 +230,7 @@ async function saveContext() {
         heartbeat_seconds: Number(ctxForm.heartbeat_seconds),
       }),
     )
-    ctxMessage.value = '已写入 .env 并重建 Agent 图，下一轮对话按新阈值生效'
+    ElMessage.success('已保存到当前用户配置并重建 Agent 图，下一轮对话按新阈值生效')
   } catch (err) {
     ctxError.value = (err as Error).message
   } finally {
@@ -219,11 +243,10 @@ function fmtToken(value?: number): string {
 }
 
 // ---------- 会话归档 ----------
-const archiveDays = ref(30)
+const archiveDays = ref<number | undefined>(30)
 const archiveLoading = ref(true)
 const archiveSaving = ref(false)
 const archiveError = ref('')
-const archiveMessage = ref('')
 
 async function loadArchive() {
   archiveLoading.value = true
@@ -241,14 +264,12 @@ async function saveArchive() {
   if (archiveSaving.value) return
   archiveSaving.value = true
   archiveError.value = ''
-  archiveMessage.value = ''
   try {
     const data = await updateArchiveSettings(Number(archiveDays.value))
     archiveDays.value = data.days
-    archiveMessage.value =
-      data.days === 0
-        ? '已关闭自动归档'
-        : `已设置：${data.days} 天无新记录自动归档`
+    ElMessage.success(
+      data.days === 0 ? '已关闭自动归档' : `已设置：${data.days} 天无新记录自动归档`,
+    )
   } catch (err) {
     archiveError.value = (err as Error).message
   } finally {
@@ -276,90 +297,106 @@ onMounted(() => {
 
       <section class="settings-module">
         <header class="module-head">
-          <span class="module-icon"><AppIcon name="sliders" :size="16" /></span>
+          <span class="module-icon"><el-icon><ChatDotRound /></el-icon></span>
           <div class="module-heading">
             <h2>对话控制</h2>
             <p>配置对话页轨迹树的可见内容</p>
           </div>
-          <button class="reset" type="button" @click="display.reset()">恢复默认</button>
+          <el-button size="small" @click="display.reset()">恢复默认</el-button>
         </header>
 
-          <ul class="rows">
-            <li v-for="row in ROWS" :key="String(row.key)">
-              <span class="icon"><AppIcon :name="row.icon" :size="15" /></span>
-              <div class="text">
-                <strong>{{ row.label }}</strong>
-                <span>{{ row.desc }}</span>
-              </div>
-              <UiSwitch v-model="display.prefs[row.key]" />
-            </li>
-          </ul>
+        <ul class="rows">
+          <li v-for="row in ROWS" :key="String(row.key)">
+            <el-icon class="icon"><component :is="ROW_ICONS[row.icon] || ChatDotRound" /></el-icon>
+            <span class="text">
+              <strong>{{ row.label }}</strong>
+              <span>{{ row.desc }}</span>
+            </span>
+            <el-switch
+              :model-value="display.prefs[row.key]"
+              @update:model-value="
+                (v: string | number | boolean) => (display.prefs[row.key] = Boolean(v))
+              "
+            />
+          </li>
+        </ul>
 
-          <div class="foot">
-            <AppIcon name="shield" :size="13" />
-            展示设置保存在浏览器本地（localStorage），仅影响当前控制台，不改变 Agent 的执行行为。
-          </div>
+        <div class="foot">
+          <el-icon><Lock /></el-icon>
+          展示设置保存在浏览器本地（localStorage），仅影响当前控制台，不改变 Agent 的执行行为。
+        </div>
       </section>
 
       <section class="settings-module">
         <header class="module-head">
-          <span class="module-icon"><AppIcon name="cpu" :size="16" /></span>
+          <span class="module-icon"><el-icon><Cpu /></el-icon></span>
           <div class="module-heading">
             <h2>对话运行参数</h2>
-            <p>写入后端 .env 并热更新</p>
+            <p>按当前用户保存并热更新</p>
           </div>
         </header>
 
-          <ul class="rows">
-            <li>
-              <span class="icon"><AppIcon name="sparkles" :size="15" /></span>
-              <div class="text">
-                <strong>思考模式</strong>
-                <span>开启后模型返回推理内容（reasoning_content），轨迹树会流式展示</span>
-              </div>
-              <UiSwitch
-                :model-value="settings.thinking"
-                :disabled="settings.saving || settings.online === false"
-                @update:model-value="settings.setThinking"
-              />
-            </li>
-            <li>
-              <span class="icon"><AppIcon name="globe" :size="15" /></span>
-              <div class="text">
-                <strong>联网搜索</strong>
-                <span>开启后 Agent 绑定 search_web / fetch_web；关闭后不再下发搜索工具</span>
-              </div>
-              <UiSwitch
-                :model-value="settings.webSearch"
-                :disabled="settings.saving || settings.online === false"
-                @update:model-value="settings.setWebSearch"
-              />
-            </li>
-          </ul>
+        <ul class="rows">
+          <li>
+            <el-icon class="icon"><MagicStick /></el-icon>
+            <span class="text">
+              <strong>思考模式</strong>
+              <span>开启后模型返回推理内容（reasoning_content），轨迹树会流式展示</span>
+            </span>
+            <el-switch
+              :model-value="settings.thinking"
+              :disabled="settings.saving || settings.online === false"
+              @update:model-value="(v: string | number | boolean) => settings.setThinking(Boolean(v))"
+            />
+          </li>
+          <li>
+            <el-icon class="icon"><Connection /></el-icon>
+            <span class="text">
+              <strong>联网搜索</strong>
+              <span>开启后 Agent 绑定 search_web / fetch_web；关闭后不再下发搜索工具</span>
+            </span>
+            <el-switch
+              :model-value="settings.webSearch"
+              :disabled="settings.saving || settings.online === false"
+              @update:model-value="(v: string | number | boolean) => settings.setWebSearch(Boolean(v))"
+            />
+          </li>
+        </ul>
 
-          <div class="foot" :class="{ warn: settings.online === false || settings.error }">
-            <AppIcon :name="settings.online === false ? 'shield' : 'server'" :size="13" />
-            <span v-if="settings.online === false">后端不可达：参数开关暂时不可写，请先启动 FastAPI。</span>
-            <span v-else-if="settings.error">{{ settings.error }}</span>
-            <span v-else>保存后会重置已缓存的 Agent 图，下一轮对话立即生效（不会中断正在进行的一轮）。</span>
-          </div>
+        <div class="foot" :class="{ warn: settings.online === false || Boolean(settings.error) }">
+          <el-icon>
+            <Warning v-if="settings.online === false || settings.error" />
+            <Monitor v-else />
+          </el-icon>
+          <span v-if="settings.online === false">后端不可达：参数开关暂时不可写，请先启动 FastAPI。</span>
+          <span v-else-if="settings.error">{{ settings.error }}</span>
+          <span v-else>保存后会重置已缓存的 Agent 图，下一轮对话立即生效（不会中断正在进行的一轮）。</span>
+        </div>
       </section>
 
       <!-- 上下文压缩：阈值与评估策略 -->
       <section class="settings-module">
         <header class="module-head">
-          <span class="module-icon"><AppIcon name="layers" :size="16" /></span>
+          <span class="module-icon"><el-icon><Operation /></el-icon></span>
           <div class="module-heading">
             <h2>上下文压缩</h2>
-            <p>软 / 硬水位、保留预算与评估策略；保存后写入 .env 并重建 Agent 图</p>
+            <p>软 / 硬水位、保留预算与评估策略；保存到当前用户并重建 Agent 图</p>
           </div>
-          <button class="ghost-btn" type="button" :disabled="ctxSaving || ctxLoading" @click="saveContext">
-            <AppIcon name="check" :size="12" />
+          <el-button
+            type="primary"
+            size="small"
+            :icon="Check"
+            :loading="ctxSaving"
+            :disabled="ctxLoading"
+            @click="saveContext"
+          >
             {{ ctxSaving ? '保存中…' : '保存压缩配置' }}
-          </button>
+          </el-button>
         </header>
 
-        <div v-if="ctxLoading" class="sandbox-loading">正在读取压缩配置…</div>
+        <div v-if="ctxLoading" v-loading="true" class="sandbox-loading">
+          <span class="loading-text">正在读取压缩配置…</span>
+        </div>
         <template v-else>
           <div v-if="ctx" class="ctx-budget">
             <span>窗口 <b>{{ fmtToken(ctx.budget.window) }}</b></span>
@@ -369,40 +406,134 @@ onMounted(() => {
             <span>保留 <b>{{ fmtToken(ctx.budget.keep) }}</b></span>
           </div>
 
-          <div class="sandbox-grid">
-            <label class="field">
-              <span>软水位（相对可用预算）<InfoHint title="软水位" text="上下文用掉一部分后，系统提前开始整理，避免拖到快满才动手。数值越小，整理越早、越频繁；单位是“可用预算”的比例，例如 0.70 表示用到七成时开始整理。" /></span>
-              <input v-model.number="ctxForm.trigger" type="number" step="0.01" min="0.05" max="0.99" />
-            </label>
-            <label class="field">
-              <span>硬水位（强制压缩）<InfoHint title="硬水位" text="上下文到达这个比例时必须整理，即使助手正忙也会执行。应明显高于软水位，留出提前整理的余地。" /></span>
-              <input v-model.number="ctxForm.hard" type="number" step="0.01" min="0.05" max="1" />
-            </label>
-            <label class="field">
-              <span>保留预算<InfoHint title="保留预算" text="整理后至少要原样保留的最近对话比例。留得越多越不容易丢细节，但节省的空间变少；留得太少可能丢掉刚发生的关键信息。" /></span>
-              <input v-model.number="ctxForm.keep" type="number" step="0.01" min="0.05" max="0.99" />
-            </label>
-            <label class="field">
-              <span>首次压缩最少轮次<InfoHint title="首次压缩最少轮次" text="会话至少聊过这么多轮才允许第一次整理，避免刚开始对话就被压缩。整理过一次后不再受此限制。" /></span>
-              <input v-model.number="ctxForm.min_rounds" type="number" min="1" max="100" />
-            </label>
-            <label class="field">
-              <span>冷却（模型调用次数）<InfoHint title="冷却" text="两次整理之间至少间隔多少次模型调用，防止刚整理完又马上再整理、反复折腾上下文。" /></span>
-              <input v-model.number="ctxForm.cooldown" type="number" min="0" max="50" />
-            </label>
-            <label class="field">
-              <span>最大延迟次数<InfoHint title="最大延迟次数" text="助手正处在工具调用链中时可以先推迟整理。这里设置最多能推迟几次，超过就强制执行，保证上下文不会溢出。" /></span>
-              <input v-model.number="ctxForm.max_defer" type="number" min="0" max="20" />
-            </label>
-            <label class="field">
-              <span>摘要超时（秒）<InfoHint title="摘要超时" text="生成摘要的最长等待时间。超时后系统会改用“保留关键信息 + 最近消息”的兜底方案，保证对话能继续。" /></span>
-              <input v-model.number="ctxForm.timeout_seconds" type="number" min="5" max="300" />
-            </label>
-            <label class="field">
-              <span>进度心跳（秒）<InfoHint title="进度心跳" text="整理期间系统每隔多久向页面汇报一次进度。心跳也用于判断连接是否掉线，间隔太大时会误判为断线。" /></span>
-              <input v-model.number="ctxForm.heartbeat_seconds" type="number" min="2" max="60" />
-            </label>
-          </div>
+          <el-form label-position="top" class="sandbox-grid">
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  软水位（相对可用预算）
+                  <InfoHint title="软水位" text="上下文用掉一部分后，系统提前开始整理，避免拖到快满才动手。数值越小，整理越早、越频繁；单位是“可用预算”的比例，例如 0.70 表示用到七成时开始整理。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.trigger"
+                :step="0.01"
+                :min="0.05"
+                :max="0.99"
+                :precision="2"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  硬水位（强制压缩）
+                  <InfoHint title="硬水位" text="上下文到达这个比例时必须整理，即使助手正忙也会执行。应明显高于软水位，留出提前整理的余地。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.hard"
+                :step="0.01"
+                :min="0.05"
+                :max="1"
+                :precision="2"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  保留预算
+                  <InfoHint title="保留预算" text="整理后至少要原样保留的最近对话比例。留得越多越不容易丢细节，但节省的空间变少；留得太少可能丢掉刚发生的关键信息。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.keep"
+                :step="0.01"
+                :min="0.05"
+                :max="0.99"
+                :precision="2"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  首次压缩最少轮次
+                  <InfoHint title="首次压缩最少轮次" text="会话至少聊过这么多轮才允许第一次整理，避免刚开始对话就被压缩。整理过一次后不再受此限制。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.min_rounds"
+                :min="1"
+                :max="100"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  冷却（模型调用次数）
+                  <InfoHint title="冷却" text="两次整理之间至少间隔多少次模型调用，防止刚整理完又马上再整理、反复折腾上下文。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.cooldown"
+                :min="0"
+                :max="50"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  最大延迟次数
+                  <InfoHint title="最大延迟次数" text="助手正处在工具调用链中时可以先推迟整理。这里设置最多能推迟几次，超过就强制执行，保证上下文不会溢出。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.max_defer"
+                :min="0"
+                :max="20"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  摘要超时（秒）
+                  <InfoHint title="摘要超时" text="生成摘要的最长等待时间。超时后系统会改用“保留关键信息 + 最近消息”的兜底方案，保证对话能继续。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.timeout_seconds"
+                :min="5"
+                :max="300"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  进度心跳（秒）
+                  <InfoHint title="进度心跳" text="整理期间系统每隔多久向页面汇报一次进度。心跳也用于判断连接是否掉线，间隔太大时会误判为断线。" />
+                </span>
+              </template>
+              <el-input-number
+                v-model="ctxForm.heartbeat_seconds"
+                :min="2"
+                :max="60"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+          </el-form>
 
           <ul class="sandbox-switches">
             <li>
@@ -410,14 +541,22 @@ onMounted(() => {
                 <strong>启用自动压缩</strong>
                 <span>关闭后达到水位也不压缩，仅保留监控与手动 compact_conversation</span>
               </div>
-              <UiSwitch v-model="ctxForm.enabled" />
+              <el-switch
+                :model-value="ctxForm.enabled"
+                @update:model-value="(v: string | number | boolean) => (ctxForm.enabled = Boolean(v))"
+              />
             </li>
             <li>
               <div class="text">
                 <strong>规则评估</strong>
                 <span>锚点保真、时机标签与成本回执；零额外模型调用</span>
               </div>
-              <UiSwitch v-model="ctxForm.eval_enabled" />
+              <el-switch
+                :model-value="ctxForm.eval_enabled"
+                @update:model-value="
+                  (v: string | number | boolean) => (ctxForm.eval_enabled = Boolean(v))
+                "
+              />
             </li>
             <li>
               <div class="text">
@@ -431,14 +570,21 @@ onMounted(() => {
                 </strong>
                 <span>压缩结束后异步调用摘要模型判断时机，额外一次调用，默认关闭</span>
               </div>
-              <UiSwitch v-model="ctxForm.eval_judge" />
+              <el-switch
+                :model-value="ctxForm.eval_judge"
+                @update:model-value="
+                  (v: string | number | boolean) => (ctxForm.eval_judge = Boolean(v))
+                "
+              />
             </li>
           </ul>
 
           <div class="foot" :class="{ warn: Boolean(ctxError) }">
-            <AppIcon :name="ctxError ? 'shield' : 'server'" :size="13" />
+            <el-icon>
+              <Warning v-if="ctxError" />
+              <Monitor v-else />
+            </el-icon>
             <span v-if="ctxError">{{ ctxError }}</span>
-            <span v-else-if="ctxMessage">{{ ctxMessage }}</span>
             <span v-else>修改会重建用户级 Agent 图；正在运行的一轮不受影响，下一轮按新阈值判断。</span>
           </div>
         </template>
@@ -447,41 +593,54 @@ onMounted(() => {
       <!-- 会话归档：长期无新记录的会话自动归档 -->
       <section class="settings-module">
         <header class="module-head">
-          <span class="module-icon"><AppIcon name="archive" :size="16" /></span>
+          <span class="module-icon"><el-icon><FolderOpened /></el-icon></span>
           <div class="module-heading">
             <h2>会话归档</h2>
             <p>超过设定天数没有新记录的会话会在进入对话页时自动归档；归档后不再被 Agent 读取</p>
           </div>
-          <button
-            class="ghost-btn"
-            type="button"
-            :disabled="archiveSaving || archiveLoading"
+          <el-button
+            type="primary"
+            size="small"
+            :icon="Check"
+            :loading="archiveSaving"
+            :disabled="archiveLoading"
             @click="saveArchive"
           >
-            <AppIcon name="check" :size="12" />
             {{ archiveSaving ? '保存中…' : '保存归档设置' }}
-          </button>
+          </el-button>
         </header>
 
-        <div v-if="archiveLoading" class="sandbox-loading">正在读取归档配置…</div>
+        <div v-if="archiveLoading" v-loading="true" class="sandbox-loading">
+          <span class="loading-text">正在读取归档配置…</span>
+        </div>
         <template v-else>
-          <div class="sandbox-grid">
-            <label class="field">
-              <span>
-                自动归档天数
-                <InfoHint
-                  title="自动归档天数"
-                  text="会话超过这么多天没有新记录时，会在你进入对话页的那一刻自动归档。检测只在进入对话页时执行一次，不会在后台常驻计时器。填 0 表示关闭自动归档；置顶会话不会被自动归档。"
-                />
-              </span>
-              <input v-model.number="archiveDays" type="number" min="0" max="3650" />
-            </label>
-          </div>
+          <el-form label-position="top" class="sandbox-grid">
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  自动归档天数
+                  <InfoHint
+                    title="自动归档天数"
+                    text="会话超过这么多天没有新记录时，会在你进入对话页的那一刻自动归档。检测只在进入对话页时执行一次，不会在后台常驻计时器。填 0 表示关闭自动归档；置顶会话不会被自动归档。"
+                  />
+                </span>
+              </template>
+              <el-input-number
+                v-model="archiveDays"
+                :min="0"
+                :max="3650"
+                controls-position="right"
+                class="fill"
+              />
+            </el-form-item>
+          </el-form>
 
           <div class="foot" :class="{ warn: Boolean(archiveError) }">
-            <AppIcon :name="archiveError ? 'shield' : 'archive'" :size="13" />
+            <el-icon>
+              <Warning v-if="archiveError" />
+              <FolderOpened v-else />
+            </el-icon>
             <span v-if="archiveError">{{ archiveError }}</span>
-            <span v-else-if="archiveMessage">{{ archiveMessage }}</span>
             <span v-else>默认 30 天；0 表示关闭。归档会话可在对话页左下角的「归档会话」中恢复或永久删除。</span>
           </div>
         </template>
@@ -490,18 +649,18 @@ onMounted(() => {
       <!-- 沙箱服务配置：未配置时给出安全提示 -->
       <section class="settings-module">
         <header class="module-head">
-          <span class="module-icon"><AppIcon name="shield" :size="16" /></span>
+          <span class="module-icon"><el-icon><Lock /></el-icon></span>
           <div class="module-heading">
             <h2>沙箱服务</h2>
-            <p>OpenSandbox 地址与生命周期配置，写入 .env 并热更新</p>
+            <p>OpenSandbox 地址与生命周期配置，按当前用户保存并热更新</p>
           </div>
-          <span class="mode-chip" :class="sandbox?.configured ? 'on' : 'off'">
+          <el-tag size="small" effect="plain" :type="sandbox?.configured ? 'success' : 'warning'">
             {{ sandboxLoading ? '读取中…' : sandbox?.configured ? '沙箱模式' : '项目工作区模式' }}
-          </span>
+          </el-tag>
         </header>
 
         <div v-if="!sandboxLoading && !sandbox?.configured" class="risk-banner">
-          <AppIcon name="shield" :size="15" />
+          <el-icon><Warning /></el-icon>
           <div>
             <strong>未配置沙箱服务，Agent 只能读写项目文件。</strong>
             <span>
@@ -511,47 +670,68 @@ onMounted(() => {
           </div>
         </div>
 
-        <div class="sandbox-grid">
-          <label class="field">
-            <span>服务地址</span>
-            <input v-model="form.host" type="text" placeholder="127.0.0.1" spellcheck="false" />
-          </label>
-          <label class="field">
-            <span>服务端口</span>
-            <input v-model.number="form.port" type="number" min="1" max="65535" placeholder="18083" />
-          </label>
-          <label class="field">
-            <span>API Key <em>{{ sandbox?.has_api_key ? '已配置，留空保持不变' : '未配置' }}</em></span>
-            <input
+        <el-form v-loading="sandboxLoading" label-position="top" class="sandbox-grid">
+          <el-form-item label="服务地址">
+            <el-input v-model="form.host" placeholder="127.0.0.1" spellcheck="false" />
+          </el-form-item>
+          <el-form-item label="服务端口">
+            <el-input-number
+              v-model="form.port"
+              :min="1"
+              :max="65535"
+              controls-position="right"
+              class="fill"
+            />
+          </el-form-item>
+          <el-form-item>
+            <template #label>
+              <span class="label-line">
+                API Key
+                <em>{{ sandbox?.has_api_key ? '已配置，留空保持不变' : '未配置' }}</em>
+              </span>
+            </template>
+            <el-input
               v-model="form.apiKey"
               type="password"
+              show-password
               placeholder="留空则保持现有密钥"
               autocomplete="new-password"
               spellcheck="false"
               :disabled="clearKey"
             />
-            <button
+            <el-button
               v-if="sandbox?.has_api_key"
+              link
+              type="primary"
+              size="small"
               class="inline-link"
-              type="button"
               @click="clearApiKey"
             >
               {{ clearKey ? '取消清空' : '清空密钥' }}
-            </button>
-          </label>
-          <label class="field">
-            <span>沙箱镜像</span>
-            <input v-model="form.image" type="text" placeholder="myagent-sandbox:1" spellcheck="false" />
-          </label>
-          <label class="field">
-            <span>单次命令超时（秒）</span>
-            <input v-model.number="form.defaultTimeout" type="number" min="10" max="3600" />
-          </label>
-          <label class="field">
-            <span>沙箱生命周期（秒）</span>
-            <input v-model.number="form.lifetime" type="number" min="600" :max="30 * 86400" />
-          </label>
-        </div>
+            </el-button>
+          </el-form-item>
+          <el-form-item label="沙箱镜像">
+            <el-input v-model="form.image" placeholder="myagent-sandbox:1" spellcheck="false" />
+          </el-form-item>
+          <el-form-item label="单次命令超时（秒）">
+            <el-input-number
+              v-model="form.defaultTimeout"
+              :min="10"
+              :max="3600"
+              controls-position="right"
+              class="fill"
+            />
+          </el-form-item>
+          <el-form-item label="沙箱生命周期（秒）">
+            <el-input-number
+              v-model="form.lifetime"
+              :min="600"
+              :max="30 * 86400"
+              controls-position="right"
+              class="fill"
+            />
+          </el-form-item>
+        </el-form>
 
         <ul class="sandbox-switches">
           <li>
@@ -559,50 +739,65 @@ onMounted(() => {
               <strong>启动预热</strong>
               <span>服务启动时创建一个备用沙箱，首次对话更快；失败会自动退回按需创建</span>
             </div>
-            <UiSwitch v-model="form.prewarm" />
+            <el-switch
+              :model-value="form.prewarm"
+              @update:model-value="(v: string | number | boolean) => (form.prewarm = Boolean(v))"
+            />
           </li>
           <li>
             <div class="text">
               <strong>通过生命周期服务端代理</strong>
               <span>Windows / Docker Desktop / 远程场景建议开启，客户端不直连沙箱容器 IP</span>
             </div>
-            <UiSwitch v-model="form.useServerProxy" />
+            <el-switch
+              :model-value="form.useServerProxy"
+              @update:model-value="
+                (v: string | number | boolean) => (form.useServerProxy = Boolean(v))
+              "
+            />
           </li>
         </ul>
 
         <div class="sandbox-actions">
-          <button class="ghost-btn" type="button" :disabled="sandboxChecking" @click="checkPort">
-            <AppIcon name="server" :size="12" />
+          <el-button :icon="Monitor" :loading="sandboxChecking" @click="checkPort">
             {{ sandboxChecking ? '检测中…' : '检测连接' }}
-          </button>
-          <button class="primary" type="button" :disabled="sandboxSaving" @click="saveSandbox">
+          </el-button>
+          <el-button type="primary" :loading="sandboxSaving" @click="saveSandbox">
             {{ sandboxSaving ? '保存中…' : '保存并重连' }}
-          </button>
+          </el-button>
         </div>
 
-        <p v-if="sandboxError" class="sandbox-note err">{{ sandboxError }}</p>
-        <p v-else-if="sandboxMessage" class="sandbox-note ok">{{ sandboxMessage }}</p>
+        <el-alert
+          v-if="sandboxError"
+          :title="sandboxError"
+          type="error"
+          :closable="false"
+          show-icon
+          class="sandbox-note"
+        />
 
         <div class="runtime-box">
-          <button class="runtime-head" type="button" @click="showRuntimes = !showRuntimes">
-            <AppIcon name="cpu" :size="13" />
-            <span>
+          <el-button text class="runtime-head" @click="showRuntimes = !showRuntimes">
+            <el-icon><Cpu /></el-icon>
+            <span class="runtime-label">
               本机运行环境检测
               <em v-if="localEnv"> · 可用 {{ localEnv.runnable }} 项</em>
             </span>
-            <span class="chev" :class="{ open: showRuntimes }">
-              <AppIcon name="chevronRight" :size="12" />
-            </span>
-          </button>
+            <el-icon class="chev" :class="{ open: showRuntimes }"><ArrowRight /></el-icon>
+          </el-button>
           <ul v-if="showRuntimes && localEnv" class="runtime-list">
             <li v-for="item in localEnv.items" :key="item.command">
               <span class="runtime-name">{{ item.label }}</span>
               <span class="runtime-version">
                 {{ item.available ? item.version || '已安装' : '未检测到' }}
               </span>
-              <span class="runtime-state" :class="item.available && item.satisfied ? 'ok' : 'bad'">
+              <el-tag
+                size="small"
+                effect="plain"
+                :type="item.available && item.satisfied ? 'success' : 'warning'"
+              >
                 {{ item.available ? (item.satisfied ? '可用' : '版本过低') : '缺失' }}
-              </span>
+              </el-tag>
               <a
                 v-if="!item.available || !item.satisfied"
                 :href="item.download"
@@ -616,7 +811,7 @@ onMounted(() => {
 
         <div v-if="paths" class="paths-box">
           <header>
-            <AppIcon name="folder" :size="13" />
+            <el-icon><Folder /></el-icon>
             存储位置
           </header>
           <div class="path-row">
@@ -639,7 +834,7 @@ onMounted(() => {
         </div>
 
         <div class="foot">
-          <AppIcon name="shield" :size="13" />
+          <el-icon><Lock /></el-icon>
           未配置沙箱时，Agent 只能读写项目文件，命令执行会被拒绝；
           项目内可以创建代码与脚本，但绝不会在本机执行。
         </div>
@@ -654,42 +849,90 @@ onMounted(() => {
 }
 
 .page {
-  padding: 18px 22px 26px;
+  width: min(1280px, 100%);
+  margin: 0 auto;
+  padding: 34px 40px 84px;
 }
 
-.columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-  max-width: 1180px;
+.settings-intro {
+  padding-bottom: 26px;
 }
 
-.panel-title small {
-  margin-left: 8px;
-  font-size: 11px;
-  font-weight: 400;
+.intro-kicker {
+  margin: 0 0 10px;
+  font-size: 9px;
+  letter-spacing: 0.24em;
+  color: var(--accent-cyan);
+}
+
+.settings-intro h1 {
+  margin: 0 0 8px;
+  font-size: clamp(28px, 3vw, 38px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+}
+
+.settings-intro p {
+  margin: 0;
+  font-size: 12.5px;
   color: var(--text-3);
 }
 
-.reset {
-  padding: 5px 12px;
-  font-size: 11.5px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+.settings-module {
+  padding: 30px 0 36px;
+  border-top: 1px solid var(--line);
   background: transparent;
-  transition: color 0.16s, border-color 0.16s;
 }
 
-.reset:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
+.settings-module + .settings-module {
+  margin-top: 8px;
+}
+
+.module-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-bottom: 18px;
+}
+
+.module-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  color: var(--accent-cyan);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: transparent;
+}
+
+.module-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.module-heading h2 {
+  margin: 0 0 4px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+}
+
+.module-heading p {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
 }
 
 .rows {
   list-style: none;
-  margin: 8px 16px 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 42px;
+  margin: 0;
   padding: 0;
 }
 
@@ -697,12 +940,20 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 4px;
+  padding: 15px 0;
   border-bottom: 1px solid var(--line);
 }
 
 .rows li:last-child {
   border-bottom: none;
+}
+
+.text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
 }
 
 .icon {
@@ -712,15 +963,11 @@ onMounted(() => {
   height: 22px;
   flex: none;
   color: var(--accent-cyan);
-  background: transparent;
 }
 
-.text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  flex: 1;
-  min-width: 0;
+.loading-text {
+  font-size: 11px;
+  color: var(--text-3);
 }
 
 .text strong {
@@ -737,14 +984,11 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 7px;
-  margin: 10px 16px 14px;
-  padding: 9px 0 0;
+  margin: 16px 0 0;
+  padding: 14px 0 0;
   font-size: 11px;
   color: var(--text-3);
-  border: 0;
   border-top: 1px solid var(--line);
-  border-radius: 0;
-  background: transparent;
 }
 
 .foot.warn {
@@ -752,41 +996,15 @@ onMounted(() => {
 }
 
 /* ---------- 沙箱服务 ---------- */
-.panel.sandbox {
-  margin-top: 16px;
-  max-width: 1180px;
-}
-
-.mode-chip {
-  padding: 2px 8px;
-  font-size: 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--line);
-  color: var(--text-3);
-  flex: none;
-}
-
-.mode-chip.on {
-  color: var(--accent-cyan);
-  border-color: rgba(55, 208, 196, 0.32);
-  background: transparent;
-}
-
-.mode-chip.off {
-  color: var(--amber);
-  border-color: rgba(242, 176, 60, 0.32);
-  background: transparent;
-}
-
 .risk-banner {
   display: flex;
   gap: 10px;
-  margin: 10px 16px 0;
-  padding: 10px 12px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
   color: var(--amber);
-  border: 1px solid rgba(242, 176, 60, 0.28);
-  border-radius: var(--radius-sm);
-  background: rgba(242, 176, 60, 0.05);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: transparent;
 }
 
 .risk-banner div {
@@ -806,17 +1024,39 @@ onMounted(() => {
   color: var(--text-2);
 }
 
-.risk-banner code {
-  font-family: 'Cascadia Code', Consolas, monospace;
-  font-size: 10.5px;
-  color: var(--accent-cyan);
-}
-
 .sandbox-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px 14px;
-  padding: 14px 16px 2px;
+  gap: 0 20px;
+}
+
+.sandbox-grid :deep(.el-form-item) {
+  margin-bottom: 14px;
+}
+
+.label-line {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.label-line em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.fill {
+  width: 100%;
+}
+
+.inline-link {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+.sandbox-loading {
+  min-height: 120px;
 }
 
 /* 压缩预算概览 */
@@ -824,7 +1064,7 @@ onMounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 14px 16px 0;
+  padding: 0 0 14px;
 }
 
 .ctx-budget span {
@@ -834,7 +1074,7 @@ onMounted(() => {
   padding: 4px 10px;
   border-radius: 8px;
   border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.03);
+  background: transparent;
   font-size: 11px;
   color: var(--text-3);
 }
@@ -845,59 +1085,9 @@ onMounted(() => {
   color: var(--text-1);
 }
 
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--text-2);
-}
-
-.field span {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.field em {
-  font-style: normal;
-  font-size: 10px;
-  color: var(--text-3);
-}
-
-.field input {
-  width: 100%;
-  padding: 8px 11px;
-  font-size: 12px;
-  font-family: inherit;
-  color: var(--text-1);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-deep);
-  outline: none;
-}
-
-.field input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.22);
-}
-
-.field input:disabled {
-  opacity: 0.55;
-}
-
-.inline-link {
-  align-self: flex-start;
-  padding: 0;
-  font-size: 10px;
-  color: var(--accent-cyan);
-  border: none;
-  background: transparent;
-}
-
 .sandbox-switches {
   list-style: none;
-  margin: 8px 16px 0;
+  margin: 10px 0 0;
   padding: 0;
 }
 
@@ -905,7 +1095,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 11px 4px;
+  padding: 11px 0;
   border-bottom: 1px solid var(--line);
 }
 
@@ -935,62 +1125,15 @@ onMounted(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
-  padding: 10px 16px 0;
-}
-
-.sandbox-actions button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 14px;
-  font-size: 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid transparent;
-}
-
-.ghost-btn {
-  color: var(--text-2);
-  border-color: var(--line-strong) !important;
-  background: transparent;
-}
-
-.ghost-btn:hover:not(:disabled) {
-  color: var(--text-1);
-  border-color: var(--accent) !important;
-}
-
-.ghost-btn:disabled,
-.primary:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.primary {
-  color: #fff;
-  background: var(--accent);
+  padding: 14px 0 0;
 }
 
 .sandbox-note {
-  margin: 10px 16px 0;
-  padding: 8px 10px;
-  font-size: 11px;
-  border-radius: var(--radius-sm);
-}
-
-.sandbox-note.ok {
-  color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.28);
-  background: transparent;
-}
-
-.sandbox-note.err {
-  color: var(--danger);
-  border: 1px solid rgba(226, 96, 94, 0.32);
-  background: transparent;
+  margin: 12px 0 0;
 }
 
 .runtime-box {
-  margin: 12px 16px 0;
+  margin: 14px 0 0;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: transparent;
@@ -1009,12 +1152,16 @@ onMounted(() => {
   background: transparent;
 }
 
-.runtime-head span {
+.runtime-head:hover {
+  background: var(--bg-hover);
+}
+
+.runtime-label {
   flex: 1;
   text-align: left;
 }
 
-.runtime-head em {
+.runtime-label em {
   font-style: normal;
   font-size: 10.5px;
   color: var(--text-3);
@@ -1042,7 +1189,7 @@ onMounted(() => {
 
 .runtime-list li {
   display: grid;
-  grid-template-columns: 110px 1fr 70px 46px;
+  grid-template-columns: 110px 1fr 80px 46px;
   align-items: center;
   gap: 8px;
   padding: 4px 0;
@@ -1057,24 +1204,6 @@ onMounted(() => {
   color: var(--text-3);
   font-family: 'Cascadia Code', Consolas, monospace;
   font-size: 10.5px;
-}
-
-.runtime-state {
-  font-size: 10px;
-  text-align: center;
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--line);
-}
-
-.runtime-state.ok {
-  color: var(--accent-cyan);
-  border-color: rgba(55, 208, 196, 0.3);
-}
-
-.runtime-state.bad {
-  color: var(--amber);
-  border-color: rgba(242, 176, 60, 0.32);
 }
 
 .runtime-list a {
@@ -1096,7 +1225,7 @@ onMounted(() => {
 
 /* ---------- 存储位置 ---------- */
 .paths-box {
-  margin: 12px 16px 0;
+  margin: 14px 0 0;
   padding: 9px 12px 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -1141,7 +1270,7 @@ onMounted(() => {
   font-size: 10.5px;
   line-height: 1.6;
   color: var(--amber);
-  border-top: 1px solid rgba(242, 176, 60, 0.3);
+  border-top: 1px solid var(--line);
 }
 
 .path-warn code {
@@ -1151,236 +1280,16 @@ onMounted(() => {
   word-break: break-all;
 }
 
-@media (max-width: 980px) {
-  .columns {
-    grid-template-columns: 1fr;
-  }
-
-  .sandbox-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-/* ---------- 整页宽：一个设置模块占满一行 ---------- */
-.page {
-  padding: 0 0 48px;
-}
-
-.columns,
-.panel.sandbox {
-  max-width: none;
-  margin: 0;
-}
-
-.columns {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  align-items: stretch;
-}
-
-.columns > .panel,
-.page > .panel {
-  width: 100%;
-}
-
-.panel-head {
-  padding: 20px 32px 0;
-}
-
-/* 同一模块内部的开关用两列铺开，避免整行只有一条窄内容 */
-.rows {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 32px;
-  padding: 0 32px;
-}
-
-.rows li {
-  min-width: 0;
-}
-
-.foot {
-  margin: 0 32px 20px;
-}
-
-.sandbox-grid {
-  padding: 14px 32px 8px;
-}
-
-.runtime-list {
-  padding: 0 32px;
-}
-
-@media (max-width: 900px) {
-  .rows {
-    grid-template-columns: 1fr;
-  }
-
-  .panel-head,
-  .rows,
-  .sandbox-grid,
-  .runtime-list {
-    padding-left: 20px;
-    padding-right: 20px;
-  }
-
-  .foot {
-    margin-left: 20px;
-    margin-right: 20px;
-  }
-}
-
-/* ---------- 模块化设置布局 ---------- */
-.page {
-  width: min(1280px, 100%);
-  margin: 0 auto;
-  padding: 34px 40px 84px;
-}
-
-.settings-intro {
-  padding-bottom: 26px;
-}
-
-.intro-kicker {
-  margin: 0 0 10px;
-  font-size: 9px;
-  letter-spacing: 0.24em;
-  color: rgba(55, 208, 196, 0.72);
-}
-
-.settings-intro h1 {
-  margin: 0 0 8px;
-  font-size: clamp(28px, 3vw, 38px);
-  font-weight: 600;
-  letter-spacing: -0.035em;
-  line-height: 1.05;
-}
-
-.settings-intro p {
-  margin: 0;
-  font-size: 12.5px;
-  color: var(--text-3);
-}
-
-.settings-module {
-  padding: 30px 0 36px;
-  border-top: 1px solid var(--line);
-  background: transparent;
-}
-
-.settings-module + .settings-module {
-  margin-top: 8px;
-}
-
-.module-head {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding-bottom: 18px;
-}
-
-.module-icon {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  flex: none;
-  color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.25);
-  border-radius: 8px;
-  background: transparent;
-}
-
-.module-heading {
-  flex: 1;
-  min-width: 0;
-}
-
-.module-heading h2 {
-  margin: 0 0 4px;
-  font-size: 22px;
-  font-weight: 600;
-  letter-spacing: -0.025em;
-  line-height: 1.1;
-}
-
-.module-heading p {
-  margin: 0;
-  font-size: 11.5px;
-  color: var(--text-3);
-}
-
-.settings-module .rows {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 42px;
-  margin: 0;
-  padding: 0;
-}
-
-.settings-module .rows li {
-  padding: 15px 0;
-}
-
-.settings-module .foot {
-  margin: 16px 0 0;
-  padding: 14px 0 0;
-  border-top: 1px solid var(--line);
-  font-size: 11px;
-}
-
-.settings-module .risk-banner {
-  margin: 0 0 16px;
-  padding: 12px 14px;
-  border-radius: 8px;
-  background: rgba(242, 176, 60, 0.045);
-}
-
-.settings-module .sandbox-grid {
-  padding: 0;
-  gap: 16px 20px;
-}
-
-.settings-module .sandbox-switches {
-  margin: 10px 0 0;
-}
-
-.settings-module .sandbox-actions {
-  padding: 14px 0 0;
-}
-
-.settings-module .sandbox-note {
-  margin: 12px 0 0;
-}
-
-.settings-module .runtime-box,
-.settings-module .paths-box {
-  margin: 14px 0 0;
-}
-
-.settings-module .field input {
-  background: rgba(4, 10, 20, 0.38);
-  border-color: rgba(126, 154, 198, 0.24);
-  backdrop-filter: blur(6px);
-}
-
-.settings-module .mode-chip,
-.settings-module .reset {
-  border: 1px solid var(--line-strong);
-  background: transparent;
-}
-
 @media (max-width: 900px) {
   .page {
     padding: 24px 20px 64px;
   }
 
-  .settings-module .rows {
+  .rows {
     grid-template-columns: 1fr;
   }
 
-  .settings-module .sandbox-grid {
+  .sandbox-grid {
     grid-template-columns: 1fr;
   }
 

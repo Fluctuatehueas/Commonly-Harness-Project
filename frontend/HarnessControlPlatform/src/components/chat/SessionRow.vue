@@ -1,6 +1,8 @@
 <script setup lang="ts">
 // 单条会话行：置顶标记 / 运行状态 / 更多操作（置顶、重命名、归档、删除）
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import type { InputInstance } from 'element-plus'
+import { Box, Delete, EditPen, MoreFilled, Top, Bottom } from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { SessionItem } from '@/stores/sessions'
 
@@ -25,7 +27,7 @@ const emit = defineEmits<{
 
 const editing = ref(false)
 const editTitle = ref('')
-const inputEl = ref<HTMLInputElement | null>(null)
+const inputEl = ref<InputInstance | null>(null)
 
 // 「更多」菜单挂在 body 上，避免被侧边栏滚动容器裁切。
 interface MenuPosition {
@@ -136,12 +138,12 @@ function chooseRemove() {
       <i v-else-if="props.running" class="dot run"></i>
     </span>
 
-    <input
+    <el-input
       v-if="editing"
       ref="inputEl"
       v-model="editTitle"
       class="rename"
-      type="text"
+      size="small"
       maxlength="120"
       @click.stop
       @keydown.enter.stop.prevent="commitRename"
@@ -153,15 +155,16 @@ function chooseRemove() {
     <span class="time mono">{{ fmtTime(props.session.updated_at) }}</span>
 
     <div class="actions">
-      <button
+      <el-button
         class="more"
-        type="button"
+        :icon="MoreFilled"
+        text
+        circle
+        size="small"
         title="更多操作"
         aria-haspopup="menu"
         @click.stop="toggleMenu($event)"
-      >
-        <AppIcon name="more" :size="18" />
-      </button>
+      />
     </div>
 
     <Teleport to="body">
@@ -177,22 +180,31 @@ function chooseRemove() {
         }"
         @click.stop
       >
-        <button type="button" role="menuitem" @click="choosePin">
-          <AppIcon :name="props.session.pinned ? 'unpin' : 'pin'" :size="12" />
-          <span>{{ props.session.pinned ? '取消置顶' : '置顶' }}</span>
-        </button>
-        <button type="button" role="menuitem" @click="chooseRename">
-          <AppIcon name="edit" :size="12" />
-          <span>重命名</span>
-        </button>
-        <button type="button" role="menuitem" @click="chooseArchive">
-          <AppIcon name="archive" :size="12" />
-          <span>归档</span>
-        </button>
-        <button type="button" role="menuitem" class="danger" @click="chooseRemove">
-          <AppIcon name="trash" :size="12" />
-          <span>删除</span>
-        </button>
+        <el-button
+          class="row-menu-item"
+          text
+          role="menuitem"
+          :icon="props.session.pinned ? Bottom : Top"
+          @click="choosePin"
+        >
+          {{ props.session.pinned ? '取消置顶' : '置顶' }}
+        </el-button>
+        <el-button class="row-menu-item" text role="menuitem" :icon="EditPen" @click="chooseRename">
+          重命名
+        </el-button>
+        <el-button class="row-menu-item" text role="menuitem" :icon="Box" @click="chooseArchive">
+          归档
+        </el-button>
+        <el-button
+          class="row-menu-item danger"
+          text
+          type="danger"
+          role="menuitem"
+          :icon="Delete"
+          @click="chooseRemove"
+        >
+          删除
+        </el-button>
       </div>
     </Teleport>
   </div>
@@ -309,24 +321,21 @@ function chooseRemove() {
 }
 
 /* 更多按钮：上下各留 1px，尽量撑满行高，让图标更大更醒目 */
-.more {
-  display: grid;
-  place-items: center;
+.more.el-button {
   width: 26px;
+  height: auto;
+  min-height: 26px;
   margin: 1px 0;
   padding: 0;
   color: var(--text-3);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
 }
 
-.more:hover {
+.more.el-button:hover {
   color: var(--accent-cyan);
   background: var(--bg-hover);
 }
 
-.more :deep(svg) {
+.more.el-button :deep(svg) {
   width: 18px;
   height: 18px;
 }
@@ -352,54 +361,58 @@ function chooseRemove() {
   box-shadow: 0 8px 24px rgba(2, 6, 14, 0.5);
 }
 
-.row-menu button {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+.row-menu-item.el-button {
   width: 100%;
+  height: auto;
+  margin-left: 0;
   padding: 6px 8px;
   font-size: 11px;
-  text-align: left;
   color: var(--text-2);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
+  justify-content: flex-start;
 }
 
-.row-menu button:hover {
+.row-menu-item.el-button + .row-menu-item.el-button {
+  margin-left: 0;
+}
+
+.row-menu-item.el-button:hover {
   color: var(--text-1);
   background: var(--bg-hover);
 }
 
-.row-menu button :deep(svg) {
-  flex: none;
+.row-menu-item.el-button :deep(svg) {
   color: var(--accent-cyan);
 }
 
-.row-menu button.danger {
+.row-menu-item.el-button.danger {
   color: var(--danger);
 }
 
-.row-menu button.danger :deep(svg) {
+.row-menu-item.el-button.danger :deep(svg) {
   color: var(--danger);
 }
 
-.row-menu button.danger:hover {
+.row-menu-item.el-button.danger:hover {
+  color: var(--danger);
   background: rgba(226, 96, 94, 0.12);
 }
 
-.rename {
+.rename.el-input {
   flex: 1;
   min-width: 0;
   height: 22px;
+}
+
+.rename.el-input :deep(.el-input__wrapper) {
   padding: 0 6px;
-  font-size: 12px;
-  font-family: inherit;
-  color: var(--text-1);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-sm);
   background: var(--bg-deep);
-  outline: none;
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.rename.el-input :deep(.el-input__inner) {
+  height: 20px;
+  font-size: 12px;
+  color: var(--text-1);
 }
 
 .menu-mask {

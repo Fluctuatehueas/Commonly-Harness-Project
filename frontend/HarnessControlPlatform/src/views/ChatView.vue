@@ -1,15 +1,30 @@
 <script setup lang="ts">
 // 首页：对话测试（顶栏菜单 + 左侧会话栏 + SSE 流式 + 文件预览）
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import type { InputInstance } from 'element-plus'
+import {
+  ArrowDown,
+  Check,
+  Close,
+  CopyDocument,
+  Document,
+  Link,
+  Paperclip,
+  Picture,
+  Plus,
+  Promotion,
+  VideoPause,
+} from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
-import UiSwitch from '@/components/console/UiSwitch.vue'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
 import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
+import ExecutionCard from '@/components/taskflow/ExecutionCard.vue'
 import RoundLimitToast from '@/components/chat/RoundLimitToast.vue'
 import { API_BASE } from '@/api/client'
 import {
@@ -27,23 +42,28 @@ import { USER_ID, useSessionStore } from '@/stores/sessions'
 import { useDisplayStore } from '@/stores/display'
 import { useFileStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
-import { fetchSandboxStatus } from '@/api/settings'
+import { useAgentStore } from '@/stores/agents'
+import { fetchSandboxStatus, fetchFeedbackSettings } from '@/api/settings'
+import { withdrawLatestMessage, fetchSessionUsage, type SessionUsage } from '@/api/chat'
 
 const chat = useChatStore()
 const display = useDisplayStore()
 const sessions = useSessionStore()
 const files = useFileStore()
 const settings = useSettingsStore()
+const agents = useAgentStore()
 
 // 未配置沙箱时在对话页顶部提示本机执行的安全风险。
 const sandboxNotice = ref('')
 const sandboxBannerClosed = ref(false)
 const integrityNotice = ref('')
 const integrityBannerClosed = ref(false)
+// 反馈总开关；关闭时隐藏赞同/不赞同/重试，仅保留复制。
+const feedbackEnabled = ref(true)
 
 const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
-const inputEl = ref<HTMLTextAreaElement | null>(null)
+const inputEl = ref<InputInstance | null>(null)
 const showFiles = ref(false)
 const fileRefreshKey = ref(0)
 // null=检测中 true=在线 false=离线（离线时提示后端不可达）
@@ -51,7 +71,6 @@ const backendOnline = ref<boolean | null>(null)
 // 用户离开底部后不再强制滚动，改为提供「回到底部」按钮
 const stickToBottom = ref(true)
 const hasOverflow = ref(false)
-const TEXTAREA_MAX_HEIGHT = 168
 
 // ---------- 上下文附件 ----------
 const formats = ref<ContextFormats>({
@@ -189,8 +208,6 @@ async function restoreDraft(threadId: string | null): Promise<void> {
         pendingFiles.value = record.files
       }
     }
-    await nextTick()
-    autoGrow()
   } finally {
     draftLocked = false
   }
@@ -233,6 +250,7 @@ async function fetchHealthWithRetry(attempts = 20): Promise<Response | null> {
 }
 
 onMounted(async () => {
+  void agents.load()
   const res = await fetchHealthWithRetry()
   backendOnline.value = Boolean(res)
   if (res) {
@@ -255,6 +273,11 @@ onMounted(async () => {
     void sessions.refreshArchived()
     formats.value = await fetchContextFormats()
     void settings.load()
+    void fetchFeedbackSettings()
+      .then((config) => {
+        feedbackEnabled.value = config.enabled
+      })
+      .catch(() => undefined)
     void fetchSandboxStatus()
       .then((status) => {
         if (!status.configured) sandboxNotice.value = status.notice
@@ -312,11 +335,11 @@ async function submitUrl() {
   const url = urlDraft.value.trim()
   if (!url || urlLoading.value) return
   if (!/^https?:\/\//i.test(url)) {
-    uploadError.value = '链接需要以 http:// 或 https:// 开头'
+    ElMessage.warning('链接需要以 http:// 或 https:// 开头')
     return
   }
   if (pendingFiles.value.length >= formats.value.max_files) {
-    uploadError.value = `一次最多上传 ${formats.value.max_files} 个文件`
+    ElMessage.warning(`一次最多上传 ${formats.value.max_files} 个文件`)
     return
   }
   uploadError.value = ''
@@ -327,7 +350,7 @@ async function submitUrl() {
     urlDraft.value = ''
     urlMode.value = false
   } catch (error) {
-    uploadError.value = (error as Error).message
+    ElMessage.error((error as Error).message)
   } finally {
     urlLoading.value = false
   }
@@ -347,16 +370,16 @@ async function onFilesPicked(event: Event) {
 
   for (const file of files) {
     if (pendingFiles.value.length >= formats.value.max_files) {
-      uploadError.value = `一次最多上传 ${formats.value.max_files} 个文件`
+      ElMessage.warning(`一次最多上传 ${formats.value.max_files} 个文件`)
       break
     }
     if (file.size > limit) {
-      uploadError.value = `${file.name} 超过 ${formats.value.max_file_mb} MB`
+      ElMessage.warning(`${file.name} 超过 ${formats.value.max_file_mb} MB`)
       continue
     }
     const ext = `.${(file.name.split('.').pop() || '').toLowerCase()}`
     if (allowed.length && !allowed.includes(ext)) {
-      uploadError.value = `不支持的文件类型 ${ext}`
+      ElMessage.warning(`不支持的文件类型 ${ext}`)
       continue
     }
     uploading.value = true
@@ -367,7 +390,7 @@ async function onFilesPicked(event: Event) {
         previews.value[record.id] = URL.createObjectURL(file)
       }
     } catch (error) {
-      uploadError.value = (error as Error).message
+      ElMessage.error((error as Error).message)
     } finally {
       uploading.value = false
     }
@@ -396,6 +419,7 @@ interface HistoryMessage {
   args?: string
   source?: string
   tokens?: { input: number; output: number; total: number }
+  feedback?: 'like' | 'dislike' | null
 }
 
 async function selectSession(threadId: string) {
@@ -405,6 +429,9 @@ async function selectSession(threadId: string) {
   resetInput()
   sessions.activeThreadId = threadId
   chat.activateThread(threadId)
+  // 会话绑定的 Agent 回填到选择器，避免跨会话串用员工。
+  const bound = sessions.sessions.find((item) => item.thread_id === threadId)
+  chat.selectedAgentId = bound?.agent_id || agents.defaultAgentId || 'default'
   // 记录切换前的文件基线，下一轮结束时才能准确判断“本轮新增”。
   void files.prime(threadId)
   // 后台仍在运行的会话：保留实时缓冲，不能用 checkpoint 历史覆盖
@@ -421,6 +448,7 @@ async function selectSession(threadId: string) {
           input: number
           output: number
           total: number
+          spent?: number
           rounds?: number
           context_window?: number
           context_used?: number
@@ -437,7 +465,13 @@ async function selectSession(threadId: string) {
           }
         }
         if (m.role === 'assistant') {
-          return { id: m.id || `h-a-${i}`, kind: 'assistant', content: m.content, tokens: m.tokens }
+          return {
+            id: m.id || `h-a-${i}`,
+            kind: 'assistant',
+            content: m.content,
+            tokens: m.tokens,
+            feedback: m.feedback,
+          }
         }
         const name = m.tool_name || 'tool'
         return {
@@ -468,6 +502,7 @@ async function selectSession(threadId: string) {
             input: data.session_usage.input,
             output: data.session_usage.output,
             total: data.session_usage.total,
+            spent: data.session_usage.spent,
             rounds: data.session_usage.rounds,
             contextWindow: data.session_usage.context_window,
             contextUsed: data.session_usage.context_used,
@@ -512,7 +547,11 @@ async function createSession() {
   stashCurrentDraft()
   draftLocked = true
   resetInput()
-  const id = await sessions.createSession()
+  const id = await sessions.createSession(
+    undefined,
+    undefined,
+    chat.selectedAgentId || agents.defaultAgentId,
+  )
   if (!id) {
     sessions.activeThreadId = null
     chat.newChat()
@@ -527,7 +566,6 @@ async function createSession() {
   // 新建后直接进入该会话的聊天界面，并把焦点放回输入框。
   stickToBottom.value = true
   await nextTick()
-  autoGrow()
   void scrollBottom()
   inputEl.value?.focus()
 }
@@ -679,6 +717,7 @@ interface TurnView {
   key: string
   user: ChatMsg | null
   process: ChatMsg[]
+  taskflow: ChatMsg | null
   final: ChatMsg | null
   interrupt: ChatMsg | null
   notes: ChatMsg[]
@@ -691,6 +730,24 @@ const turns = computed<TurnView[]>(() => {
 
   const flush = () => {
     if (!current) return
+    // 自检修正会在同一轮产生第二版最终回答。两版回答之间没有工具调用时，
+    // 前一条助手消息视为草稿，不展示，避免「答案先出现又被退回去」。
+    if (current.process.length > 1) {
+      const superseded = new Set<string>()
+      let lastAssistantId: string | null = null
+      let toolSince = false
+      for (const msg of current.process) {
+        if (msg.kind === 'tool' || msg.kind === 'interrupt') toolSince = true
+        if (msg.kind === 'assistant' && msg.content) {
+          if (lastAssistantId && !toolSince) superseded.add(lastAssistantId)
+          lastAssistantId = msg.id
+          toolSince = false
+        }
+      }
+      if (superseded.size) {
+        current.process = current.process.filter((msg) => !superseded.has(msg.id))
+      }
+    }
     // 只有「本轮最后一条且带内容」的助手消息才算正式回答，其余都是过程轨迹。
     const last = current.process[current.process.length - 1]
     if (last && last.kind === 'assistant' && last.content) {
@@ -708,6 +765,7 @@ const turns = computed<TurnView[]>(() => {
         key: msg.id,
         user: msg,
         process: [],
+        taskflow: null,
         final: null,
         interrupt: null,
         notes: [],
@@ -720,11 +778,16 @@ const turns = computed<TurnView[]>(() => {
         key: `pre-${msg.id}`,
         user: null,
         process: [],
+        taskflow: null,
         final: null,
         interrupt: null,
         notes: [],
         live: false,
       }
+    }
+    if (msg.kind === 'taskflow') {
+      current.taskflow = msg
+      continue
     }
     if (msg.kind === 'interrupt') {
       if (msg.resolved) {
@@ -784,6 +847,137 @@ const archivedActive = computed(() =>
   sessions.isArchived(chat.threadId || sessions.activeThreadId),
 )
 
+// ---------- 撤回最新用户消息 ----------
+function canWithdraw(turn: TurnView, index: number): boolean {
+  if (!turn.user || archivedActive.value || chat.sending || chat.demoMode) {
+    return false
+  }
+  // 只能撤回最新一条；撤回后上一条自然成为最新，可继续逐条撤回。
+  return index === turns.value.length - 1
+}
+
+async function withdrawLatest(turn: TurnView, index: number) {
+  if (!canWithdraw(turn, index) || !turn.user) return
+  try {
+    await ElMessageBox.confirm(
+      '撤回后，这条消息及其之后的 AI 回复会从会话中移除。已产生的 Token 计费和已写入磁盘或沙箱的文件不会回滚。',
+      '撤回这条消息？',
+      {
+        confirmButtonText: '撤回',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
+  try {
+    const threadId = chat.threadId || sessions.activeThreadId
+    if (!threadId) throw new Error('会话不存在')
+    const result = await withdrawLatestMessage(threadId, USER_ID, '控制台用户')
+    // 重新拉取历史，确保消息、中断与用量都以后端 head 为准。
+    await selectSession(threadId)
+    sessionUsageOverride.value = null
+    void hydrateSessionUsage(threadId)
+    const withdrawn = result.content || turn.user.content || ''
+    // 撤回内容放回输入框；若原本还有未发送草稿，保留在后面。
+    const restored = draft.value.trim()
+    draft.value = restored ? `${withdrawn}\n\n${restored}` : withdrawn
+    await nextTick()
+    inputEl.value?.focus()
+    void sessions.refresh()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '撤回失败')
+  }
+}
+
+// ---------- 会话 / 本轮 Token 统计 ----------
+/** 兼容旧前端状态：本地缺少 spent 时，从后端补拉一次会话累计。 */
+const sessionUsageOverride = ref<SessionUsage | null>(null)
+const sessionUsage = computed(() => {
+  const raw = sessionUsageOverride.value
+  if (!raw) return chat.sessionTokens
+  return {
+    input: raw.input || 0,
+    output: raw.output || 0,
+    total: raw.total || 0,
+    spent: raw.spent,
+    rounds: raw.rounds || 0,
+    contextWindow: raw.context_window || 0,
+    contextUsed: raw.context_used ?? raw.input ?? 0,
+  }
+})
+
+async function hydrateSessionUsage(threadId: string | null) {
+  if (!threadId || chat.demoMode) return
+  if (chat.sessionTokens?.spent != null) return
+  try {
+    const usage = await fetchSessionUsage(threadId, USER_ID)
+    if (usage && typeof usage.spent === 'number') {
+      sessionUsageOverride.value = usage
+    }
+  } catch {
+    // 补拉失败时保留现有统计，不影响对话。
+  }
+}
+
+watch(
+  () => [chat.threadId, chat.turnVersion] as const,
+  () => {
+    // 每轮结束后以后端为准；旧 store 缺少 spent 时立即补拉。
+    sessionUsageOverride.value = null
+    void hydrateSessionUsage(chat.threadId)
+  },
+  { immediate: true },
+)
+
+/** 流式期间没有逐 token 用量，用字符数估算；done 后以真实 usage 校正。 */
+function estimateTokens(text: string): number {
+  if (!text) return 0
+  let cjk = 0
+  let other = 0
+  for (const char of text) {
+    const code = char.codePointAt(0) || 0
+    const isCjk =
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3000 && code <= 0x30ff) ||
+      (code >= 0xff00 && code <= 0xffef)
+    if (isCjk) cjk += 1
+    else other += 1
+  }
+  return Math.ceil(cjk * 0.65 + other / 4)
+}
+
+const currentTurn = computed(() => turns.value[turns.value.length - 1] || null)
+const currentTurnTokens = computed(() => currentTurn.value?.final?.tokens || null)
+const streamingAnswerTokens = computed(() => {
+  const final = currentTurn.value?.final
+  if (!chat.sending || !final?.streaming) return 0
+  return estimateTokens(final.content || '')
+})
+const turnEstimating = computed(
+  () => Boolean(chat.sending && !currentTurnTokens.value),
+)
+// 本轮输入：完成后取真实 usage；流式中用上一轮上下文占用估算。
+const turnInput = computed(() => {
+  if (currentTurnTokens.value) return currentTurnTokens.value.input || 0
+  return sessionUsage.value?.contextUsed || sessionUsage.value?.input || 0
+})
+// 本轮输出：流式中按字符估算，完成后取真实 usage。
+const turnOutput = computed(() => {
+  if (currentTurnTokens.value) return currentTurnTokens.value.output || 0
+  return streamingAnswerTokens.value
+})
+// 本会话累计 = 历轮真实计费 + 本轮尚未落账的估算部分。
+const sessionSpentMissing = computed(() => sessionUsage.value?.spent == null)
+const sessionSpent = computed(() => {
+  const base = sessionUsage.value?.spent ?? 0
+  if (!chat.sending) return base
+  const pendingInput = currentTurnTokens.value ? 0 : turnInput.value
+  return base + pendingInput + streamingAnswerTokens.value
+})
+const usageEstimating = computed(() => Boolean(chat.sending))
+
 async function scrollBottom() {
   await nextTick()
   const el = scroller.value
@@ -810,18 +1004,6 @@ function onMessagesScroll() {
 function jumpToBottom() {
   void scrollBottom()
 }
-
-// ---------- 输入框自适应高度 ----------
-function autoGrow() {
-  const el = inputEl.value
-  if (!el) return
-  el.style.height = 'auto'
-  el.style.height = `${Math.min(el.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`
-}
-
-watch(draft, () => {
-  void nextTick(autoGrow)
-})
 
 // 输入或附件变化后延迟落盘，避免每次按键都写 localStorage。
 watch(
@@ -886,9 +1068,9 @@ function toggleWebSearch(value: boolean) {
 
 // ---------- 上下文窗口圆环 ----------
 const DONUT_CIRC = 2 * Math.PI * 15.5
-const ctxWindow = computed(() => chat.sessionTokens?.contextWindow || 0)
+const ctxWindow = computed(() => sessionUsage.value?.contextWindow || 0)
 const ctxUsed = computed(
-  () => chat.sessionTokens?.contextUsed ?? chat.sessionTokens?.input ?? 0,
+  () => sessionUsage.value?.contextUsed ?? sessionUsage.value?.input ?? 0,
 )
 const ctxPct = computed(() =>
   ctxWindow.value > 0
@@ -924,6 +1106,62 @@ async function copyMessage(msg: ChatMsg) {
   copiedId.value = msg.id
   if (copyTimer) window.clearTimeout(copyTimer)
   copyTimer = window.setTimeout(() => (copiedId.value = ''), 1600)
+}
+
+// ---------- 赞同 / 不赞同 / 重试 ----------
+const feedbackBusy = ref<Record<string, boolean>>({})
+const RETRY_HINT_LIMIT = 3
+const retryHintShown = new Set<string>()
+
+function toolsOf(turn: TurnView): string[] {
+  return turn.process
+    .filter((message) => message.kind === 'tool' && message.toolName)
+    .map((message) => String(message.toolName))
+    .filter((name, index, list) => list.indexOf(name) === index)
+    .slice(0, 8)
+}
+
+async function toggleFeedback(turn: TurnView, action: 'like' | 'dislike') {
+  const final = turn.final
+  if (!final || final.streaming || archivedActive.value || chat.demoMode) return
+  if (!feedbackEnabled.value) return
+  if (feedbackBusy.value[final.id]) return
+  feedbackBusy.value = { ...feedbackBusy.value, [final.id]: true }
+  try {
+    await chat.sendFeedback(final, action, {
+      userId: USER_ID,
+      userExcerpt: turn.user?.content || '',
+      tools: toolsOf(turn),
+    })
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '反馈提交失败')
+  } finally {
+    const next = { ...feedbackBusy.value }
+    delete next[final.id]
+    feedbackBusy.value = next
+  }
+}
+
+function canRetry(turn: TurnView, index: number): boolean {
+  if (!feedbackEnabled.value || archivedActive.value || chat.sending || chat.demoMode) return false
+  if (!turn.final || turn.final.streaming || turn.interrupt) return false
+  // 只允许最后一条最终回答：历史回答重试会丢弃其后的轮次。
+  return index === turns.value.length - 1
+}
+
+function handleRetry(turn: TurnView) {
+  const final = turn.final
+  if (!final) return
+  if (!chat.retryLast(final)) return
+  const turnKey = turn.user?.id || ''
+  if (
+    turnKey &&
+    chat.retryCountFor(turnKey) >= RETRY_HINT_LIMIT &&
+    !retryHintShown.has(turnKey)
+  ) {
+    retryHintShown.add(turnKey)
+    chat.addNote('如果还是不对，直接说希望我在哪方面调整：更短、更细、换个角度都可以。')
+  }
 }
 
 function formatExact(total: number): string {
@@ -993,7 +1231,7 @@ async function submit() {
   if (!chat.threadId && !chat.demoMode) {
     const id = await sessions.createSession()
     if (!id) {
-      uploadError.value = '无法创建会话，请检查后端连接'
+      ElMessage.error('无法创建会话，请检查后端连接')
       return
     }
     sessions.activeThreadId = id
@@ -1010,7 +1248,6 @@ async function submit() {
   uploadError.value = ''
   stickToBottom.value = true
   void nextTick(() => {
-    autoGrow()
     void scrollBottom()
   })
 }
@@ -1061,45 +1298,87 @@ async function submit() {
             </div>
           </div>
           <div class="controls">
+            <el-select
+              v-model="chat.selectedAgentId"
+              class="agent-select"
+              size="small"
+              placeholder="选择 Agent"
+              :disabled="archivedActive"
+            >
+              <el-option
+                v-for="opt in agents.options"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              >
+                <span>{{ opt.label }}</span>
+                <small class="agent-option-role">{{ opt.role }}</small>
+              </el-option>
+            </el-select>
             <span v-if="archivedActive" class="chip archived-chip">归档只读</span>
             <span v-if="chat.threadId" class="chip">thread {{ chat.threadId.slice(0, 8) }}…</span>
-            <button class="ghost" type="button" @click="showFiles = !showFiles">
-              <AppIcon name="file" :size="13" /> 文件
-            </button>
-            <button class="ghost" type="button" @click="createSession()">
-              <AppIcon name="plus" :size="13" /> 新会话
-            </button>
+            <el-button size="small" :icon="Document" @click="showFiles = !showFiles">
+              文件
+            </el-button>
+            <el-button size="small" :icon="Plus" @click="createSession()">
+              新会话
+            </el-button>
           </div>
         </header>
 
         <div v-if="sandboxNotice && !sandboxBannerClosed" class="sandbox-warn">
           <AppIcon name="shield" :size="13" />
-          <span>{{ sandboxNotice }}</span>
-          <button type="button" title="关闭提示" @click="sandboxBannerClosed = true">
-            <AppIcon name="close" :size="10" />
-          </button>
+          <span class="warn-text">{{ sandboxNotice }}</span>
+          <el-button
+            class="banner-close"
+            :icon="Close"
+            text
+            circle
+            size="small"
+            title="关闭提示"
+            @click="sandboxBannerClosed = true"
+          />
         </div>
 
         <div v-if="integrityNotice && !integrityBannerClosed" class="sandbox-warn">
           <AppIcon name="shield" :size="13" />
-          <span>{{ integrityNotice }}</span>
-          <button type="button" title="关闭提示" @click="integrityBannerClosed = true">
-            <AppIcon name="close" :size="10" />
-          </button>
+          <span class="warn-text">{{ integrityNotice }}</span>
+          <el-button
+            class="banner-close"
+            :icon="Close"
+            text
+            circle
+            size="small"
+            title="关闭提示"
+            @click="integrityBannerClosed = true"
+          />
         </div>
 
         <div class="messages-wrap">
           <div ref="scroller" class="messages" @scroll.passive="onMessagesScroll">
-            <div v-if="shown.length === 0" class="empty">
-              <div class="empty-orb"><AppIcon name="sparkles" :size="26" /></div>
-              <h3>Harness 对话测试台</h3>
-              <p>发送一条消息，观察模型推理、工具调用、技能使用与人工介入的完整链路。</p>
+            <el-empty v-if="shown.length === 0" class="chat-empty">
+              <template #image>
+                <div class="empty-orb"><AppIcon name="sparkles" :size="26" /></div>
+              </template>
+              <template #description>
+                <p class="empty-title">Harness 对话测试台</p>
+                <p class="empty-desc">
+                  发送一条消息，观察模型推理、工具调用、技能使用与人工介入的完整链路。
+                </p>
+              </template>
               <div class="suggestions">
-                <button v-for="s in SUGGESTIONS" :key="s" type="button" @click="chat.send(s)">{{ s }}</button>
+                <el-button
+                  v-for="s in SUGGESTIONS"
+                  :key="s"
+                  size="small"
+                  @click="chat.send(s)"
+                >
+                  {{ s }}
+                </el-button>
               </div>
-            </div>
+            </el-empty>
 
-            <template v-for="turn in turns" :key="turn.key">
+            <template v-for="(turn, turnIndex) in turns" :key="turn.key">
               <div v-if="turn.user" class="row user">
                 <div class="msg-col user">
                   <div class="bubble user-bubble">
@@ -1112,18 +1391,45 @@ async function submit() {
                     </div>
                     <span v-if="turn.user.content">{{ turn.user.content }}</span>
                   </div>
-                  <div v-if="turn.user.content" class="msg-meta user">
-                    <button
+                  <div
+                    v-if="turn.user.content || canWithdraw(turn, turnIndex)"
+                    class="msg-meta user"
+                  >
+                    <el-button
+                      v-if="turn.user.content"
                       class="copy-mini"
-                      type="button"
+                      size="small"
+                      text
+                      :icon="copiedId === turn.user.id ? Check : CopyDocument"
                       :class="{ copied: copiedId === turn.user.id }"
                       :title="copiedId === turn.user.id ? '已复制' : '复制文本'"
                       @click="copyMessage(turn.user)"
                     >
-                      <AppIcon :name="copiedId === turn.user.id ? 'check' : 'copy'" :size="10" />
-                      <span>{{ copiedId === turn.user.id ? '已复制' : '复制' }}</span>
+                      {{ copiedId === turn.user.id ? '已复制' : '复制' }}
+                    </el-button>
+                    <button
+                      v-if="canWithdraw(turn, turnIndex)"
+                      class="meta-icon"
+                      aria-label="撤回"
+                      title="撤回这条消息"
+                      @click="withdrawLatest(turn, turnIndex)"
+                    >
+                      <AppIcon name="undo" :size="14" />
                     </button>
                   </div>
+                </div>
+              </div>
+
+              <!-- 任务流执行卡片：步骤进度、实时 token 与回放轨迹 -->
+              <div v-if="turn.taskflow" class="row indent flow-row">
+                <div class="tree-col">
+                  <ExecutionCard
+                    :flow-name="turn.taskflow.flowName || '任务流'"
+                    :status="turn.taskflow.flowStatus || 'running'"
+                    :current-step="turn.taskflow.flowCurrentStep || ''"
+                    :steps="turn.taskflow.flowSteps || []"
+                    :traces="turn.taskflow.flowTraces || []"
+                  />
                 </div>
               </div>
 
@@ -1142,19 +1448,56 @@ async function submit() {
                 <div class="avatar ai">AI</div>
                 <div class="msg-col ai">
                   <div class="bubble ai-bubble">
-                    <MarkdownView v-if="turn.final.content" :content="turn.final.content" />
+                    <MarkdownView
+                      v-if="turn.final.content"
+                      :content="turn.final.content"
+                      :thread-id="chat.threadId"
+                      :streaming="Boolean(turn.final.streaming)"
+                    />
                     <span v-if="turn.final.streaming" class="cursor"></span>
                   </div>
                   <div v-if="turn.final.content && !turn.final.streaming" class="msg-meta ai">
                     <button
-                      class="copy-mini"
-                      type="button"
-                      :class="{ copied: copiedId === turn.final.id }"
-                      :title="copiedId === turn.final.id ? '已复制' : '复制回答'"
+                      class="meta-icon"
+                      :class="{ active: copiedId === turn.final.id }"
+                      :title="copiedId === turn.final.id ? '已复制' : '复制'"
+                      :aria-label="copiedId === turn.final.id ? '已复制' : '复制'"
                       @click="copyMessage(turn.final)"
                     >
-                      <AppIcon :name="copiedId === turn.final.id ? 'check' : 'copy'" :size="10" />
-                      <span>{{ copiedId === turn.final.id ? '已复制' : '复制' }}</span>
+                      <AppIcon :name="copiedId === turn.final.id ? 'check' : 'copy'" :size="14" />
+                    </button>
+                    <button
+                      v-if="feedbackEnabled"
+                      class="meta-icon"
+                      :class="{ active: turn.final.feedback === 'like' }"
+                      :disabled="archivedActive || chat.demoMode || feedbackBusy[turn.final.id]"
+                      :aria-pressed="turn.final.feedback === 'like'"
+                      aria-label="赞同"
+                      title="赞同"
+                      @click="toggleFeedback(turn, 'like')"
+                    >
+                      <AppIcon name="thumbUp" :size="14" />
+                    </button>
+                    <button
+                      v-if="feedbackEnabled"
+                      class="meta-icon"
+                      :class="{ active: turn.final.feedback === 'dislike', dislike: true }"
+                      :disabled="archivedActive || chat.demoMode || feedbackBusy[turn.final.id]"
+                      :aria-pressed="turn.final.feedback === 'dislike'"
+                      aria-label="不赞同"
+                      title="不赞同"
+                      @click="toggleFeedback(turn, 'dislike')"
+                    >
+                      <AppIcon name="thumbDown" :size="14" />
+                    </button>
+                    <button
+                      v-if="canRetry(turn, turnIndex)"
+                      class="meta-icon"
+                      aria-label="重新回答"
+                      title="重新回答"
+                      @click="handleRetry(turn)"
+                    >
+                      <AppIcon name="refresh" :size="14" />
                     </button>
                   </div>
                 </div>
@@ -1172,16 +1515,16 @@ async function submit() {
 
           <!-- 用户向上翻阅时，不再强制滚到底，只在视口底部提供一个回底按钮 -->
           <Transition name="pop">
-            <button
+            <el-button
               v-if="hasOverflow && !stickToBottom"
               class="jump-bottom"
-              type="button"
+              size="small"
+              :icon="ArrowDown"
               title="回到最新消息"
               @click="jumpToBottom"
             >
-              <AppIcon name="chevronRight" :size="12" />
-              <span>回到底部</span>
-            </button>
+              回到底部
+            </el-button>
           </Transition>
         </div>
 
@@ -1197,10 +1540,11 @@ async function submit() {
               >
                 <AppIcon name="sparkles" :size="12" />
                 <span>思考模式</span>
-                <UiSwitch
+                <el-switch
                   :model-value="settings.thinking"
+                  size="small"
                   :disabled="settingsDisabled"
-                  @update:model-value="toggleThinking"
+                  @update:model-value="(v: string | number | boolean) => toggleThinking(v === true)"
                 />
               </span>
               <span
@@ -1210,10 +1554,11 @@ async function submit() {
               >
                 <AppIcon name="globe" :size="12" />
                 <span>联网搜索</span>
-                <UiSwitch
+                <el-switch
                   :model-value="settings.webSearch"
+                  size="small"
                   :disabled="settingsDisabled"
-                  @update:model-value="toggleWebSearch"
+                  @update:model-value="(v: string | number | boolean) => toggleWebSearch(v === true)"
                 />
               </span>
             </div>
@@ -1227,70 +1572,90 @@ async function submit() {
               <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
               <AppIcon v-else name="file" :size="12" />
               <span class="p-name">{{ att.name }}</span>
-              <button type="button" title="移除" @click="removePending(att.id)">
-                <AppIcon name="close" :size="10" />
-              </button>
+              <el-button
+                class="chip-close"
+                :icon="Close"
+                text
+                circle
+                size="small"
+                title="移除"
+                @click="removePending(att.id)"
+              />
             </span>
           </div>
           <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
 
           <div v-if="urlMode" class="url-row">
-            <AppIcon name="globe" :size="14" />
-            <input
+            <el-icon class="url-icon"><Link /></el-icon>
+            <el-input
               v-model="urlDraft"
-              type="url"
+              class="url-input"
+              size="small"
               placeholder="https://example.com/article"
               :disabled="urlLoading"
               @keydown.enter.prevent="submitUrl"
               @keydown.esc="urlMode = false"
             />
-            <button
-              class="url-ok"
-              type="button"
+            <el-button
+              type="primary"
+              size="small"
               :disabled="urlLoading || !urlDraft.trim()"
               @click="submitUrl"
             >
               {{ urlLoading ? '抓取中…' : '导入' }}
-            </button>
-            <button class="url-cancel" type="button" title="取消" @click="urlMode = false">
-              <AppIcon name="close" :size="11" />
-            </button>
+            </el-button>
+            <el-button
+              :icon="Close"
+              text
+              circle
+              size="small"
+              title="取消"
+              @click="urlMode = false"
+            />
           </div>
 
           <div class="input-row">
             <div class="attach-wrap">
-              <button
+              <el-button
                 class="attach"
                 :class="{ active: attachMenu }"
-                type="button"
+                size="large"
+                circle
                 :disabled="uploading || chat.sending || chat.compacting"
                 title="添加上下文：文件 / 图片 / 网络链接"
                 @click="attachMenu = !attachMenu"
               >
-                <AppIcon name="paperclip" :size="17" />
                 <span v-if="uploading" class="attach-spin"></span>
-              </button>
+                <el-icon v-else><Paperclip /></el-icon>
+              </el-button>
               <Transition name="pop">
                 <div v-if="attachMenu" class="attach-menu">
-                  <button type="button" @click="pickAttach('file')">
-                    <AppIcon name="file" :size="14" />
-                    <span>文件</span>
-                    <small>文档 / 文本</small>
+                  <button class="attach-item" type="button" @click="pickAttach('file')">
+                    <span class="ai-icon"><el-icon><Document /></el-icon></span>
+                    <span class="ai-text">
+                      <span class="ai-label">文件</span>
+                      <small>文档 / 文本</small>
+                    </span>
                   </button>
-                  <button type="button" @click="pickAttach('image')">
-                    <AppIcon name="image" :size="14" />
-                    <span>图片</span>
-                    <small>随消息多模态发送</small>
+                  <button class="attach-item" type="button" @click="pickAttach('image')">
+                    <span class="ai-icon"><el-icon><Picture /></el-icon></span>
+                    <span class="ai-text">
+                      <span class="ai-label">图片</span>
+                      <small>随消息多模态发送</small>
+                    </span>
                   </button>
-                  <button type="button" @click="openUrlMode">
-                    <AppIcon name="globe" :size="14" />
-                    <span>网络链接</span>
-                    <small>抓取网页正文</small>
+                  <button class="attach-item" type="button" @click="openUrlMode">
+                    <span class="ai-icon"><el-icon><Link /></el-icon></span>
+                    <span class="ai-text">
+                      <span class="ai-label">网络链接</span>
+                      <small>抓取网页正文</small>
+                    </span>
                   </button>
                 </div>
               </Transition>
             </div>
             <div v-if="attachMenu" class="menu-mask" @click="attachMenu = false"></div>
+            <!-- 原生文件选择框无法用组件替代，继续隐藏后由按钮触发 -->
             <input
               ref="fileInput"
               class="file-input"
@@ -1299,64 +1664,82 @@ async function submit() {
               :accept="fileAccept || formats.accept"
               @change="onFilesPicked"
             />
-            <textarea
+            <el-input
               ref="inputEl"
               v-model="draft"
-              rows="1"
+              class="chat-input"
+              type="textarea"
+              :autosize="{ minRows: 1, maxRows: 6 }"
+              resize="none"
               placeholder="输入消息，可附图片/文档/网页链接；Enter 发送 / Shift+Enter 换行"
               :disabled="chat.sending || chat.compacting"
-              @input="autoGrow"
               @keydown.enter.exact.prevent="submit"
-            ></textarea>
-            <button v-if="chat.sending" class="stop" type="button" title="中止" @click="chat.stop()">
-              <AppIcon name="stop" :size="15" />
-            </button>
-            <button
+            />
+            <el-button
+              v-if="chat.sending"
+              class="stop"
+              type="danger"
+              :icon="VideoPause"
+              size="large"
+              circle
+              title="中止"
+              @click="chat.stop()"
+            />
+            <el-button
               v-else
               class="send"
-              type="button"
+              type="primary"
+              :icon="Promotion"
+              size="large"
+              circle
               :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
               @click="submit"
-            >
-              <AppIcon name="send" :size="15" />
-            </button>
+            />
           </div>
 
-          <!-- 本会话统计 + 上下文窗口圆环 -->
-          <div v-if="chat.sessionTokens" class="input-foot">
+          <!-- 本会话累计消耗 + 本轮输入/输出 + 上下文窗口圆环 -->
+          <div v-if="sessionUsage" class="input-foot">
+            <span class="usage-spacer" aria-hidden="true"></span>
             <div
               class="usage-text"
-              :title="`按最终回答统计：输出 ${chat.sessionTokens.output} tok（历轮生成之和）；当前上下文 ${formatExact(ctxUsed)} tok（最近一轮输入，含系统提示词/工具/技能/记忆）`"
+              :title="`本会话累计消耗 ${formatExact(sessionSpent)} tok（历轮 input + output，含已撤回轮次）；本轮输入 ${formatExact(turnInput)} tok，输出 ${formatExact(turnOutput)} tok。${usageEstimating ? '流式期间按上一轮上下文与输出字符估算，结束后按实际计费校正。' : ''}`"
             >
               <AppIcon name="cpu" :size="10" />
-              <span>本会话输出</span>
-              <b>{{ formatExact(chat.sessionTokens.output) }} tok</b>
+              <span>本会话消耗</span>
+              <b v-if="sessionSpentMissing" title="后端未提供会话累计消耗，请重启后端">—</b>
+              <b v-else>{{ usageEstimating ? '≈ ' : '' }}{{ formatExact(sessionSpent) }} tok</b>
               <em>·</em>
-              <span>当前上下文</span>
-              <b>{{ formatExact(ctxUsed) }} tok</b>
-              <em v-if="chat.sessionTokens.rounds">· {{ chat.sessionTokens.rounds }} 轮</em>
+              <span>本轮</span>
+              <span>输入</span>
+              <b>{{ turnEstimating ? '≈ ' : '' }}{{ formatExact(turnInput) }} tok</b>
+              <em>·</em>
+              <span>输出</span>
+              <b>{{ turnEstimating ? '≈ ' : '' }}{{ formatExact(turnOutput) }} tok</b>
+              <em v-if="sessionUsage.rounds">· {{ sessionUsage.rounds }} 轮</em>
               <span v-if="chat.compactionCount" class="compact-count">
                 已压缩 {{ chat.compactionCount }} 次
               </span>
             </div>
 
-            <div
-              v-if="ctxWindow > 0"
-              class="ctx-donut"
-              :class="ctxTone"
-              :title="`上下文窗口占用 ${formatExact(ctxUsed)} / ${formatExact(ctxWindow)} tok（${ctxPct}%）`"
-            >
-              <svg viewBox="0 0 36 36" aria-hidden="true">
-                <circle class="donut-track" cx="18" cy="18" r="15.5" />
-                <circle
-                  class="donut-bar"
-                  cx="18"
-                  cy="18"
-                  r="15.5"
-                  :stroke-dasharray="ctxDash"
-                />
-              </svg>
-              <span class="donut-label">{{ ctxPct }}%</span>
+            <div class="ctx-wrap">
+              <div
+                v-if="ctxWindow > 0"
+                class="ctx-donut"
+                :class="ctxTone"
+                :title="`上下文窗口占用 ${formatExact(ctxUsed)} / ${formatExact(ctxWindow)} tok（${ctxPct}%）`"
+              >
+                <svg viewBox="0 0 36 36" aria-hidden="true">
+                  <circle class="donut-track" cx="18" cy="18" r="15.5" />
+                  <circle
+                    class="donut-bar"
+                    cx="18"
+                    cy="18"
+                    r="15.5"
+                    :stroke-dasharray="ctxDash"
+                  />
+                </svg>
+                <span class="donut-label">{{ ctxPct }}%</span>
+              </div>
             </div>
           </div>
         </footer>
@@ -1364,9 +1747,9 @@ async function submit() {
         <div v-else class="archived-readonly">
           <span class="ar-icon"><AppIcon name="archive" :size="14" /></span>
           <span class="ar-text">该会话已归档，仅支持查看聊天记录，不会再被 Agent 读取。</span>
-          <button class="ar-restore" type="button" @click="restoreActiveSession">
+          <el-button class="ar-restore" size="small" @click="restoreActiveSession">
             恢复会话
-          </button>
+          </el-button>
         </div>
       </section>
 
@@ -1457,6 +1840,26 @@ async function submit() {
   flex: none;
 }
 
+.agent-select {
+  width: 168px;
+}
+
+.agent-option-role {
+  margin-left: 8px;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+/* Element Plus 给相邻按钮默认加重叠边距，这里统一交给 flex gap */
+.controls .el-button + .el-button,
+.url-row .el-button + .el-button {
+  margin-left: 0;
+}
+
+.controls .el-button {
+  flex: none;
+}
+
 .status-chip {
   display: inline-flex;
   align-items: center;
@@ -1513,27 +1916,6 @@ async function submit() {
   background: rgba(255, 182, 72, 0.08);
 }
 
-.ghost {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex: none;
-  padding: 5px 10px;
-  font-size: 11.5px;
-  white-space: nowrap;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  transition: color 0.16s, border-color 0.16s, background 0.16s;
-}
-
-.ghost:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-  background: var(--bg-hover);
-}
-
 .messages-wrap {
   position: relative;
   flex: 1;
@@ -1556,26 +1938,22 @@ async function submit() {
   background: rgba(242, 176, 60, 0.06);
 }
 
-.sandbox-warn span {
+.sandbox-warn .warn-text {
   flex: 1;
   min-width: 0;
 }
 
-.sandbox-warn button {
-  display: grid;
-  place-items: center;
+.sandbox-warn .banner-close.el-button {
   width: 18px;
   height: 18px;
   flex: none;
+  padding: 0;
   color: var(--text-3);
-  border: none;
-  border-radius: 4px;
-  background: transparent;
 }
 
-.sandbox-warn button:hover {
+.sandbox-warn .banner-close.el-button:hover {
   color: var(--text-1);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-hover);
 }
 
 .messages {
@@ -1593,6 +1971,11 @@ async function submit() {
   width: 100%;
 }
 
+.flow-row {
+  width: 100%;
+  margin: 2px 0;
+}
+
 .tree-col {
   display: flex;
   flex-direction: column;
@@ -1602,37 +1985,28 @@ async function submit() {
 }
 
 /* 回到最新消息：固定在聊天视口底部，不阻塞阅读 */
-.jump-bottom {
+.jump-bottom.el-button {
   position: absolute;
   left: 50%;
   bottom: 14px;
   transform: translateX(-50%);
   z-index: 12;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 11px;
+  margin-left: 0;
   font-size: 10.5px;
   color: var(--text-1);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
+  border-color: var(--line-strong);
   background: var(--bg-elevated);
 }
 
-.jump-bottom :deep(svg) {
-  transform: rotate(90deg);
-  color: var(--accent-cyan);
-}
-
-.jump-bottom:hover {
+.jump-bottom.el-button:hover {
   border-color: var(--accent);
-  color: #fff;
+  color: var(--text-1);
+  background: var(--bg-elevated);
 }
 
-.empty {
+.chat-empty {
   margin: auto;
   max-width: 460px;
-  text-align: center;
 }
 
 .empty-orb {
@@ -1647,12 +2021,13 @@ async function submit() {
   border-radius: 50%;
 }
 
-.empty h3 {
+.empty-title {
   margin: 0 0 6px;
   font-size: 16px;
+  color: var(--text-1);
 }
 
-.empty p {
+.empty-desc {
   margin: 0 0 16px;
   font-size: 12px;
   color: var(--text-3);
@@ -1665,20 +2040,8 @@ async function submit() {
   gap: 6px;
 }
 
-.suggestions button {
-  padding: 6px 11px;
-  font-size: 11.5px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  transition: color 0.16s, border-color 0.16s, background 0.16s;
-}
-
-.suggestions button:hover {
-  color: var(--text-1);
-  border-color: var(--accent);
-  background: var(--bg-hover);
+.suggestions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 .row {
@@ -1762,42 +2125,83 @@ async function submit() {
   margin-top: 4px;
 }
 
-.copy-mini {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+.copy-mini.el-button {
+  height: 22px;
   padding: 2px 7px;
   font-size: 10px;
   color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
-.copy-mini:hover {
+.copy-mini.el-button:hover {
   color: var(--accent-cyan);
-  border-color: var(--line-strong);
   background: var(--bg-hover);
 }
 
-.copy-mini.copied {
+.copy-mini.el-button.copied {
   color: var(--accent-cyan);
-  border-color: rgba(55, 208, 196, 0.45);
 }
 
-/* 发送栏底部：左侧用量文本 + 右侧上下文圆环 */
+/* 最终回答下方：复制 / 赞同 / 不赞同 / 重试 的纯图标按钮 */
+.meta-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+}
+
+.meta-icon:hover:not(:disabled) {
+  color: var(--accent-cyan);
+  background: var(--bg-hover);
+}
+
+.meta-icon.active {
+  color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 12%, transparent);
+}
+
+.meta-icon.dislike.active {
+  color: var(--el-color-warning);
+  background: color-mix(in srgb, var(--el-color-warning) 14%, transparent);
+}
+
+.meta-icon:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 发送栏底部：中间用量文本，右侧上下文圆环 */
 .input-foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   gap: 10px;
   padding: 0 2px;
+}
+
+.usage-spacer {
+  flex: 1;
+  min-width: 0;
+}
+
+.ctx-wrap {
+  flex: 1;
+  display: flex;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .usage-text {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   min-width: 0;
   font-size: 10px;
@@ -1953,18 +2357,18 @@ async function submit() {
   color: var(--text-2);
 }
 
-.archived-readonly .ar-restore {
+.archived-readonly .ar-restore.el-button {
   flex: none;
   height: 28px;
   padding: 0 12px;
   font-size: 11.5px;
   color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.36);
-  border-radius: var(--radius-sm);
-  background: transparent;
+  border-color: rgba(55, 208, 196, 0.36);
 }
 
-.archived-readonly .ar-restore:hover {
+.archived-readonly .ar-restore.el-button:hover {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
   background: rgba(55, 208, 196, 0.1);
 }
 
@@ -2028,18 +2432,27 @@ async function submit() {
   display: none;
 }
 
-.attach {
+.attach.el-button {
   position: relative;
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 40px;
   height: 40px;
+  padding: 0;
   flex: none;
+  margin-left: 0;
+  font-size: 16px;
   color: var(--text-2);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
-  background: transparent;
-  transition: color 0.16s, border-color 0.16s, background 0.16s;
+  border-color: var(--line-strong);
+}
+
+/* 圆形按钮内部可能出现的空白插槽包裹层，统一居中 */
+.attach.el-button > span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
 }
 
 /* 附件下拉容器：菜单向上弹出，避免遮挡输入框 */
@@ -2048,7 +2461,7 @@ async function submit() {
   flex: none;
 }
 
-.attach.active {
+.attach.el-button.active {
   color: var(--accent-cyan);
   border-color: var(--accent);
   background: var(--bg-hover);
@@ -2070,38 +2483,56 @@ async function submit() {
   box-shadow: 0 10px 28px rgba(2, 6, 14, 0.5);
 }
 
-.attach-menu button {
-  display: grid;
-  grid-template-columns: 18px 1fr;
-  grid-template-rows: auto auto;
-  column-gap: 8px;
+/* 下拉项：图标方块 + 两行文字，用 flex 布局，避免依赖 EP 按钮插槽结构 */
+.attach-item {
+  display: flex;
   align-items: center;
-  padding: 8px 10px;
-  text-align: left;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 9px;
+  font-family: inherit;
   color: var(--text-2);
-  border: none;
+  text-align: left;
+  border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  transition: color 0.15s, background 0.15s;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
 }
 
-.attach-menu button:hover {
+.attach-item:hover {
   color: var(--text-1);
   background: var(--bg-hover);
 }
 
-.attach-menu button svg,
-.attach-menu button :deep(svg) {
-  grid-row: 1 / span 2;
+.attach-item .ai-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
   color: var(--accent-cyan);
+  border: 1px solid rgba(55, 208, 196, 0.22);
+  border-radius: 6px;
+  background: rgba(55, 208, 196, 0.07);
 }
 
-.attach-menu button span {
+.attach-item .ai-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.attach-item .ai-label {
   font-size: 12.5px;
+  line-height: 1.35;
 }
 
-.attach-menu button small {
+.attach-item small {
   font-size: 10.5px;
+  line-height: 1.35;
   color: var(--text-3);
 }
 
@@ -2124,52 +2555,25 @@ async function submit() {
   background: rgba(4, 10, 20, 0.4);
 }
 
-.url-row input {
+.url-row .url-icon {
+  flex: none;
+  font-size: 14px;
+  color: var(--accent-cyan);
+}
+
+.url-row .url-input {
   flex: 1;
   min-width: 0;
-  padding: 2px 4px;
+}
+
+.url-row :deep(.el-input__inner) {
   font-size: 12.5px;
-  font-family: inherit;
-  color: var(--text-1);
-  border: none;
+}
+
+.url-row :deep(.el-input__wrapper) {
   background: transparent;
-  outline: none;
-}
-
-.url-row input::placeholder {
-  color: var(--text-3);
-}
-
-.url-ok {
-  flex: none;
-  padding: 4px 12px;
-  font-size: 11.5px;
-  color: #fff;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-}
-
-.url-ok:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.url-cancel {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  flex: none;
-  color: var(--text-3);
-  border: none;
-  border-radius: 5px;
-  background: transparent;
-}
-
-.url-cancel:hover {
-  color: #e2605e;
-  background: rgba(226, 96, 94, 0.14);
+  box-shadow: none;
+  padding: 0 4px;
 }
 
 .pop-enter-active,
@@ -2217,20 +2621,25 @@ async function submit() {
 .pending-chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 6px 3px 6px;
-  font-size: 11px;
+  gap: 7px;
+  padding: 4px 6px 4px 7px;
+  font-size: 11.5px;
+  line-height: 1.3;
   color: var(--text-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  background: transparent;
+  background: rgba(126, 154, 198, 0.05);
 }
 
 .pending-chip img {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   object-fit: cover;
   border-radius: 4px;
+}
+
+.pending-chip > .el-icon {
+  color: var(--text-3);
 }
 
 .pending-chip .p-name {
@@ -2240,19 +2649,20 @@ async function submit() {
   white-space: nowrap;
 }
 
-.pending-chip button {
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
+.pending-chip .chip-close.el-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 0;
+  padding: 0;
+  font-size: 11px;
   color: var(--text-3);
-  border: none;
-  border-radius: 4px;
-  background: transparent;
 }
 
-.pending-chip button:hover {
-  color: #e2605e;
+.pending-chip .chip-close.el-button:hover {
+  color: var(--danger);
   background: rgba(226, 96, 94, 0.14);
 }
 
@@ -2286,52 +2696,41 @@ async function submit() {
   border-radius: 4px;
 }
 
-.input-row textarea {
+.input-row .chat-input {
   flex: 1;
-  min-height: 40px;
-  max-height: 168px;
+  min-width: 0;
+}
+
+.chat-input :deep(.el-textarea__inner) {
+  min-height: 40px !important;
   padding: 10px 14px;
   font-size: 13px;
   font-family: inherit;
+  line-height: 1.6;
   color: var(--text-1);
-  border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
   background: var(--bg-deep);
   resize: none;
-  outline: none;
-  overflow-y: auto;
-  line-height: 1.6;
 }
 
-.input-row textarea:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.22);
-}
-
-.send,
-.stop {
-  display: grid;
-  place-items: center;
+.send.el-button,
+.stop.el-button {
   width: 40px;
   height: 40px;
-  border: none;
-  border-radius: var(--radius-md);
-  color: #fff;
-  transition: filter 0.16s ease;
   flex: none;
+  margin-left: 0;
 }
 
-.send {
-  background: var(--accent);
-}
-
-.send:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.stop {
+.stop.el-button {
+  border-color: var(--danger);
   background: var(--danger);
+  color: #fff;
+}
+
+.stop.el-button:hover {
+  border-color: var(--danger);
+  background: rgba(226, 96, 94, 0.82);
+  color: #fff;
 }
 
 .slide-enter-active,

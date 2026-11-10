@@ -3,6 +3,9 @@
   "include": ["env.d.ts", "src/**/*", "src/**/*.vue"],
   "exclude": ["src/**/__tests__/*"],
   "compilerOptions": {
+    // Element Plus 全局组件类型（app.use 注册后模板可直接使用）
+    "types": ["element-plus/global"],
+
     // Extra safety for array and object lookups, but may have false positives.
     "noUncheckedIndexedAccess": true,
 

@@ -41,13 +41,17 @@ def _session_summary(rounds: list[dict[str, Any]]) -> dict[str, int]:
     ``output`` 是历轮新增生成 Token 之和。
     不能把每轮 input 直接相加：system prompt / 工具 / 技能 / 记忆
     每轮都会被重复送入模型，逐轮求和会让会话数字成倍虚高。
+    ``spent`` 是真实计费口径（历轮 input + output 之和），用于展示
+    “本会话总消耗”；撤回消息不会回退该值。
     """
     latest_input = int(rounds[-1].get("input") or 0) if rounds else 0
     output_sum = sum(int(entry.get("output") or 0) for entry in rounds)
+    input_sum = sum(int(entry.get("input") or 0) for entry in rounds)
     return {
         "input": latest_input,
         "output": output_sum,
         "total": latest_input + output_sum,
+        "spent": input_sum + output_sum,
         "rounds": len(rounds),
     }
 

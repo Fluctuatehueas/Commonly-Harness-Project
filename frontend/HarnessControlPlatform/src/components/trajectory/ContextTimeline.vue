@@ -1,19 +1,34 @@
 <script setup lang="ts">
-// 轨迹页「上下文」视图：占用曲线 + 软水位/窗口上限参考线 + 压缩节点 + 交互 Adorner。
-import { computed, ref, watch } from 'vue'
+// 轨迹页「上下文」视图：ECharts 占用曲线 + 软/硬水位参考线 + 压缩节点 + 交互 Adorner。
+// Adorner 的数据结构与文案保持原样，仅把 SVG 手绘换成 ECharts 渲染。
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import * as echarts from 'echarts/core'
+import { LineChart, ScatterChart } from 'echarts/charts'
+import {
+  GridComponent,
+  MarkLineComponent,
+  MarkPointComponent,
+} from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import type { TrajectoryEvent, TrajectoryRun } from '@/api/trajectory'
 import AppIcon from '@/components/console/AppIcon.vue'
 import InfoHint from '@/components/common/InfoHint.vue'
+
+echarts.use([
+  LineChart,
+  ScatterChart,
+  GridComponent,
+  MarkLineComponent,
+  MarkPointComponent,
+  CanvasRenderer,
+])
 
 const props = defineProps<{
   runs: TrajectoryRun[]
   selectedRunId: string
 }>()
 
-const WIDTH = 640
-const HEIGHT = 210
-const PAD_X = 46
-const PAD_Y = 28
+const CHART_HEIGHT = 240
 
 const events = computed<TrajectoryEvent[]>(() => {
   const scoped = props.selectedRunId
@@ -80,54 +95,19 @@ const maxY = computed(() =>
   Math.max(windowSize.value, peak.value, hardWatermark.value, 1) * 1.02,
 )
 
-function xAt(index: number): number {
-  const total = Math.max(points.value.length - 1, 1)
-  return PAD_X + (WIDTH - PAD_X * 2) * (index / total)
-}
-function yAt(value: number): number {
-  return HEIGHT - PAD_Y - (HEIGHT - PAD_Y * 2) * (value / maxY.value)
-}
-const pctX = (coordinate: number) => `${(coordinate / WIDTH) * 100}%`
-const pctY = (coordinate: number) => `${(coordinate / HEIGHT) * 100}%`
-
-const linePath = computed(() =>
-  points.value
-    .map(
-      (event, index) =>
-        `${index === 0 ? 'M' : 'L'}${xAt(index).toFixed(1)},${yAt(
-          Number(event.context?.used_tokens || 0),
-        ).toFixed(1)}`,
-    )
-    .join(' '),
-)
-
-const areaPath = computed(() => {
-  if (!points.value.length) return ''
-  const first = xAt(0)
-  const last = xAt(points.value.length - 1)
-  const base = HEIGHT - PAD_Y
-  return `${linePath.value} L${last},${base} L${first},${base} Z`
-})
-
-// 每个压缩点：竖线 + 压缩前/后两个圆点
+// 每个压缩点：在曲线上的索引 + 压缩前/后数值
 const markers = computed(() =>
   compactions.value.map((event) => {
     let index = points.value.findIndex((item) => item.start >= event.start)
     if (index < 0) index = Math.max(points.value.length - 1, 0)
-    const point = points.value[index]
     return {
       event,
-      x: xAt(Math.max(index, 0)),
+      index: Math.max(index, 0),
       before: Number(event.trigger?.used_tokens || 0),
-      after: Number(event.compaction_result?.after_tokens || point?.context?.used_tokens || 0),
+      after: Number(event.compaction_result?.after_tokens || points.value[index]?.context?.used_tokens || 0),
     }
   }),
 )
-
-function nearestIndex(ratio: number): number {
-  const total = Math.max(points.value.length - 1, 1)
-  return Math.min(Math.max(Math.round(ratio * total), 0), total)
-}
 
 // ---------- Adorner 交互 ----------
 type AdornerKind = 'point' | 'compaction' | 'soft' | 'hard' | 'limit'
@@ -139,6 +119,7 @@ interface AdornerData {
   kind: AdornerKind
   title: string
   rows: AdornerRow[]
+  /** 画布内像素坐标（相对 chart 容器） */
   x: number
   y: number
   flip: boolean
@@ -216,52 +197,70 @@ function timeLabel(value?: string): string {
   return date.toLocaleTimeString('zh-CN', { hour12: false })
 }
 
-function buildPointAdorner(index: number): AdornerData {
+function shortTime(value?: string): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+const apx = (value: number) => `${fmt(value)} tok`
+
+function buildPointAdorner(index: number, px: number, py: number): AdornerData {
   const event = points.value[index]
   const used = Number(event?.context?.used_tokens || 0)
   const pct = windowSize.value ? (used / windowSize.value) * 100 : 0
-  const x = xAt(index)
-  const y = yAt(used)
   const gap = softWatermark.value - used
   return {
     kind: 'point',
     title: `模型调用 #${index + 1}`,
     rows: [
       { key: '时间', value: timeLabel(event?.start) },
-      { key: '已用上下文', value: `${fmt(used)} tok` },
+      { key: '已用上下文', value: apx(used) },
       { key: '占窗口', value: `${pct.toFixed(1)}%` },
       {
         key: gap >= 0 ? '距软水位' : '超出软水位',
-        value: `${fmt(Math.abs(gap))} tok`,
+        value: apx(Math.abs(gap)),
       },
       { key: '本步', value: String(event?.label || '') },
     ],
-    x,
-    y,
-    flip: y < HEIGHT * 0.45,
+    x: px,
+    y: py,
+    flip: py > CHART_HEIGHT * 0.5,
   }
 }
 
-function buildCompactionAdorner(marker: (typeof markers.value)[number]): AdornerData {
-  const { event, x, before, after } = marker
+function buildCompactionAdorner(
+  marker: (typeof markers.value)[number],
+  px: number,
+  py: number,
+): AdornerData {
+  const { event, before, after } = marker
   return {
     kind: 'compaction',
     title: '上下文压缩',
     rows: [
       { key: '触发', value: String(event.trigger?.type || 'unknown') },
-      { key: '压缩前', value: `${fmt(before)} tok` },
-      { key: '压缩后', value: `${fmt(after)} tok` },
-      { key: '节省', value: `${fmt(Math.max(before - after, 0))} tok` },
-      { key: '锚点保真', value: `${event.evaluation?.anchors_kept ?? 0}/${event.evaluation?.anchors_total ?? 0}` },
+      { key: '压缩前', value: apx(before) },
+      { key: '压缩后', value: apx(after) },
+      { key: '节省', value: apx(Math.max(before - after, 0)) },
+      {
+        key: '锚点保真',
+        value: `${event.evaluation?.anchors_kept ?? 0}/${event.evaluation?.anchors_total ?? 0}`,
+      },
       { key: '耗时', value: `${fmt(Number(event.duration_ms || 0))} ms` },
     ],
-    x,
-    y: Math.min(yAt(before), yAt(after)),
-    flip: Math.min(yAt(before), yAt(after)) < HEIGHT * 0.5,
+    x: px,
+    y: py,
+    flip: py > CHART_HEIGHT * 0.5,
   }
 }
 
-function buildRefAdorner(kind: 'soft' | 'hard' | 'limit'): AdornerData {
+function buildRefAdorner(
+  kind: 'soft' | 'hard' | 'limit',
+  px: number,
+  py: number,
+): AdornerData {
   let title = '软水位'
   let value = softWatermark.value
   let desc = '达到后允许压缩'
@@ -274,97 +273,269 @@ function buildRefAdorner(kind: 'soft' | 'hard' | 'limit'): AdornerData {
     value = windowSize.value
     desc = '模型上下文窗口'
   }
-  const y = yAt(value)
   return {
     kind,
     title,
     rows: [
-      { key: '阈值', value: `${fmt(value)} tok` },
+      { key: '阈值', value: apx(value) },
       {
         key: '占窗口',
         value: `${((value / (windowSize.value || 1)) * 100).toFixed(1)}%`,
       },
       { key: '含义', value: desc },
     ],
-    x: WIDTH - PAD_X - 40,
-    y,
-    flip: y < HEIGHT * 0.5,
+    x: px,
+    y: py,
+    flip: py > CHART_HEIGHT * 0.5,
   }
 }
 
-const svgRef = ref<SVGSVGElement | null>(null)
+// ---------- ECharts ----------
+const chartEl = ref<HTMLDivElement | null>(null)
+const chart = shallowRef<echarts.ECharts | null>(null)
+let observer: ResizeObserver | null = null
 
-/**
- * 屏幕坐标 → SVG 用户坐标（viewBox 坐标）。
- * 用 getScreenCTM 反变换，避免按外层卡片尺寸换算带来的偏移误差。
- */
-function clientToViewBox(clientX: number, clientY: number): { x: number; y: number } | null {
-  const svg = svgRef.value
-  const ctm = svg?.getScreenCTM()
-  if (!svg || !ctm) return null
-  const point = svg.createSVGPoint()
-  point.x = clientX
-  point.y = clientY
-  const local = point.matrixTransform(ctm.inverse())
-  return { x: local.x, y: local.y }
-}
+const axisTextColor = '#5c6f92'
+const splitLineColor = 'rgba(126, 154, 198, 0.1)'
 
-function onChartMove(event: MouseEvent) {
-  const local = clientToViewBox(event.clientX, event.clientY)
-  if (!local) return
-  const plotX = Math.min(Math.max(local.x, 0), WIDTH)
-  const plotY = Math.min(Math.max(local.y, 0), HEIGHT)
-  const ratioX = plotX / WIDTH
+function buildOption(): echarts.EChartsCoreOption {
+  const categories = points.value.map((_, i) => String(i))
+  const lineData = points.value.map((event) => Number(event.context?.used_tokens || 0))
+  const compactionDots = markers.value.flatMap((marker) => [
+    { value: [String(marker.index), marker.before], symbol: 'circle', symbolSize: 7, itemStyle: { color: '#b07cff', borderColor: 'rgba(10,14,26,0.9)', borderWidth: 1 } },
+    { value: [String(marker.index), marker.after], symbol: 'circle', symbolSize: 7, itemStyle: { color: '#37d0c4', borderColor: 'rgba(10,14,26,0.9)', borderWidth: 1 } },
+  ])
+  const activeDots = markers.value
+    .filter((marker) => marker.event.id === selectedId.value)
+    .flatMap((marker) => [
+      { value: [String(marker.index), marker.before] },
+      { value: [String(marker.index), marker.after] },
+    ])
 
-  // 参考线优先：鼠标靠近软/硬/上限线时给出阈值说明。
-  const refs: Array<['soft' | 'hard' | 'limit', number]> = [
-    ['limit', yAt(windowSize.value)],
-    ['hard', yAt(hardWatermark.value)],
-    ['soft', yAt(softWatermark.value)],
+  const refLines = [
+    { value: windowSize.value, color: 'rgba(226, 96, 94, 0.55)', label: `窗口上限 ${fmt(windowSize.value)}` },
+    { value: hardWatermark.value, color: 'rgba(242, 176, 60, 0.5)', label: `硬水位 ${fmt(hardWatermark.value)}` },
+    { value: softWatermark.value, color: 'rgba(126, 224, 210, 0.5)', label: `软水位 ${fmt(softWatermark.value)}` },
   ]
-  const hitRef = refs.find(([, y]) => Math.abs(plotY - y) <= 9)
-  if (hitRef) {
-    hover.value = buildRefAdorner(hitRef[0])
-    return
-  }
 
-  // 压缩节点：横向距离 10px 内优先展示压缩详情。
-  const hitMarker = markers.value.find((marker) => Math.abs(plotX - marker.x) <= 10)
-  if (hitMarker) {
-    hover.value = buildCompactionAdorner(hitMarker)
-    return
+  return {
+    animationDuration: 320,
+    grid: { left: 46, right: 76, top: 18, bottom: 26 },
+    xAxis: {
+      type: 'category',
+      data: categories,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: splitLineColor } },
+      axisTick: { show: false },
+      axisLabel: {
+        color: axisTextColor,
+        fontSize: 10,
+        interval: 'auto',
+        formatter: (value: string) => shortTime(points.value[Number(value)]?.start),
+      },
+    },
+    yAxis: {
+      type: 'value',
+      max: maxY.value,
+      axisLabel: {
+        color: axisTextColor,
+        fontSize: 10,
+        formatter: (value: number) => `${Math.round(value / 1000)}k`,
+      },
+      splitLine: { lineStyle: { color: splitLineColor } },
+    },
+    series: [
+      {
+        name: '上下文占用',
+        type: 'line',
+        data: lineData,
+        connectNulls: true,
+        showSymbol: false,
+        lineStyle: { color: '#5b8cff', width: 1.8 },
+        areaStyle: {
+          // 用对象形式的线性渐变，避免依赖 echarts.graphic 的运行时导出
+          color: {
+            type: 'linear',
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(91,140,255,0.34)' },
+              { offset: 1, color: 'rgba(91,140,255,0)' },
+            ],
+          },
+        },
+        markLine: {
+          silent: true,
+          symbol: 'none',
+          data: [
+            ...refLines.map((line) => ({
+              yAxis: line.value,
+              lineStyle: { color: line.color, type: [5, 5], width: 1 },
+              label: {
+                show: true,
+                position: 'insideEndTop',
+                formatter: line.label,
+                color: line.color,
+                fontSize: 10,
+              },
+            })),
+            ...markers.value.map((marker) => ({
+              xAxis: String(marker.index),
+              lineStyle: { color: 'rgba(176, 124, 255, 0.45)', type: [3, 3], width: 1 },
+              label: { show: false },
+            })),
+          ],
+        },
+      },
+      {
+        name: '压缩节点',
+        type: 'scatter',
+        data: compactionDots,
+        z: 4,
+        symbolSize: 7,
+      },
+      {
+        name: '选中压缩',
+        type: 'scatter',
+        data: activeDots,
+        z: 5,
+        symbolSize: 13,
+        itemStyle: { color: 'transparent', borderColor: '#ffffff', borderWidth: 1.4 },
+      },
+    ],
   }
+}
 
-  if (!points.value.length) {
+function renderChart() {
+  const el = chartEl.value
+  if (!el) return
+  if (!chart.value) {
+    chart.value = echarts.init(el, undefined, { renderer: 'canvas' })
+    bindEvents()
+  }
+  chart.value.setOption(buildOption(), { notMerge: true })
+}
+
+function resizeChart() {
+  chart.value?.resize()
+}
+
+function pixelOfX(index: number): number | null {
+  const instance = chart.value
+  if (!instance) return null
+  const pixel = instance.convertToPixel({ xAxisIndex: 0 }, String(index))
+  return typeof pixel === 'number' ? pixel : null
+}
+
+function pixelOfY(value: number): number | null {
+  const instance = chart.value
+  if (!instance) return null
+  const pixel = instance.convertToPixel({ yAxisIndex: 0 }, value)
+  return typeof pixel === 'number' ? pixel : null
+}
+
+function bindEvents() {
+  const instance = chart.value
+  if (!instance) return
+
+  instance.getZr().on('mousemove', (event) => {
+    const px = event.offsetX
+    const py = event.offsetY
+
+    // 参考线优先：靠近软/硬/上限线时给出阈值说明
+    const refs: Array<['limit' | 'hard' | 'soft', number]> = [
+      ['limit', windowSize.value],
+      ['hard', hardWatermark.value],
+      ['soft', softWatermark.value],
+    ]
+    for (const [kind, value] of refs) {
+      const y = pixelOfY(value)
+      if (y !== null && Math.abs(py - y) <= 8) {
+        hover.value = buildRefAdorner(kind, px, y)
+        return
+      }
+    }
+
+    // 压缩节点：横向 10px 内优先展示压缩详情
+    for (const marker of markers.value) {
+      const x = pixelOfX(marker.index)
+      if (x !== null && Math.abs(px - x) <= 10) {
+        const y = Math.min(
+          pixelOfY(marker.before) ?? py,
+          pixelOfY(marker.after) ?? py,
+        )
+        hover.value = buildCompactionAdorner(marker, x, y)
+        return
+      }
+    }
+
+    // 最近数据点
+    if (!points.value.length) {
+      hover.value = null
+      return
+    }
+    const data = instance.convertFromPixel({ gridIndex: 0 }, [px, py])
+    const rawIndex = Array.isArray(data) ? Number(data[0]) : 0
+    const index = Math.min(Math.max(Math.round(rawIndex), 0), points.value.length - 1)
+    const x = pixelOfX(index)
+    const y = pixelOfY(Number(points.value[index]?.context?.used_tokens || 0))
+    if (x === null || y === null) return
+    hover.value = buildPointAdorner(index, x, y)
+  })
+
+  instance.getZr().on('globalout', () => {
     hover.value = null
-    return
-  }
-  hover.value = buildPointAdorner(nearestIndex(ratioX))
-}
+  })
 
-function onChartLeave() {
-  hover.value = null
-}
-
-function onChartClick(event: MouseEvent) {
-  const local = clientToViewBox(event.clientX, event.clientY)
-  if (!local) return
-  const marker = markers.value.find((item) => Math.abs(local.x - item.x) <= 12)
-  if (marker) selectedId.value = marker.event.id
+  instance.getZr().on('click', (event) => {
+    const px = event.offsetX
+    for (const marker of markers.value) {
+      const x = pixelOfX(marker.index)
+      if (x !== null && Math.abs(px - x) <= 12) {
+        selectedId.value = marker.event.id
+        renderChart()
+        return
+      }
+    }
+  })
 }
 
 const adornerStyle = computed(() => {
   const data = hover.value
   if (!data) return {}
-  const leftPct = (data.x / WIDTH) * 100
-  const topPct = (data.y / HEIGHT) * 100
-  const clampedLeft = Math.min(Math.max(leftPct, 16), 84)
+  const width = chart.value?.getWidth() ?? 640
+  // 左右留边，避免卡片被裁切
+  const clampedX = Math.min(Math.max(data.x, 96), Math.max(width - 96, 96))
   return {
-    left: `${clampedLeft}%`,
-    top: `${topPct}%`,
-    transform: data.flip ? 'translate(-50%, 14px)' : 'translate(-50%, calc(-100% - 14px))',
+    left: `${clampedX}px`,
+    top: `${data.y}px`,
+    transform: data.flip ? 'translate(-50%, 12px)' : 'translate(-50%, calc(-100% - 12px))',
   }
 })
+
+onMounted(() => {
+  if (points.value.length) renderChart()
+  if (chartEl.value) {
+    observer = new ResizeObserver(() => resizeChart())
+    observer.observe(chartEl.value)
+  }
+})
+
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  observer = null
+  chart.value?.dispose()
+  chart.value = null
+})
+
+watch(
+  () => [points.value.length, props.selectedRunId, compactions.value.length],
+  () => renderChart(),
+)
+
+watch([softWatermark, hardWatermark, windowSize, selectedId], () => renderChart())
 </script>
 
 <template>
@@ -384,113 +555,16 @@ const adornerStyle = computed(() => {
     </header>
 
     <div v-if="!points.length" class="ctx-empty">
-      <AppIcon name="workflow" :size="20" />
+      <el-icon :size="20"><AppIcon name="workflow" :size="20" /></el-icon>
       <p>本次运行还没有上下文快照，发送一条消息后再刷新。</p>
     </div>
 
     <template v-else>
       <div class="chart-wrap">
-        <div
-          class="chart-plot"
-          @mousemove="onChartMove"
-          @mouseleave="onChartLeave"
-          @click="onChartClick"
-        >
-          <svg
-            ref="svgRef"
-            :viewBox="`0 0 ${WIDTH} ${HEIGHT}`"
-            class="chart"
-            role="img"
-            aria-label="上下文占用曲线"
-          >
-          <defs>
-            <linearGradient id="ctx-area" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="rgba(91,140,255,0.34)" />
-              <stop offset="100%" stop-color="rgba(91,140,255,0)" />
-            </linearGradient>
-          </defs>
+        <div class="chart-plot">
+          <div ref="chartEl" class="chart-canvas" :style="{ height: `${CHART_HEIGHT}px` }" />
 
-          <!-- 参考线：窗口上限 / 硬水位 / 软水位 -->
-          <line
-            :x1="PAD_X"
-            :x2="WIDTH - PAD_X"
-            :y1="yAt(windowSize)"
-            :y2="yAt(windowSize)"
-            class="ref-line limit"
-          />
-          <line
-            :x1="PAD_X"
-            :x2="WIDTH - PAD_X"
-            :y1="yAt(hardWatermark)"
-            :y2="yAt(hardWatermark)"
-            class="ref-line hard"
-          />
-          <line
-            :x1="PAD_X"
-            :x2="WIDTH - PAD_X"
-            :y1="yAt(softWatermark)"
-            :y2="yAt(softWatermark)"
-            class="ref-line soft"
-          />
-
-          <path :d="areaPath" fill="url(#ctx-area)" />
-          <path :d="linePath" class="usage-line" />
-
-          <!-- 压缩节点：竖虚线 + 压缩前后圆点 -->
-          <g v-for="marker in markers" :key="marker.event.id">
-            <line
-              :x1="marker.x"
-              :x2="marker.x"
-              :y1="PAD_Y"
-              :y2="HEIGHT - PAD_Y"
-              class="mark-line"
-            />
-            <circle
-              :cx="marker.x"
-              :cy="yAt(marker.before)"
-              r="4"
-              class="mark-dot before"
-              :class="{ active: marker.event.id === selectedId }"
-            />
-            <circle
-              :cx="marker.x"
-              :cy="yAt(marker.after)"
-              r="4"
-              class="mark-dot after"
-              :class="{ active: marker.event.id === selectedId }"
-            />
-          </g>
-
-          <!-- 悬停定位虚线 -->
-          <line
-            v-if="hover"
-            :x1="hover.x"
-            :x2="hover.x"
-            :y1="PAD_Y"
-            :y2="HEIGHT - PAD_Y"
-            class="hover-line"
-          />
-          <circle
-            v-if="hover && hover.kind === 'point'"
-            :cx="hover.x"
-            :cy="hover.y"
-            r="4.5"
-            class="hover-dot"
-          />
-        </svg>
-
-        <!-- 图表内联阈值标签（替代底部图例） -->
-          <span class="pin limit" :style="{ top: pctY(yAt(windowSize)) }">
-            窗口上限 {{ fmt(windowSize) }}
-          </span>
-          <span class="pin hard" :style="{ top: pctY(yAt(hardWatermark)) }">
-            硬水位 {{ fmt(hardWatermark) }}
-          </span>
-          <span class="pin soft" :style="{ top: pctY(yAt(softWatermark)) }">
-            软水位 {{ fmt(softWatermark) }}
-          </span>
-
-          <!-- Adorner 数据卡片 -->
+          <!-- Adorner 数据卡片：结构保持不变 -->
           <div v-if="hover" class="adorner" :class="hover.kind" :style="adornerStyle">
             <header>
               <b>{{ hover.title }}</b>
@@ -506,12 +580,12 @@ const adornerStyle = computed(() => {
 
       <div class="ctx-body">
         <div class="ctx-list">
-          <button
+          <el-button
             v-for="event in compactions"
             :key="event.id"
-            type="button"
             class="ctx-card"
             :class="{ active: event.id === selectedId }"
+            text
             @click="selectedId = event.id"
           >
             <span class="ctx-card-title">
@@ -524,7 +598,7 @@ const adornerStyle = computed(() => {
               {{ fmt(Number(event.trigger?.used_tokens || 0)) }} →
               {{ fmt(Number(event.compaction_result?.after_tokens || 0)) }} tok
             </span>
-          </button>
+          </el-button>
           <p v-if="!compactions.length" class="ctx-hint">本次运行未触发上下文压缩</p>
         </div>
 
@@ -651,81 +725,14 @@ const adornerStyle = computed(() => {
   background: rgba(255, 255, 255, 0.02);
 }
 
-/* 与 SVG viewBox 完全对齐的绘图区，Adorner 用百分比定位 */
 .chart-plot {
   position: relative;
   cursor: crosshair;
 }
 
-.chart {
+.chart-canvas {
   width: 100%;
-  height: auto;
-  display: block;
 }
-
-.ref-line {
-  stroke-dasharray: 5 5;
-  stroke-width: 1;
-}
-
-.ref-line.limit { stroke: rgba(226, 96, 94, 0.5); }
-.ref-line.hard { stroke: rgba(242, 176, 60, 0.45); }
-.ref-line.soft { stroke: rgba(126, 224, 210, 0.45); }
-
-.usage-line {
-  fill: none;
-  stroke: #5b8cff;
-  stroke-width: 1.8;
-  stroke-linejoin: round;
-}
-
-.mark-line {
-  stroke: rgba(176, 124, 255, 0.45);
-  stroke-dasharray: 3 3;
-}
-
-.mark-dot {
-  fill: #b07cff;
-  stroke: rgba(10, 14, 26, 0.9);
-  stroke-width: 1;
-}
-
-.mark-dot.after { fill: #37d0c4; }
-
-.mark-dot.active {
-  stroke: #ffffff;
-  stroke-width: 1.6;
-}
-
-.hover-line {
-  stroke: rgba(255, 255, 255, 0.35);
-  stroke-dasharray: 4 3;
-}
-
-.hover-dot {
-  fill: none;
-  stroke: #ffffff;
-  stroke-width: 1.6;
-}
-
-/* 图表内联阈值标签 */
-.pin {
-  position: absolute;
-  right: 10px;
-  transform: translateY(-50%);
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 10px;
-  font-family: var(--font-mono);
-  line-height: 16px;
-  pointer-events: none;
-  background: rgba(12, 18, 32, 0.86);
-  border: 1px solid transparent;
-}
-
-.pin.limit { color: #f2a09f; border-color: rgba(226, 96, 94, 0.45); }
-.pin.hard { color: #f2c777; border-color: rgba(242, 176, 60, 0.45); }
-.pin.soft { color: #7ee0d2; border-color: rgba(126, 224, 210, 0.4); }
 
 /* Adorner 卡片 */
 .adorner {
@@ -802,12 +809,17 @@ const adornerStyle = computed(() => {
   align-items: flex-start;
   gap: 3px;
   padding: 9px 11px;
+  height: auto;
   border-radius: 9px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.02);
   color: var(--text-2);
-  cursor: pointer;
   text-align: left;
+}
+
+.ctx-card:hover {
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .ctx-card.active {
@@ -821,6 +833,7 @@ const adornerStyle = computed(() => {
   display: flex;
   gap: 8px;
   align-items: center;
+  color: var(--text-1);
 }
 
 .ctx-card-title em {
@@ -838,6 +851,16 @@ const adornerStyle = computed(() => {
 .ctx-hint {
   color: var(--text-3);
   font-size: 11px;
+}
+
+.ctx-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 36px 0;
+  color: var(--text-3);
+  font-size: 11.5px;
 }
 
 /* 压缩详情卡片：标题更大、逐行分隔线、行首加粗 */
@@ -871,7 +894,6 @@ const adornerStyle = computed(() => {
 
 .detail-row.block {
   grid-template-columns: 1fr;
-  gap: 5px;
 }
 
 .detail-row .k {
@@ -920,17 +942,6 @@ const adornerStyle = computed(() => {
   padding: 6px 8px;
   border-radius: 7px;
   background: rgba(0, 0, 0, 0.22);
-}
-
-.ctx-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-height: 220px;
-  color: var(--text-3);
-  font-size: 12px;
 }
 
 @media (max-width: 960px) {

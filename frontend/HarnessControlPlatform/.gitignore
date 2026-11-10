@@ -37,3 +37,6 @@ __screenshots__/
 
 # Vite
 *.timestamp-*-*.mjs
+
+# npm 本地缓存（安装依赖时使用 --cache .npm-cache）
+.npm-cache/

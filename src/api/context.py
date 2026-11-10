@@ -428,6 +428,9 @@ async def upload_context_file(
     user_id: str = Query(..., min_length=1),
 ) -> dict[str, Any]:
     """保存一个上传文件；超过大小或类型不支持时直接拒绝。"""
+    from api.identity import effective_user_id
+
+    user_id = effective_user_id(user_id)
     limit = MAX_FILE_MB * 1024 * 1024
     chunks: list[bytes] = []
     size = 0
@@ -461,6 +464,9 @@ async def import_context_url(request: UrlImportRequest) -> dict[str, Any]:
     只允许 http/https 公网地址；每一跳跳转都会重新校验，
     防止通过跳转访问内网（基础 SSRF 防护）。
     """
+    from api.identity import effective_user_id
+
+    request.user_id = effective_user_id(request.user_id)
     data, content_type = await _download_url(request.url)
     name = _guess_filename(request.url, content_type)
     return _persist_bytes(
@@ -474,6 +480,9 @@ async def import_context_url(request: UrlImportRequest) -> dict[str, Any]:
 @router.delete("/{file_id}")
 async def delete_context_file(file_id: str, user_id: str = Query(..., min_length=1)) -> dict[str, bool]:
     """删除尚未发送的附件，避免占用磁盘。"""
+    from api.identity import effective_user_id
+
+    user_id = effective_user_id(user_id)
     if not re.fullmatch(r"[0-9a-f]{32}", file_id):
         raise HTTPException(status_code=400, detail="非法附件 ID")
     folder = _user_dir(user_id) / file_id
@@ -495,6 +504,9 @@ async def resolve_context_files(request: ResolveAttachmentsRequest) -> dict[str,
 
     前端恢复草稿时只保留有效附件，并提示用户哪些附件已失效。
     """
+    from api.identity import effective_user_id
+
+    request.user_id = effective_user_id(request.user_id)
     files: list[dict[str, Any]] = []
     missing: list[str] = []
     for file_id in dict.fromkeys(request.ids):

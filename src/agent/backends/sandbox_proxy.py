@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from threading import RLock
+from threading import Condition
 
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
@@ -22,16 +22,59 @@ class SandboxBackendProxy(BaseSandbox):
 
     Agent 图在构建时会捕获后端对象。恢复沙箱时替换被代理的后端，而不是重建
     Agent 图，可以保持图中已有引用继续有效。
+
+    并发语义：
+    - 普通操作（execute / 文件传输 / 健康检查）可以并发执行，不再被一把锁串行化，
+      多个子 Agent 因此能在同一个沙箱里真正并行干活；
+    - ``replace_backend`` / ``close`` 需要等所有在途操作和事务结束后再替换，
+      避免热替换把正在执行的命令打断。
     """
     def __init__(self, backend: BaseSandbox | None = None) -> None:
        self._backend = backend
-       self._lock = RLock()
+       self._condition = Condition()
+       self._active_ops = 0
+       self._transactions = 0
+       self._replacing = False
 
-    #  上下文管理器，进入时拿锁，退出时释放。确保后端使用时一直被占有，不被其他agent异步替换。
+    #  上下文管理器：事务期间禁止替换后端，但允许普通操作继续并发。
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        with self._lock:
+        with self._condition:
+            while self._replacing:
+                self._condition.wait()
+            self._transactions += 1
+        try:
             yield
+        finally:
+            with self._condition:
+                self._transactions -= 1
+                if self._transactions == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def _operation(self) -> Iterator[BaseSandbox]:
+        """登记一次在途操作；替换/关闭会等待它结束。"""
+        with self._condition:
+            while self._replacing:
+                self._condition.wait()
+            backend = self._require_backend()
+            self._active_ops += 1
+        try:
+            yield backend
+        finally:
+            with self._condition:
+                self._active_ops -= 1
+                if self._active_ops == 0:
+                    self._condition.notify_all()
+
+    def _wait_idle(self) -> BaseSandbox | None:
+        """进入替换流程并等待在途操作清空；调用方需持有 condition。"""
+        self._replacing = True
+        while self._active_ops or self._transactions:
+            self._condition.wait()
+        previous = self._backend
+        return previous
+
     # 请求一个沙箱
     def _require_backend(self) -> BaseSandbox:
         """
@@ -44,53 +87,62 @@ class SandboxBackendProxy(BaseSandbox):
     @property
     def id(self) -> str:
         """返回当前沙箱标识"""
-        with self._lock:
-            return self._require_backend().id
+        with self._operation() as backend:
+            return backend.id
     
     # 热替换的核心
     def replace_backend(self, backend: BaseSandbox) -> None:
         """
         等待进行中的操作完成，安装新后端并关闭旧客户端。
         """
-        with self._lock: # 拿锁，保证没有正在进行的 execute / upload_files / download_files（它们都持锁）。
-            previous = self._backend # 保存后端引用
-            self._backend = backend # 原子替换
-            if previous is not backend: # 避免自己替换自己，把自己关掉了，确保真正关闭的时旧的
-                close = getattr(previous, "close", None) 
-                if callable(close):
-                    close()
+        with self._condition:
+            previous = self._wait_idle()
+            self._backend = backend
+            self._replacing = False
+            self._condition.notify_all()
+        if previous is not None and previous is not backend:
+            close = getattr(previous, "close", None)
+            if callable(close):
+                close()
 
     def close(self) -> None:
         """
         等待活动操作完成，并只关闭一次本地资源。
         """
-        with self._lock:
-            previous = self._backend
+        with self._condition:
+            previous = self._wait_idle()
             self._backend = None
-            close = getattr(previous, "close", None) # 反射：拿backend的close方法 
-            if callable(close): 
+            self._replacing = False
+            self._condition.notify_all()
+        if previous is not None:
+            close = getattr(previous, "close", None)
+            if callable(close):
                 close()
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        """将命令执行转发到当前沙箱。"""
-        with self._lock:
-            return self._require_backend().execute(command, timeout=timeout)
+        """将命令执行转发到当前沙箱（支持多子 Agent 并发）。"""
+        with self._operation() as backend:
+            return backend.execute(command, timeout=timeout)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """将文件上传转发到当前沙箱。"""
-        with self._lock:
-            return self._require_backend().upload_files(files)
+        with self._operation() as backend:
+            return backend.upload_files(files)
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
         """将文件下载转发到当前沙箱。"""
-        with self._lock:
-            return self._require_backend().download_files(paths)
+        with self._operation() as backend:
+            return backend.download_files(paths)
 
     # 健康指针
     def is_healthy(self) -> bool:
         """使用当前后端的健康探针返回沙箱状态。"""
-        with self._lock:
-            if self._backend is None:
-                return False
-            probe = getattr(self._backend, "is_healthy", None)
-            return bool(probe()) if callable(probe) else self.execute("true").exit_code == 0
+        try:
+            with self._operation() as backend:
+                probe = getattr(backend, "is_healthy", None)
+                if callable(probe):
+                    return bool(probe())
+                # 不要嵌套调用 self.execute：替换流程等待在途操作时会死锁。
+                return backend.execute("true").exit_code == 0
+        except Exception:
+            return False

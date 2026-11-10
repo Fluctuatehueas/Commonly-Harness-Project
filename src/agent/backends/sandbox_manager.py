@@ -51,16 +51,25 @@ class SandboxManager:
         self._operations: set[asyncio.Task[SandboxBackendProxy]] = set()
         self._close_task: asyncio.Task[None] | None = None
         self._is_closed = False
-        self._connection: ConnectionConfigSync | None = None
-        if agent_config.OPEN_SANDBOX_API_KEY:
-            self._connection = ConnectionConfigSync(
-                api_key=agent_config.OPEN_SANDBOX_API_KEY,
-                domain=(
-                    f"{agent_config.OPEN_SANDBOX_HOST}:"
-                    f"{agent_config.OPEN_SANDBOX_PORT}"
-                ),
-                use_server_proxy=agent_config.OPEN_SANDBOX_USE_SERVER_PROXY,
-            )
+
+    @property
+    def _connection(self) -> ConnectionConfigSync | None:
+        """当前用户生效的 OpenSandbox 连接配置。
+
+        系统设置按用户保存，因此每次获取时按请求上下文解析：
+        同一进程内不同用户可以使用不同的沙箱地址 / 密钥。
+        """
+        from agent.identity import current_user_id
+        from agent.user_data import sandbox_settings
+
+        settings = sandbox_settings(current_user_id())
+        if not settings["api_key"]:
+            return None
+        return ConnectionConfigSync(
+            api_key=settings["api_key"],
+            domain=f"{settings['host']}:{settings['port']}",
+            use_server_proxy=settings["use_server_proxy"],
+        )
 
     async def initialize(self) -> None:
         """

@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "id": "tf_builtin_code_review",
+  "name": "代码审查与修复",
+  "description": "审查指定代码或改动，按问题清单逐项确认并修复，最后回归验证",
+  "source": "user",
+  "status": "published",
+  "trigger_examples": ["帮我审查一下这段代码", "review 一下最近的改动", "检查代码有没有问题"],
+  "mcp_services": [],
+  "steps": [
+    {
+      "id": "s1",
+      "name": "范围确认",
+      "instruction": "确认审查范围：文件、提交或功能模块；确认关注重点（正确性/安全/性能）",
+      "skills": "auto",
+      "executor": "main",
+      "constraints": "只确认范围，不开始审查"
+    },
+    {
+      "id": "s2",
+      "name": "审查并汇总问题",
+      "instruction": "通读范围内代码，输出按严重程度排序的问题清单（位置、问题、建议）",
+      "skills": "auto",
+      "executor": "auto",
+      "checkpoint": true,
+      "example": "## 问题清单\n1. [高] 文件:行号 - 问题描述 - 修复建议\n2. [中] ..."
+    },
+    {
+      "id": "s3",
+      "name": "逐项修复",
+      "instruction": "按问题清单逐项修复，每项修复说明改动点",
+      "skills": "auto",
+      "executor": "auto",
+      "constraints": "只修复清单内确认的问题，不顺手重构"
+    },
+    {
+      "id": "s4",
+      "name": "回归验证",
+      "instruction": "运行相关测试或最小验证，确认修复未引入新问题",
+      "skills": "auto",
+      "executor": "auto",
+      "checkpoint": true
+    }
+  ]
+}

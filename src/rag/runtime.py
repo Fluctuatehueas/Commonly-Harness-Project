@@ -694,4 +694,34 @@ class RagRuntime:
             state.document_count = max(0, state.document_count - 1)
 
 
-rag_runtime = RagRuntime()
+# ============================================================
+# 按用户隔离的 RAG 运行时
+# ============================================================
+
+_USER_RUNTIMES: dict[str, RagRuntime] = {}
+
+
+def get_rag_runtime(user_id: str | None = None) -> RagRuntime:
+    """返回指定用户的 RAG 运行时；Provider 配置互不可见。"""
+    from agent.identity import current_user_id, safe_user_id
+    from agent.user_data import user_rag_config_path
+    from rag.config_store import RagConfigStore
+
+    uid = safe_user_id(user_id or current_user_id())
+    runtime = _USER_RUNTIMES.get(uid)
+    if runtime is None:
+        runtime = RagRuntime(
+            RagConfigStore(user_rag_config_path(uid)),
+        )
+        _USER_RUNTIMES[uid] = runtime
+    return runtime
+
+
+class _RagRuntimeProxy:
+    """向后兼容代理：按当前请求身份转发到用户级 RAG 运行时。"""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_rag_runtime(), name)
+
+
+rag_runtime = _RagRuntimeProxy()

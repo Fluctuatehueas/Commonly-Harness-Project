@@ -1,9 +1,25 @@
 <script setup lang="ts">
 // 技能管理：搜索 + 列表 + 右侧可拖拽抽屉 + 三种新增方式
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  CircleCheck,
+  CircleClose,
+  Close,
+  Delete,
+  Document,
+  FolderOpened,
+  Link,
+  MagicStick,
+  Plus,
+  Reading,
+  Search,
+  Setting,
+  Upload,
+  VideoPause,
+  VideoPlay,
+} from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
-import AppIcon from '@/components/console/AppIcon.vue'
-import UiSwitch from '@/components/console/UiSwitch.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
 import {
   createSkill,
@@ -60,15 +76,11 @@ const deleting = ref<SkillItem | null>(null)
 const deletingBusy = ref(false)
 const togglingId = ref('')
 
-const toast = ref('')
-const toastType = ref<'ok' | 'err'>('ok')
-let toastTimer: number | undefined
 let searchTimer: number | undefined
 
 // 安装任务卡：Dialog 关闭后仍在页面底部显示进度。
 const jobs = ref<SkillInstallJob[]>([])
 let jobTimer: number | undefined
-let jobLoadPending = false
 
 const stageLabel: Record<string, string> = {
   queued: '排队中',
@@ -82,10 +94,8 @@ const stageLabel: Record<string, string> = {
 }
 
 function flash(message: string, type: 'ok' | 'err' = 'ok') {
-  toast.value = message
-  toastType.value = type
-  if (toastTimer) window.clearTimeout(toastTimer)
-  toastTimer = window.setTimeout(() => (toast.value = ''), 3000)
+  if (type === 'err') ElMessage.error(message)
+  else ElMessage.success(message)
 }
 
 function targetLabel(target: string): string {
@@ -148,6 +158,18 @@ watch(enabledFilter, () => {
   void load()
 })
 
+// 分页与新增方式分段切换
+function onPageChange(next: number) {
+  page.value = next
+  void load()
+}
+
+// el-radio-group 的 change 回调参数可能为 undefined，这里做空值兜底
+function onAddTabChange(value: string | number | boolean | undefined) {
+  addTab.value = value as 'url' | 'zip' | 'manual'
+  addError.value = ''
+}
+
 async function openDrawer(item: SkillItem) {
   active.value = item
   drawerOpen.value = true
@@ -201,12 +223,28 @@ async function reveal(item: SkillItem) {
   }
 }
 
-function askDelete(item: SkillItem) {
+// 删除确认：交给 ElMessageBox，确认后再走原有删除流程
+async function askDelete(item: SkillItem) {
   if (item.protected) {
     flash('受保护的管理技能不能删除', 'err')
     return
   }
   deleting.value = item
+  try {
+    await ElMessageBox.confirm(
+      `确定要永久删除「${item.title}」吗？该操作会直接从磁盘移除 ${item.path}，无法恢复。`,
+      '删除技能',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    deleting.value = null
+    return
+  }
+  await confirmDelete()
 }
 
 async function confirmDelete() {
@@ -216,7 +254,6 @@ async function confirmDelete() {
   try {
     await deleteSkill(item.target, item.name)
     if (active.value?.skill_id === item.skill_id) closeDrawer()
-    deleting.value = null
     flash(`已删除技能 ${item.name}`)
     if (items.value.length === 1 && page.value > 1) page.value--
     await load()
@@ -224,6 +261,7 @@ async function confirmDelete() {
     flash((err as Error).message, 'err')
   } finally {
     deletingBusy.value = false
+    deleting.value = null
   }
 }
 
@@ -480,7 +518,6 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  if (toastTimer) window.clearTimeout(toastTimer)
   if (searchTimer) window.clearTimeout(searchTimer)
   if (jobTimer) window.clearTimeout(jobTimer)
   stopResize()
@@ -494,7 +531,7 @@ onBeforeUnmount(() => {
     <div class="page">
       <section class="panel head">
         <div class="head-title">
-          <span class="title-icon"><AppIcon name="sparkles" :size="15" /></span>
+          <span class="title-icon"><el-icon><MagicStick /></el-icon></span>
           <div>
             <strong>技能管理</strong>
             <small>共 {{ total }} 个技能 · 支持 URL / ZIP / 手动创建</small>
@@ -502,46 +539,50 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="head-actions">
-          <div class="search-box">
-            <AppIcon name="search" :size="13" />
-            <input v-model="keyword" type="text" placeholder="搜索技能名称或描述…" />
-            <button v-if="keyword" type="button" title="清空" @click="keyword = ''">
-              <AppIcon name="close" :size="10" />
-            </button>
-          </div>
-          <select v-model="enabledFilter" class="state-select">
-            <option value="all">全部状态</option>
-            <option value="on">使用中</option>
-            <option value="off">已停用</option>
-          </select>
-          <button class="add-btn" type="button" @click="openAdd">
-            <AppIcon name="plus" :size="14" /> 新增技能
-          </button>
+          <el-input
+            v-model="keyword"
+            class="search-input"
+            placeholder="搜索技能名称或描述…"
+            :prefix-icon="Search"
+            clearable
+          />
+          <el-select v-model="enabledFilter" class="state-select" placeholder="全部状态">
+            <el-option label="全部状态" value="all" />
+            <el-option label="使用中" value="on" />
+            <el-option label="已停用" value="off" />
+          </el-select>
+          <el-button type="primary" :icon="Plus" @click="openAdd">新增技能</el-button>
         </div>
       </section>
 
       <p v-if="error" class="error-note">{{ error }}</p>
 
-      <div v-if="loading && items.length === 0" class="panel loading">
-        <i class="spinner"></i> 正在读取技能库…
+      <div v-if="loading && items.length === 0" class="loading-block">
+        <el-skeleton animated :rows="6" />
       </div>
 
-      <ul v-else-if="items.length" class="skill-list">
+      <ul v-else-if="items.length" v-loading="loading" class="skill-list">
         <li
           v-for="item in items"
           :key="item.skill_id"
           class="skill-card"
           :class="{ disabled: !item.enabled }"
         >
-          <span class="skill-icon"><AppIcon name="book" :size="20" /></span>
+          <span class="skill-icon"><el-icon><Reading /></el-icon></span>
 
           <div class="skill-main">
             <div class="skill-title-row">
               <strong>{{ item.title }}</strong>
               <code>{{ item.name }}</code>
-              <span class="target-chip">{{ targetLabel(item.target) }}</span>
-              <span v-if="!item.enabled" class="state-chip off">已停用</span>
-              <span v-if="item.protected" class="state-chip lock">受保护</span>
+              <el-tag size="small" effect="plain" type="primary">
+                {{ targetLabel(item.target) }}
+              </el-tag>
+              <el-tag v-if="!item.enabled" size="small" effect="plain" type="warning">
+                已停用
+              </el-tag>
+              <el-tag v-if="item.protected" size="small" effect="plain" type="info">
+                受保护
+              </el-tag>
             </div>
             <p class="skill-desc">{{ item.description || '暂无描述' }}</p>
             <div class="skill-meta">
@@ -554,72 +595,84 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="skill-actions">
-            <UiSwitch
+            <el-switch
               :model-value="item.enabled"
               :disabled="item.protected || togglingId === item.skill_id"
-              @update:model-value="(value) => onToggle(item, value)"
+              @change="(v: string | number | boolean) => onToggle(item, Boolean(v))"
             />
-            <button class="gear" type="button" title="查看技能详情" @click="openDrawer(item)">
-              <AppIcon name="gear" :size="15" />
-            </button>
+            <el-button
+              size="small"
+              :icon="Setting"
+              circle
+              title="查看技能详情"
+              @click="openDrawer(item)"
+            />
           </div>
         </li>
       </ul>
 
-      <div v-else class="panel empty">
-        <div class="empty-orb"><AppIcon name="sparkles" :size="24" /></div>
-        <h3>没有找到技能</h3>
-        <p>调整搜索条件，或点击「新增技能」从 URL / ZIP / 手动创建。</p>
-      </div>
+      <el-empty v-else class="empty-block" description="没有找到技能">
+        <p class="empty-tip">调整搜索条件，或点击「新增技能」从 URL / ZIP / 手动创建。</p>
+      </el-empty>
 
       <footer v-if="pages > 1" class="pager">
-        <button type="button" :disabled="page <= 1" @click="page--; load()">上一页</button>
-        <span>第 {{ page }} / {{ pages }} 页</span>
-        <button type="button" :disabled="page >= pages" @click="page++; load()">下一页</button>
+        <el-pagination
+          layout="prev, pager, next"
+          :current-page="page"
+          :page-count="pages"
+          background
+          @current-change="onPageChange"
+        />
+        <span>共 {{ total }} 个</span>
       </footer>
     </div>
 
     <!-- 右侧技能详情抽屉：宽度可拖拽 -->
-    <Transition name="drawer">
-      <aside
-        v-if="drawerOpen && active"
-        class="drawer"
-        :class="{ resizing }"
-        :style="{ width: `${drawerWidth}px` }"
-      >
+    <el-drawer
+      v-model="drawerOpen"
+      class="skills-drawer"
+      direction="rtl"
+      :size="`${drawerWidth}px`"
+      :with-header="false"
+      :modal="false"
+      modal-penetrable
+      :lock-scroll="false"
+      :style="{ top: 'var(--topbar-h)', height: 'calc(100vh - var(--topbar-h))' }"
+      @closed="closeDrawer"
+    >
+      <div v-if="active" class="drawer-panel" :class="{ resizing }">
         <div class="resizer" title="拖动调整宽度" @mousedown="startResize"></div>
 
         <header class="drawer-head">
-          <span class="skill-icon"><AppIcon name="book" :size="18" /></span>
+          <span class="skill-icon"><el-icon><Reading /></el-icon></span>
           <div class="drawer-title">
             <strong>{{ active.title }}</strong>
             <small><code>{{ active.name }}</code> · {{ targetLabel(active.target) }}</small>
           </div>
-          <button class="icon-btn" type="button" title="关闭" @click="closeDrawer">
-            <AppIcon name="close" :size="13" />
-          </button>
+          <el-button size="small" :icon="Close" circle title="关闭" @click="closeDrawer" />
         </header>
 
         <div class="drawer-actions">
-          <button type="button" @click="reveal(active)">
-            <AppIcon name="folder" :size="12" /> 打开目录
-          </button>
-          <button
-            type="button"
+          <el-button size="small" :icon="FolderOpened" @click="reveal(active)">
+            打开目录
+          </el-button>
+          <el-button
+            size="small"
+            :icon="active.enabled ? VideoPause : VideoPlay"
             :disabled="active.protected || togglingId === active.skill_id"
             @click="onToggle(active, !active.enabled)"
           >
-            <AppIcon :name="active.enabled ? 'stop' : 'play'" :size="12" />
             {{ active.enabled ? '停用' : '启用' }}
-          </button>
-          <button
-            class="danger"
-            type="button"
+          </el-button>
+          <el-button
+            size="small"
+            type="danger"
+            :icon="Delete"
             :disabled="active.protected"
             @click="askDelete(active)"
           >
-            <AppIcon name="trash" :size="12" /> 删除
-          </button>
+            删除
+          </el-button>
         </div>
 
         <div class="drawer-meta">
@@ -632,190 +685,161 @@ onBeforeUnmount(() => {
 
         <div class="drawer-body">
           <div class="drawer-section">
-            <span class="readonly-tag">SKILL.md · 只读</span>
+            <el-tag size="small" effect="plain" type="primary">SKILL.md · 只读</el-tag>
           </div>
           <MarkdownView v-if="markdown" :content="markdown" />
           <p v-else-if="contentLoading" class="drawer-empty">正在读取技能描述…</p>
           <p v-else class="drawer-empty">没有可展示的描述内容</p>
         </div>
-      </aside>
-    </Transition>
+      </div>
+    </el-drawer>
 
     <!-- 新增技能 Dialog：三种方式分页展示 -->
-    <Transition name="fade">
-      <div v-if="addOpen" class="modal-mask" @click.self="closeAdd">
-        <div class="dialog">
-          <header class="dialog-head">
-            <strong>新增技能</strong>
-            <button class="icon-btn" type="button" @click="closeAdd">
-              <AppIcon name="close" :size="13" />
-            </button>
-          </header>
+    <el-dialog
+      v-model="addOpen"
+      class="skills-add-dialog"
+      title="新增技能"
+      width="min(680px, 94vw)"
+      :close-on-click-modal="false"
+    >
+      <div class="dialog-body">
+        <el-radio-group :model-value="addTab" class="add-tabs" @change="onAddTabChange">
+          <el-radio-button value="url">
+            <el-icon><Link /></el-icon> URL 安装
+          </el-radio-button>
+          <el-radio-button value="zip">
+            <el-icon><Upload /></el-icon> ZIP 上传
+          </el-radio-button>
+          <el-radio-button value="manual">
+            <el-icon><Document /></el-icon> 手动编写
+          </el-radio-button>
+        </el-radio-group>
 
-          <div class="dialog-tabs">
-            <button
-              type="button"
-              :class="{ active: addTab === 'url' }"
-              @click="addTab = 'url'; addError = ''"
-            >
-              <AppIcon name="link" :size="13" /> URL 安装
-            </button>
-            <button
-              type="button"
-              :class="{ active: addTab === 'zip' }"
-              @click="addTab = 'zip'; addError = ''"
-            >
-              <AppIcon name="upload" :size="13" /> ZIP 上传
-            </button>
-            <button
-              type="button"
-              :class="{ active: addTab === 'manual' }"
-              @click="addTab = 'manual'; addError = ''"
-            >
-              <AppIcon name="book" :size="13" /> 手动编写
-            </button>
+        <div v-if="addTab === 'url'" class="method">
+          <p class="method-desc">
+            支持 GitHub <code>tree</code> 技能目录链接，或可直接下载的 ZIP 直链。
+            后台会下载、解压、校验 SKILL.md 并自动生成元信息。
+          </p>
+          <div class="field">
+            <span>技能链接</span>
+            <el-input
+              v-model="urlInput"
+              placeholder="https://github.com/owner/repo/tree/main/skills/xxx"
+            />
           </div>
 
-          <div class="dialog-body">
-            <div v-if="addTab === 'url'" class="method">
-              <p class="method-desc">
-                支持 GitHub <code>tree</code> 技能目录链接，或可直接下载的 ZIP 直链。
-                后台会下载、解压、校验 SKILL.md 并自动生成元信息。
-              </p>
-              <label>
-                <span>技能链接</span>
-                <input
-                  v-model="urlInput"
-                  type="url"
-                  placeholder="https://github.com/owner/repo/tree/main/skills/xxx"
-                />
-              </label>
-
-              <div class="method-notes">
-                <h4>粘贴前请逐条确认</h4>
-                <ol>
-                  <li>
-                    必须是<strong>可直接下载的 ZIP 文件链接</strong>，或
-                    <strong>GitHub 仓库里的技能子目录链接</strong>（形如
-                    <code>https://github.com/owner/repo/tree/main/skills/技能名</code>）。
-                    网页文章、仓库主页、Release 页面、网盘分享页都会下载失败。
-                  </li>
-                  <li>
-                    ZIP 解压后，根目录或唯一顶层目录必须包含
-                    <code>SKILL.md</code>；其 YAML frontmatter 必须同时有
-                    <code>name</code> 与 <code>description</code>，否则无法识别技能包。
-                  </li>
-                  <li>
-                    安装位置：<code>{{ installRoot }}/&lt;技能名&gt;</code>。
-                    技能名由链接或 SKILL.md 推断，推断成功后直接接入系统技能库。
-                  </li>
-                  <li>
-                    如已存在同名技能，下载会失败；需先删除旧技能，或改用「ZIP 上传 / 手动编写」。
-                  </li>
-                  <li>
-                    包体上限 {{ maxPackageMb }} MB；后台会拒绝路径穿越、符号链接和超限文件树。
-                  </li>
-                  <li>
-                    下载成功后列表会自动刷新，下一轮对话立即生效，无需重启后端。
-                  </li>
-                </ol>
-                <p class="note-example">
-                  示例直链：<code>https://example.com/skills/report-writer.zip</code>
-                </p>
-              </div>
-            </div>
-
-            <div v-else-if="addTab === 'zip'" class="method">
-              <p class="method-desc">
-                拖入或选择一个 ZIP 技能包，后台会校验压缩包安全性，解压到技能库并识别 SKILL.md。
-              </p>
-              <div
-                class="dropzone"
-                :class="{ over: dragOver }"
-                role="button"
-                tabindex="0"
-                @click="pickZip"
-                @keydown.enter="pickZip"
-                @dragover.prevent="dragOver = true"
-                @dragleave="dragOver = false"
-                @drop.prevent="onDrop"
-              >
-                <AppIcon name="upload" :size="26" />
-                <strong>拖拽 ZIP 到这里，或点击选择文件</strong>
-                <span>最大 {{ maxPackageMb }} MB · 自动解包并接入技能库</span>
-              </div>
-              <input ref="zipInput" class="hidden-input" type="file" accept=".zip" @change="onZipInput" />
-              <p v-if="zipFile" class="picked-file">
-                <AppIcon name="file" :size="12" />
-                {{ zipFile.name }} · {{ formatSize(zipFile.size) }}
-                <button type="button" @click="zipFile = null">移除</button>
-              </p>
-              <div class="method-notes compact">
-                <p>
-                  安装位置：<code>{{ installRoot }}/&lt;技能名&gt;</code>。
-                  压缩包内必须包含 <code>SKILL.md</code>（含 name / description 的 frontmatter），
-                  缺少时会被拒绝。
-                </p>
-              </div>
-            </div>
-
-            <div v-else class="method">
-              <p class="method-desc">
-                手写 SKILL.md 的 frontmatter 摘要与正文。名称为目录名，创建后可在详情抽屉中查看。
-              </p>
-              <label>
-                <span>技能名称 <em>用于目录名，仅字母/数字/-/_</em></span>
-                <input v-model="form.name" type="text" placeholder="例如 report-writer" maxlength="64" />
-              </label>
-              <label>
-                <span>摘要描述 <em>SKILL.md frontmatter 的 description</em></span>
-                <textarea v-model="form.description" rows="2" placeholder="一句话说明这个技能解决什么问题" maxlength="500"></textarea>
-              </label>
-              <label>
-                <span>详细描述 <em>SKILL.md 正文，可写使用步骤与示例</em></span>
-                <textarea v-model="form.content" rows="7" placeholder="## 使用场景&#10;&#10;## 操作步骤&#10;&#10;## 示例"></textarea>
-              </label>
-            </div>
-
-            <p v-if="addError" class="form-error">{{ addError }}</p>
-          </div>
-
-          <footer class="dialog-foot">
-            <button class="ghost-btn" type="button" :disabled="submitting" @click="closeAdd">取消</button>
-            <button class="primary" type="button" :disabled="!canSubmit || submitting" @click="submitAdd">
-              {{ submitting ? '处理中…' : addTab === 'manual' ? '创建技能' : '安装技能' }}
-            </button>
-          </footer>
-        </div>
-      </div>
-    </Transition>
-
-    <!-- 删除确认 -->
-    <Transition name="fade">
-      <div v-if="deleting" class="modal-mask" @click.self="deleting = null">
-        <div class="dialog small">
-          <header class="dialog-head">
-            <strong>删除技能</strong>
-            <button class="icon-btn" type="button" @click="deleting = null">
-              <AppIcon name="close" :size="13" />
-            </button>
-          </header>
-          <div class="dialog-body">
-            <p class="confirm-text">
-              确定要永久删除 <b>{{ deleting.title }}</b> 吗？
-              该操作会直接从磁盘移除
-              <code>{{ deleting.path }}</code>，无法恢复。
+          <div class="method-notes">
+            <h4>粘贴前请逐条确认</h4>
+            <ol>
+              <li>
+                必须是<strong>可直接下载的 ZIP 文件链接</strong>，或
+                <strong>GitHub 仓库里的技能子目录链接</strong>（形如
+                <code>https://github.com/owner/repo/tree/main/skills/技能名</code>）。
+                网页文章、仓库主页、Release 页面、网盘分享页都会下载失败。
+              </li>
+              <li>
+                ZIP 解压后，根目录或唯一顶层目录必须包含
+                <code>SKILL.md</code>；其 YAML frontmatter 必须同时有
+                <code>name</code> 与 <code>description</code>，否则无法识别技能包。
+              </li>
+              <li>
+                安装位置：<code>{{ installRoot }}/&lt;技能名&gt;</code>。
+                技能名由链接或 SKILL.md 推断，推断成功后直接接入系统技能库。
+              </li>
+              <li>
+                如已存在同名技能，下载会失败；需先删除旧技能，或改用「ZIP 上传 / 手动编写」。
+              </li>
+              <li>
+                包体上限 {{ maxPackageMb }} MB；后台会拒绝路径穿越、符号链接和超限文件树。
+              </li>
+              <li>
+                下载成功后列表会自动刷新，下一轮对话立即生效，无需重启后端。
+              </li>
+            </ol>
+            <p class="note-example">
+              示例直链：<code>https://example.com/skills/report-writer.zip</code>
             </p>
           </div>
-          <footer class="dialog-foot">
-            <button class="ghost-btn" type="button" :disabled="deletingBusy" @click="deleting = null">取消</button>
-            <button class="danger-btn" type="button" :disabled="deletingBusy" @click="confirmDelete">
-              {{ deletingBusy ? '删除中…' : '确认删除' }}
-            </button>
-          </footer>
         </div>
+
+        <div v-else-if="addTab === 'zip'" class="method">
+          <p class="method-desc">
+            拖入或选择一个 ZIP 技能包，后台会校验压缩包安全性，解压到技能库并识别 SKILL.md。
+          </p>
+          <div
+            class="dropzone"
+            :class="{ over: dragOver }"
+            role="button"
+            tabindex="0"
+            @click="pickZip"
+            @keydown.enter="pickZip"
+            @dragover.prevent="dragOver = true"
+            @dragleave="dragOver = false"
+            @drop.prevent="onDrop"
+          >
+            <el-icon :size="26"><Upload /></el-icon>
+            <strong>拖拽 ZIP 到这里，或点击选择文件</strong>
+            <span>最大 {{ maxPackageMb }} MB · 自动解包并接入技能库</span>
+          </div>
+          <input ref="zipInput" class="hidden-input" type="file" accept=".zip" @change="onZipInput" />
+          <p v-if="zipFile" class="picked-file">
+            <el-icon><Document /></el-icon>
+            {{ zipFile.name }} · {{ formatSize(zipFile.size) }}
+            <el-button text size="small" @click="zipFile = null">移除</el-button>
+          </p>
+          <div class="method-notes compact">
+            <p>
+              安装位置：<code>{{ installRoot }}/&lt;技能名&gt;</code>。
+              压缩包内必须包含 <code>SKILL.md</code>（含 name / description 的 frontmatter），
+              缺少时会被拒绝。
+            </p>
+          </div>
+        </div>
+
+        <div v-else class="method">
+          <p class="method-desc">
+            手写 SKILL.md 的 frontmatter 摘要与正文。名称为目录名，创建后可在详情抽屉中查看。
+          </p>
+          <div class="field">
+            <span>技能名称 <em>用于目录名，仅字母/数字/-/_</em></span>
+            <el-input v-model="form.name" maxlength="64" placeholder="例如 report-writer" />
+          </div>
+          <div class="field">
+            <span>摘要描述 <em>SKILL.md frontmatter 的 description</em></span>
+            <el-input
+              v-model="form.description"
+              type="textarea"
+              :rows="2"
+              maxlength="500"
+              placeholder="一句话说明这个技能解决什么问题"
+            />
+          </div>
+          <div class="field">
+            <span>详细描述 <em>SKILL.md 正文，可写使用步骤与示例</em></span>
+            <el-input
+              v-model="form.content"
+              type="textarea"
+              :rows="7"
+              placeholder="## 使用场景&#10;&#10;## 操作步骤&#10;&#10;## 示例"
+            />
+          </div>
+        </div>
+
+        <p v-if="addError" class="form-error">{{ addError }}</p>
       </div>
-    </Transition>
+
+      <template #footer>
+        <el-button :disabled="submitting" @click="closeAdd">取消</el-button>
+        <el-button
+          type="primary"
+          :disabled="!canSubmit || submitting"
+          :loading="submitting"
+          @click="submitAdd"
+        >
+          {{ submitting ? '处理中…' : addTab === 'manual' ? '创建技能' : '安装技能' }}
+        </el-button>
+      </template>
+    </el-dialog>
 
     <!-- 安装进度卡：Dialog 关闭后从页面底部向上堆叠 -->
     <div v-if="jobs.length" class="job-dock">
@@ -828,25 +852,31 @@ onBeforeUnmount(() => {
         >
           <header>
             <span class="job-icon">
-              <AppIcon
-                :name="job.status === 'error' ? 'close' : job.status === 'done' ? 'check' : 'sparkles'"
-                :size="13"
-              />
+              <el-icon v-if="job.status === 'error'"><CircleClose /></el-icon>
+              <el-icon v-else-if="job.status === 'done'"><CircleCheck /></el-icon>
+              <el-icon v-else><MagicStick /></el-icon>
             </span>
             <div class="job-title">
               <strong>{{ job.kind === 'zip' ? 'ZIP 技能包' : 'URL 技能安装' }}</strong>
               <small>{{ job.label }}</small>
             </div>
-            <button class="job-close" type="button" title="收起" @click="removeJob(job.job_id)">
-              <AppIcon name="close" :size="10" />
-            </button>
+            <el-button
+              text
+              circle
+              size="small"
+              title="收起"
+              :icon="Close"
+              @click="removeJob(job.job_id)"
+            />
           </header>
           <p class="job-message">
             {{ job.status === 'error' ? job.error : job.message }}
           </p>
-          <div class="job-progress">
-            <i :style="{ width: `${Math.max(4, job.progress)}%` }"></i>
-          </div>
+          <el-progress
+            :percentage="Math.max(4, job.progress)"
+            :show-text="false"
+            :status="job.status === 'error' ? 'exception' : job.status === 'done' ? 'success' : undefined"
+          />
           <footer>
             <span>{{ stageLabel[job.stage] || job.stage }}</span>
             <em>{{ job.progress }}%</em>
@@ -854,10 +884,6 @@ onBeforeUnmount(() => {
         </article>
       </TransitionGroup>
     </div>
-
-    <Transition name="fade">
-      <div v-if="toast" class="toast" :class="toastType">{{ toast }}</div>
-    </Transition>
   </div>
 </template>
 
@@ -915,61 +941,12 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
-.search-box {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+.search-input {
   width: 270px;
-  padding: 7px 10px;
-  color: var(--text-3);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-deep);
-}
-
-.search-box input {
-  flex: 1;
-  min-width: 0;
-  font-size: 12px;
-  font-family: inherit;
-  color: var(--text-1);
-  border: none;
-  background: transparent;
-  outline: none;
-}
-
-.search-box button {
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  color: var(--text-3);
-  border: none;
-  border-radius: 4px;
-  background: transparent;
 }
 
 .state-select {
-  padding: 7px 10px;
-  font-size: 11.5px;
-  font-family: inherit;
-  color: var(--text-2);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-deep);
-  outline: none;
-}
-
-.add-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 13px;
-  font-size: 12px;
-  color: #fff;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
+  width: 118px;
 }
 
 .error-note {
@@ -977,64 +954,29 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   font-size: 12px;
   color: var(--amber);
-  border: 1px solid rgba(242, 176, 60, 0.3);
+  border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
   background: transparent;
 }
 
-.loading,
-.empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 320px;
-  gap: 10px;
-  color: var(--text-3);
-  font-size: 12px;
-  text-align: center;
+.loading-block {
+  padding: 18px 0;
 }
 
-.loading {
-  flex-direction: row;
+.empty-block {
+  padding: 34px 0;
 }
 
-.spinner {
-  width: 16px;
-  height: 16px;
-  border: 2px solid transparent;
-  border-top-color: var(--accent-cyan);
-  border-radius: 50%;
-  animation: spin 0.75s linear infinite;
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.empty-orb {
-  display: grid;
-  place-items: center;
-  width: 44px;
-  height: 44px;
-  border-radius: 50%;
-  color: var(--accent-cyan);
-  border: 1px solid var(--line-strong);
-  background: transparent;
-}
-
-.empty h3 {
-  margin: 0;
-  font-size: 16px;
-  color: var(--text-1);
-}
-
-.empty p {
-  margin: 0;
+.empty-tip {
+  max-width: 460px;
+  margin: 0 auto 12px;
   font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--text-3);
 }
 
 .skill-list {
+  position: relative;
   list-style: none;
   margin: 0;
   padding: 0;
@@ -1102,32 +1044,6 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 
-.target-chip {
-  padding: 1px 6px;
-  font-size: 9.5px;
-  color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.28);
-  border-radius: var(--radius-sm);
-}
-
-.state-chip {
-  padding: 1px 6px;
-  font-size: 9.5px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--line);
-  color: var(--text-3);
-}
-
-.state-chip.off {
-  color: var(--amber);
-  border-color: rgba(242, 176, 60, 0.35);
-}
-
-.state-chip.lock {
-  color: #a99bff;
-  border-color: rgba(143, 123, 255, 0.35);
-}
-
 .skill-desc {
   margin: 0;
   display: -webkit-box;
@@ -1160,24 +1076,6 @@ onBeforeUnmount(() => {
   flex: none;
 }
 
-.gear {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  transition: color 0.16s, border-color 0.16s, background 0.16s;
-}
-
-.gear:hover {
-  color: var(--accent-cyan);
-  border-color: var(--line-strong);
-  background: var(--bg-hover);
-}
-
 .pager {
   display: flex;
   align-items: center;
@@ -1188,45 +1086,28 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 
-.pager button {
-  padding: 5px 12px;
-  font-size: 11px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-}
-
-.pager button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
 /* ---------- 右侧抽屉 ---------- */
-.drawer {
-  position: fixed;
-  top: var(--topbar-h);
-  right: 0;
-  bottom: 0;
-  z-index: 45;
+/* el-drawer 内部的自定义面板：头部固定，内容区滚动 */
+.drawer-panel {
+  position: relative;
   display: flex;
   flex-direction: column;
-  min-width: 320px;
+  height: 100%;
   border-left: 1px solid var(--line-strong);
   background: var(--bg-elevated);
-  box-shadow: -12px 0 28px rgba(2, 6, 14, 0.42);
 }
 
-.drawer.resizing {
+.drawer-panel.resizing {
   user-select: none;
 }
 
 .resizer {
   position: absolute;
   top: 0;
-  left: -4px;
+  left: 0;
   bottom: 0;
-  width: 8px;
+  z-index: 1;
+  width: 6px;
   cursor: col-resize;
 }
 
@@ -1234,7 +1115,7 @@ onBeforeUnmount(() => {
   content: '';
   position: absolute;
   top: 50%;
-  left: 3px;
+  left: 2px;
   width: 2px;
   height: 46px;
   margin-top: -23px;
@@ -1245,7 +1126,7 @@ onBeforeUnmount(() => {
 }
 
 .resizer:hover::after,
-.drawer.resizing .resizer::after {
+.drawer-panel.resizing .resizer::after {
   opacity: 1;
 }
 
@@ -1282,59 +1163,11 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 
-.icon-btn {
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  flex: none;
-  color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-}
-
-.icon-btn:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-}
-
 .drawer-actions {
   display: flex;
   gap: 8px;
   padding: 10px 16px;
   flex-wrap: wrap;
-}
-
-.drawer-actions button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 10px;
-  font-size: 11px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-}
-
-.drawer-actions button:hover:not(:disabled) {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-}
-
-.drawer-actions button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.drawer-actions .danger {
-  color: var(--danger);
-  border-color: rgba(226, 96, 94, 0.38);
-}
-
-.drawer-actions .danger:hover:not(:disabled) {
-  background: rgba(226, 96, 94, 0.1);
 }
 
 .drawer-meta {
@@ -1363,84 +1196,20 @@ onBeforeUnmount(() => {
   margin-bottom: 6px;
 }
 
-.readonly-tag {
-  padding: 1px 7px;
-  font-size: 9.5px;
-  color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.3);
-  border-radius: var(--radius-sm);
-}
-
 .drawer-empty {
   font-size: 11.5px;
   color: var(--text-3);
 }
 
 /* ---------- Dialog ---------- */
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(2, 7, 18, 0.62);
-  backdrop-filter: blur(4px);
-}
-
-.dialog {
-  width: min(680px, 100%);
-  max-height: calc(100vh - 80px);
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-lg);
-  background: var(--bg-panel);
-  box-shadow: 0 16px 40px rgba(2, 6, 14, 0.5);
-}
-
-.dialog.small {
-  width: min(460px, 100%);
-}
-
-.dialog-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--line);
-}
-
-.dialog-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 10px 14px 0;
-}
-
-.dialog-tabs button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 7px 12px;
-  font-size: 11.5px;
-  color: var(--text-3);
-  border: 1px solid transparent;
-  border-bottom: none;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  background: transparent;
-}
-
-.dialog-tabs button.active {
-  color: var(--text-1);
-  border-color: var(--line);
-  background: var(--bg-hover);
-}
-
 .dialog-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 14px 16px;
+  padding: 0;
+}
+
+.add-tabs {
+  display: flex;
+  width: 100%;
+  margin-bottom: 12px;
 }
 
 .method {
@@ -1504,7 +1273,7 @@ onBeforeUnmount(() => {
   margin: 8px 0 0;
 }
 
-.method label {
+.field {
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -1512,31 +1281,11 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 
-.method label em {
+.field em {
   margin-left: 5px;
   font-style: normal;
   font-size: 10px;
   color: var(--text-3);
-}
-
-.method input,
-.method textarea {
-  width: 100%;
-  padding: 9px 11px;
-  font-size: 12.5px;
-  font-family: inherit;
-  color: var(--text-1);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-deep);
-  resize: vertical;
-  outline: none;
-}
-
-.method input:focus,
-.method textarea:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.22);
 }
 
 .dropzone {
@@ -1584,126 +1333,14 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 
-.picked-file button {
+.picked-file .el-button {
   margin-left: auto;
-  padding: 3px 8px;
-  font-size: 10px;
-  color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
 }
 
 .form-error {
   margin: 10px 0 0;
   font-size: 11.5px;
   color: var(--danger);
-}
-
-.confirm-text {
-  margin: 0;
-  font-size: 12.5px;
-  line-height: 1.7;
-  color: var(--text-2);
-}
-
-.confirm-text b {
-  color: var(--text-1);
-}
-
-.confirm-text code {
-  font-family: 'Cascadia Code', Consolas, monospace;
-  font-size: 11px;
-  color: var(--amber);
-  word-break: break-all;
-}
-
-.dialog-foot {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--line);
-}
-
-.dialog-foot button {
-  padding: 7px 14px;
-  font-size: 12px;
-  border-radius: var(--radius-sm);
-  border: none;
-}
-
-.ghost-btn {
-  color: var(--text-2);
-  border: 1px solid var(--line-strong) !important;
-  background: transparent;
-}
-
-.ghost-btn:hover:not(:disabled) {
-  color: var(--text-1);
-  border-color: var(--accent) !important;
-}
-
-.primary {
-  color: #fff;
-  background: var(--accent);
-}
-
-.primary:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-  box-shadow: none;
-}
-
-.danger-btn {
-  color: #fff;
-  background: var(--danger);
-}
-
-.danger-btn:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-/* ---------- 动效与提示 ---------- */
-.drawer-enter-active,
-.drawer-leave-active {
-  transition: transform 0.26s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s;
-}
-
-.drawer-enter-from,
-.drawer-leave-to {
-  transform: translateX(24px);
-  opacity: 0;
-}
-
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity 0.2s ease;
-}
-
-.fade-enter-from,
-.fade-leave-to {
-  opacity: 0;
-}
-
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 28px;
-  z-index: 80;
-  transform: translateX(-50%);
-  padding: 9px 16px;
-  font-size: 12px;
-  color: var(--text-1);
-  border: 1px solid rgba(55, 208, 196, 0.35);
-  border-radius: var(--radius-sm);
-  background: var(--bg-elevated);
-}
-
-.toast.err {
-  color: var(--danger);
-  border-color: rgba(226, 96, 94, 0.45);
 }
 
 /* ---------- 底部安装进度卡 ---------- */
@@ -1787,23 +1424,6 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.job-close {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  flex: none;
-  color: var(--text-3);
-  border: none;
-  border-radius: 5px;
-  background: transparent;
-}
-
-.job-close:hover {
-  color: var(--text-1);
-  background: rgba(255, 255, 255, 0.06);
-}
-
 .job-message {
   margin: 0;
   font-size: 11px;
@@ -1815,27 +1435,8 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical;
 }
 
-.job-progress {
+.job-card :deep(.el-progress-bar__outer) {
   height: 5px;
-  overflow: hidden;
-  border-radius: 2px;
-  background: rgba(126, 154, 198, 0.14);
-}
-
-.job-progress i {
-  display: block;
-  height: 100%;
-  border-radius: 2px;
-  background: linear-gradient(90deg, var(--accent-cyan), var(--accent));
-  transition: width 0.35s ease;
-}
-
-.job-card.done .job-progress i {
-  background: var(--accent-cyan);
-}
-
-.job-card.error .job-progress i {
-  background: var(--danger);
 }
 
 .job-card footer {
@@ -1869,18 +1470,26 @@ onBeforeUnmount(() => {
     width: 100%;
   }
 
-  .search-box {
+  .search-input {
     flex: 1;
     width: auto;
-  }
-
-  .drawer {
-    width: 100% !important;
-    top: var(--topbar-h);
   }
 
   .resizer {
     display: none;
   }
+}
+</style>
+
+<style>
+/* el-drawer / el-dialog 会传送到 body，这里用独立类名做局部布局微调 */
+.skills-drawer .el-drawer__body {
+  padding: 0;
+  overflow: hidden;
+}
+
+.skills-add-dialog .el-dialog__body {
+  max-height: 62vh;
+  overflow-y: auto;
 }
 </style>

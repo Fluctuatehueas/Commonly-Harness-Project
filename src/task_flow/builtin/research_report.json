@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0",
+  "id": "tf_builtin_research_report",
+  "name": "深度研究报告",
+  "description": "给定主题，检索资料、分析对比，产出结构化研究报告并保存到工作区",
+  "source": "user",
+  "status": "published",
+  "trigger_examples": ["帮我调研一下", "对比一下两个方案的优劣", "做个研究报告"],
+  "mcp_services": [],
+  "steps": [
+    {
+      "id": "s1",
+      "name": "需求澄清",
+      "instruction": "确认研究主题边界、输出格式与篇幅要求，不开始检索",
+      "skills": "auto",
+      "executor": "main",
+      "constraints": "只澄清，不执行检索"
+    },
+    {
+      "id": "s2",
+      "name": "并行检索",
+      "instruction": "分头检索中英文资料，提炼要点",
+      "skills": "auto",
+      "executor": "auto",
+      "checkpoint": true,
+      "parallel": [
+        {
+          "name": "中文资料",
+          "steps": [
+            {
+              "id": "s2a1",
+              "name": "中文检索",
+              "instruction": "检索中文资料，提炼关键事实与观点",
+              "skills": "auto",
+              "executor": "auto"
+            }
+          ]
+        },
+        {
+          "name": "英文资料",
+          "steps": [
+            {
+              "id": "s2b1",
+              "name": "英文检索",
+              "instruction": "检索英文资料，提炼关键事实与观点",
+              "skills": "auto",
+              "executor": "auto"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "s3",
+      "name": "撰写报告",
+      "instruction": "基于上游检索摘要撰写结构化报告并保存到工作区",
+      "skills": "auto",
+      "executor": "auto",
+      "checkpoint": true,
+      "example": "# 调研报告\n## 结论\n...\n## 对比分析\n...\n## 引用来源"
+    }
+  ]
+}

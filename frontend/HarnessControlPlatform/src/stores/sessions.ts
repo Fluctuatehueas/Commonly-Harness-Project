@@ -2,6 +2,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { API_BASE } from '@/api/client'
+import { currentUserId } from '@/api/identity'
 
 export interface SessionItem {
   thread_id: string
@@ -14,12 +15,15 @@ export interface SessionItem {
   project_id: string | null
   /** 绑定的集成 MCP（用户自有后端）；普通会话为 null。 */
   integration_server_id: string | null
+  /** 会话绑定的 MyAgent 档案 ID。 */
+  agent_id?: string | null
   /** 是否已归档：归档后从侧边栏隐藏，仅可在归档管理中查看/恢复/删除。 */
   archived: boolean
   archived_at: string | null
 }
 
-export const USER_ID = 'console_user'
+// 页面加载时读取当前演示用户；切换用户会整页重载，因此常量始终与身份一致。
+export const USER_ID = currentUserId()
 
 export const useSessionStore = defineStore('sessions', () => {
   const sessions = ref<SessionItem[]>([])
@@ -38,6 +42,7 @@ export const useSessionStore = defineStore('sessions', () => {
       pinned: Boolean(item.pinned),
       project_id: item.project_id ?? null,
       integration_server_id: item.integration_server_id ?? null,
+      agent_id: item.agent_id ?? null,
       archived: Boolean(item.archived),
       archived_at: item.archived_at ?? null,
     }
@@ -129,6 +134,7 @@ export const useSessionStore = defineStore('sessions', () => {
   async function createSession(
     projectId?: string | null,
     integrationServerId?: string | null,
+    agentId?: string | null,
   ): Promise<string | null> {
     try {
       const query = new URLSearchParams({ user_id: USER_ID })
@@ -136,6 +142,7 @@ export const useSessionStore = defineStore('sessions', () => {
       if (integrationServerId) {
         query.set('integration_server_id', integrationServerId)
       }
+      if (agentId) query.set('agent_id', agentId)
       const res = await fetch(`${API_BASE}/history?${query.toString()}`, { method: 'POST' })
       if (!res.ok) return null
       const session = normalize((await res.json()) as SessionItem)

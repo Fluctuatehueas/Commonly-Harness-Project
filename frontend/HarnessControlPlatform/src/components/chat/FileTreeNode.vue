@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 文件树节点：目录可折叠，文件行提供预览 + 来源对应的操作按钮。
 import { computed, ref } from 'vue'
+import { Download, FolderOpened } from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { TreeNode } from './fileTree'
 import { countFiles } from './fileTree'
@@ -75,14 +76,15 @@ function fmtSize(size: number) {
         <span v-if="isNew?.(file.file)" class="new-tag">new</span>
       </button>
       <span class="t-size">{{ fmtSize(file.file.size) }}</span>
-      <button
+      <el-button
         class="t-action"
-        type="button"
+        :icon="file.file.origin === 'project' ? FolderOpened : Download"
+        text
+        circle
+        size="small"
         :title="file.file.origin === 'project' ? '在资源管理器打开' : '下载'"
         @click.stop="emitAction(file.file)"
-      >
-        <AppIcon :name="file.file.origin === 'project' ? 'external' : 'download'" :size="12" />
-      </button>
+      />
     </div>
   </div>
 </template>
@@ -181,20 +183,16 @@ function fmtSize(size: number) {
   color: var(--text-3);
 }
 
-.t-action {
-  display: grid;
-  place-items: center;
+.t-action.el-button {
   width: 22px;
   height: 22px;
   flex: none;
+  margin-left: 0;
   padding: 0;
   color: var(--text-3);
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
 }
 
-.t-action:hover {
+.t-action.el-button:hover {
   color: var(--accent-cyan);
   border-color: var(--line);
 }

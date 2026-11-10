@@ -11,12 +11,19 @@ const props = defineProps<{ title: string; icon: IconName }>()
   <div class="app-shell">
     <TopNav />
     <div class="page">
-        <section class="panel placeholder">
-          <div class="orb"><AppIcon :name="props.icon" :size="26" /></div>
-          <h2>{{ props.title }}</h2>
-          <p>该模块正在建设中，敬请期待。</p>
-        </section>
-      </div>
+      <!-- 空态改用 el-empty：标题/说明排版与全站空态统一，图片位仍用项目自绘图标 -->
+      <section class="panel placeholder">
+        <el-empty :image-size="44">
+          <template #image>
+            <div class="orb"><AppIcon :name="props.icon" :size="26" /></div>
+          </template>
+          <template #description>
+            <h2>{{ props.title }}</h2>
+            <p>该模块正在建设中，敬请期待。</p>
+          </template>
+        </el-empty>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -31,7 +38,6 @@ const props = defineProps<{ title: string; icon: IconName }>()
 
 .placeholder {
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
   min-height: calc(100vh - var(--topbar-h) - 44px);
@@ -44,7 +50,6 @@ const props = defineProps<{ title: string; icon: IconName }>()
   place-items: center;
   width: 44px;
   height: 44px;
-  margin-bottom: 16px;
   border-radius: 50%;
   color: var(--accent-cyan);
   border: 1px solid var(--line-strong);

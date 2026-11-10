@@ -1,6 +1,19 @@
 <script setup lang="ts">
 // 对话左侧栏：动作区 + 项目分组 + 对话分组（无卡片、发丝线分区、可折叠）
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  Bottom,
+  Box,
+  ChatDotRound,
+  CopyDocument,
+  Delete,
+  EditPen,
+  FolderOpened,
+  Plus,
+  Refresh,
+  Top,
+} from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import SessionRow from './SessionRow.vue'
 import { useSessionStore, type SessionItem } from '@/stores/sessions'
@@ -69,8 +82,6 @@ const open = reactive(readGroups())
 const expanded = ref<string[]>(readExpanded())
 const projectMenu = ref<string | null>(null)
 const archiveOpen = ref(false)
-const notice = ref('')
-let noticeTimer: number | undefined
 
 // ---------- 集成的项目（用户自有后端 MCP） ----------
 const integrations = ref<McpServerItem[]>([])
@@ -231,77 +242,47 @@ function createIntegrationSession(item: McpServerItem) {
 
 // ---------- 动作 ----------
 function flash(message: string) {
-  notice.value = message
-  if (noticeTimer) window.clearTimeout(noticeTimer)
-  noticeTimer = window.setTimeout(() => (notice.value = ''), 2400)
+  ElMessage.info(message)
 }
 
-// ---------- 页内弹窗（Electron 不支持 window.prompt） ----------
-interface DialogState {
-  kind: 'input' | 'confirm' | 'alert'
-  title: string
-  message: string
-  value: string
-  danger: boolean
-}
-
-const dialog = ref<DialogState | null>(null)
-const dialogInput = ref<HTMLInputElement | null>(null)
-let dialogResolve: ((value: string | boolean | null) => void) | null = null
-
-function openDialog(state: DialogState, resultOnClose: string | boolean | null) {
-  dialog.value = state
-  void nextTick(() => dialogInput.value?.focus())
-  return new Promise<string | boolean | null>((resolve) => {
-    dialogResolve = (value) => resolve(value === null ? resultOnClose : value)
-  })
-}
-
-function closeDialog(result: string | boolean | null) {
-  const resolve = dialogResolve
-  dialogResolve = null
-  dialog.value = null
-  resolve?.(result)
-}
-
-function submitDialog() {
-  if (!dialog.value) return
-  if (dialog.value.kind === 'input') {
-    const value = dialog.value.value.trim()
-    closeDialog(value || null)
-    return
+// ---------- 页内弹窗：统一走 ElMessageBox（Electron 渲染进程同样可用） ----------
+/** 文本输入框，取消时返回 null。 */
+async function askInput(title: string, defaultValue = '', message = ''): Promise<string | null> {
+  try {
+    const { value } = await ElMessageBox.prompt(message, title, {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      inputValue: defaultValue,
+      inputPlaceholder: '请输入名称',
+      inputValidator: (input: string) => (input && input.trim() ? true : '名称不能为空'),
+    })
+    return (value || '').trim() || null
+  } catch {
+    return null
   }
-  closeDialog(true)
 }
 
-/** 提醒类弹窗只能点确定关闭；输入/确认类允许点遮罩取消。 */
-function cancelDialog() {
-  if (!dialog.value || dialog.value.kind === 'alert') return
-  closeDialog(dialog.value.kind === 'input' ? null : false)
-}
-
-async function askInput(title: string, defaultValue = '', message = '') {
-  const result = await openDialog(
-    { kind: 'input', title, message, value: defaultValue, danger: false },
-    null,
-  )
-  return typeof result === 'string' ? result : null
-}
-
-async function askConfirm(title: string, message: string, danger = false) {
-  const result = await openDialog(
-    { kind: 'confirm', title, message, value: '', danger },
-    false,
-  )
-  return result === true
+/** 二次确认，取消或关闭都按「否」处理。 */
+async function askConfirm(title: string, message: string, danger = false): Promise<boolean> {
+  try {
+    await ElMessageBox.confirm(message, title, {
+      type: danger ? 'warning' : 'info',
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      confirmButtonClass: danger ? 'el-button--danger' : '',
+    })
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function askAlert(title: string, message: string) {
-  await openDialog({ kind: 'alert', title, message, value: '', danger: false }, true)
+  await ElMessageBox.alert(message, title, { confirmButtonText: '确定' }).catch(() => undefined)
 }
 
 async function createProject(mode: ProjectMode) {
-  // 新建项目 = 选择一个父目录 + 输入新目录名；选择已有目录 = 直接附着。
+  // 打开已有项目 = 所选目录本身作为项目根；新建空项目 = 在所选目录下再建一个子目录。
   const base = await pickDirectory()
   if (!base) return
 
@@ -309,7 +290,7 @@ async function createProject(mode: ProjectMode) {
   let name = projectNameFromPath(base)
   if (mode === 'create') {
     const input = await askInput(
-      '新建项目',
+      '新建空项目',
       '新项目',
       '将在所选目录下创建同名子目录',
     )
@@ -337,7 +318,17 @@ async function createProject(mode: ProjectMode) {
   }
   open.projects = true
   if (!isExpanded(project.id)) expanded.value = [...expanded.value, project.id]
-  flash(mode === 'create' ? `已创建项目 ${project.name}` : `已添加项目 ${project.name}`)
+  flash(mode === 'create' ? `已创建项目 ${project.name}` : `已打开项目 ${project.name}`)
+  // 优先切到该项目最近一个会话；没有会话时直接新建，避免继续落在旧的自由会话里。
+  const created = project
+  const latest = sessions.sessions
+    .filter((item) => item.project_id === created.id && !item.archived)
+    .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))[0]
+  if (latest) {
+    emit('select', latest.thread_id)
+  } else {
+    await createSessionInProject(created.id)
+  }
 }
 
 
@@ -450,10 +441,6 @@ function openArchiveDialog() {
   void sessions.refreshArchived()
 }
 
-function closeArchiveDialog() {
-  archiveOpen.value = false
-}
-
 async function archiveSession(threadId: string) {
   // 运行中或等待人工介入的会话先不归档，避免归档后仍有 Agent 写入。
   if (sessions.runningThreads.has(threadId) || sessions.waitingThreads.has(threadId)) {
@@ -532,14 +519,15 @@ onBeforeUnmount(() => {
 <template>
   <aside class="session-panel">
     <div class="sp-actions side-stack">
-      <button class="side-action primary" type="button" @click="requestCreate">
-        <AppIcon name="plus" :size="14" />
-        <span>新建会话</span>
-      </button>
-      <button class="side-action" type="button" @click="createProject('create')">
-        <AppIcon name="folder" :size="14" />
-        <span>新建项目</span>
-      </button>
+      <el-button class="side-action" type="primary" :icon="Plus" @click="requestCreate">
+        新建会话
+      </el-button>
+      <el-button class="side-action" :icon="FolderOpened" @click="createProject('attach')">
+        打开已有项目
+      </el-button>
+      <el-button class="side-action" :icon="Plus" @click="createProject('create')">
+        新建空项目
+      </el-button>
     </div>
 
     <div class="sp-scroll">
@@ -553,7 +541,11 @@ onBeforeUnmount(() => {
           <span class="count mono">{{ integrations.length }}</span>
         </header>
 
-        <div v-show="open.integrations" class="group-body">
+        <div
+          v-show="open.integrations"
+          v-loading="integrationLoading && integrations.length === 0"
+          class="group-body"
+        >
           <div
             v-for="item in integrations"
             :key="item.server_id"
@@ -582,21 +574,27 @@ onBeforeUnmount(() => {
                 <span class="i-name">{{ item.server_id }}</span>
                 <span class="i-hint">{{ integrationHint(item) }}</span>
               </span>
-              <span
+              <el-button
                 v-if="!integrationConnected(item) && item.enabled"
                 class="i-connect"
+                size="small"
+                text
+                type="primary"
+                :loading="connectingIntegration === item.server_id"
                 @click.stop="connectIntegration(item)"
               >
                 {{ connectingIntegration === item.server_id ? '连接中…' : '连接' }}
-              </span>
-              <span
+              </el-button>
+              <el-button
                 v-else-if="integrationConnected(item) && item.enabled"
                 class="i-new"
+                :icon="ChatDotRound"
+                text
+                circle
+                size="small"
                 title="在该后端新建会话"
                 @click.stop="createIntegrationSession(item)"
-              >
-                <AppIcon name="chatPlus" :size="12" />
-              </span>
+              />
               <span
                 class="p-chev"
                 :class="{ open: selectedIntegration === item.server_id }"
@@ -631,10 +629,11 @@ onBeforeUnmount(() => {
           </div>
 
           <p v-if="integrationError" class="empty">{{ integrationError }}</p>
-          <p v-else-if="integrationLoading && integrations.length === 0" class="empty">加载中…</p>
-          <p v-else-if="integrations.length === 0" class="empty">
-            暂无集成项目。在 MCP 服务页新增服务时打开「集成项目」即可。
-          </p>
+          <el-empty
+            v-else-if="integrations.length === 0 && !integrationLoading"
+            :image-size="40"
+            description="暂无集成项目。在 MCP 服务页新增服务时打开「集成项目」即可。"
+          />
         </div>
       </section>
 
@@ -662,12 +661,14 @@ onBeforeUnmount(() => {
                 {{ project.status === 'unavailable' ? '目录丢失' : '需修复' }}
               </span>
               <span class="p-hover">
-                <button
+                <el-button
                   class="mini"
-                  type="button"
+                  text
+                  circle
+                  size="small"
                   title="项目操作"
                   @click.stop="projectMenu = project.id"
-                >…</button>
+                >…</el-button>
               </span>
               <span class="p-chev" :class="{ open: isExpanded(project.id) }" @click.stop="toggleProject(project.id)">
                 <AppIcon name="chevronRight" :size="10" />
@@ -694,33 +695,44 @@ onBeforeUnmount(() => {
 
             <div v-if="projectMenu === project.id" class="menu-mask" @click.stop="projectMenu = null"></div>
             <div v-if="projectMenu === project.id" class="p-menu" @click.stop>
-              <button type="button" @click="createSessionInProject(project.id)">
-                <AppIcon name="chatPlus" :size="11" /><span>在该项目下新建对话</span>
-              </button>
-              <button type="button" @click="renameProject(project.id)">
-                <AppIcon name="edit" :size="11" /><span>重命名</span>
-              </button>
-              <button type="button" @click="toggleProjectPin(project.id)">
-                <AppIcon :name="project.pinned ? 'unpin' : 'pin'" :size="11" />
-                <span>{{ project.pinned ? '取消置顶' : '置顶' }}</span>
-              </button>
-              <button type="button" @click="repairProject(project.id)">
-                <AppIcon name="check" :size="11" /><span>重新校验 / 修复标记</span>
-              </button>
-              <button type="button" @click="openProject(project.path)">
-                <AppIcon name="folder" :size="11" /><span>在资源管理器中打开</span>
-              </button>
-              <button type="button" @click="copyProjectPath(project.id); projectMenu = null">
-                <AppIcon name="copy" :size="11" /><span>复制目录路径</span>
-              </button>
-              <button
+              <el-button class="p-menu-item" text :icon="ChatDotRound" @click="createSessionInProject(project.id)">
+                在该项目下新建对话
+              </el-button>
+              <el-button class="p-menu-item" text :icon="EditPen" @click="renameProject(project.id)">
+                重命名
+              </el-button>
+              <el-button
+                class="p-menu-item"
+                text
+                :icon="project.pinned ? Bottom : Top"
+                @click="toggleProjectPin(project.id)"
+              >
+                {{ project.pinned ? '取消置顶' : '置顶' }}
+              </el-button>
+              <el-button class="p-menu-item" text :icon="Refresh" @click="repairProject(project.id)">
+                重新校验 / 修复标记
+              </el-button>
+              <el-button class="p-menu-item" text :icon="FolderOpened" @click="openProject(project.path)">
+                在资源管理器中打开
+              </el-button>
+              <el-button
+                class="p-menu-item"
+                text
+                :icon="CopyDocument"
+                @click="copyProjectPath(project.id); projectMenu = null"
+              >
+                复制目录路径
+              </el-button>
+              <el-button
                 v-if="!project.is_default"
-                type="button"
-                class="danger"
+                class="p-menu-item danger"
+                text
+                type="danger"
+                :icon="Delete"
                 @click="removeProject(project.id, project.is_default)"
               >
-                <AppIcon name="trash" :size="11" /><span>移出项目</span>
-              </button>
+                移出项目
+              </el-button>
               <p class="p-path mono">{{ project.path }}</p>
             </div>
           </div>
@@ -741,7 +753,11 @@ onBeforeUnmount(() => {
           <span class="count mono">{{ ungrouped.length }}</span>
         </header>
 
-        <div v-show="open.sessions" class="group-body">
+        <div
+          v-show="open.sessions"
+          v-loading="sessions.loading && sessions.sessions.length === 0"
+          class="group-body"
+        >
           <SessionRow
             v-for="item in ungrouped"
             :key="item.thread_id"
@@ -756,106 +772,80 @@ onBeforeUnmount(() => {
             @archive="archiveSession"
           />
           <p v-if="sessions.offline" class="empty">后端离线，会话列表不可用</p>
-          <p v-else-if="sessions.loading && sessions.sessions.length === 0" class="empty">加载中…</p>
-          <p v-else-if="ungrouped.length === 0" class="empty">
-            {{ workspace.projects.length ? '暂无未分组对话' : '还没有对话，发一条消息开始' }}
-          </p>
+          <el-empty
+            v-else-if="ungrouped.length === 0 && !sessions.loading"
+            :image-size="40"
+            :description="workspace.projects.length ? '暂无未分组对话' : '还没有对话，发一条消息开始'"
+          />
         </div>
       </section>
     </div>
 
-    <button class="archive-entry" type="button" @click="openArchiveDialog">
-      <AppIcon name="archive" :size="14" />
-      <span>归档会话</span>
+    <el-button class="archive-entry" :icon="Box" @click="openArchiveDialog">
+      归档会话
       <span v-if="sessions.archivedSessions.length" class="arc-badge mono">
         {{ sessions.archivedSessions.length }}
       </span>
-    </button>
-
-    <p v-if="notice" class="sp-notice mono">{{ notice }}</p>
+    </el-button>
 
     <!-- 归档会话管理：查看 / 恢复 / 永久删除 -->
-    <div v-if="archiveOpen" class="archive-mask" @click.self="closeArchiveDialog">
-      <div class="archive-box" role="dialog" aria-modal="true">
-        <header class="archive-head">
-          <div class="archive-heading">
-            <strong>归档会话</strong>
-            <p>归档会话不会出现在侧边栏，也不会被 Agent 读取。</p>
-          </div>
-          <button class="archive-close" type="button" title="关闭" @click="closeArchiveDialog">
-            <AppIcon name="close" :size="12" />
-          </button>
-        </header>
-
-        <div class="archive-list">
-          <div
-            v-for="item in sessions.archivedSessions"
-            :key="item.thread_id"
-            class="archive-item"
-          >
-            <div class="arc-main">
-              <div class="arc-title-row">
-                <AppIcon name="archive" :size="11" />
-                <strong>{{ item.title || '新会话' }}</strong>
-                <span class="arc-count mono">{{ item.message_count }} 条</span>
-              </div>
-              <div class="arc-meta mono">
-                <span>归档于 {{ fmtArchiveTime(item.archived_at) }}</span>
-                <button
-                  v-if="archivedProject(item)"
-                  class="arc-path"
-                  type="button"
-                  :title="archivedLocation(item)"
-                  @click="openArchivedLocation(item)"
-                >
-                  · {{ archivedLocation(item) }}
-                </button>
-                <span v-else-if="archivedLocation(item)">· {{ archivedLocation(item) }}</span>
-              </div>
+    <el-dialog
+      v-model="archiveOpen"
+      title="归档会话"
+      width="520px"
+      append-to-body
+      class="archive-dialog"
+    >
+      <p class="archive-tip">归档会话不会出现在侧边栏，也不会被 Agent 读取。</p>
+      <div
+        v-loading="sessions.archivedLoading && sessions.archivedSessions.length === 0"
+        class="archive-list"
+      >
+        <div
+          v-for="item in sessions.archivedSessions"
+          :key="item.thread_id"
+          class="archive-item"
+        >
+          <div class="arc-main">
+            <div class="arc-title-row">
+              <AppIcon name="archive" :size="11" />
+              <strong>{{ item.title || '新会话' }}</strong>
+              <span class="arc-count mono">{{ item.message_count }} 条</span>
             </div>
-            <div class="arc-actions">
-              <button type="button" @click="viewArchived(item.thread_id)">查看</button>
-              <button type="button" @click="restoreArchived(item.thread_id)">恢复</button>
-              <button class="danger" type="button" @click="removeArchived(item.thread_id)">
-                删除
-              </button>
+            <div class="arc-meta mono">
+              <span>归档于 {{ fmtArchiveTime(item.archived_at) }}</span>
+              <el-button
+                v-if="archivedProject(item)"
+                class="arc-path"
+                text
+                size="small"
+                :title="archivedLocation(item)"
+                @click="openArchivedLocation(item)"
+              >
+                · {{ archivedLocation(item) }}
+              </el-button>
+              <span v-else-if="archivedLocation(item)">· {{ archivedLocation(item) }}</span>
             </div>
           </div>
-
-          <p v-if="sessions.archivedLoading && sessions.archivedSessions.length === 0" class="empty">
-            加载中…
-          </p>
-          <p v-else-if="sessions.archivedSessions.length === 0" class="empty">
-            暂无归档会话。会话行的「更多」菜单里可以选择归档。
-          </p>
+          <div class="arc-actions">
+            <el-button size="small" @click="viewArchived(item.thread_id)">查看</el-button>
+            <el-button size="small" @click="restoreArchived(item.thread_id)">恢复</el-button>
+            <el-button size="small" type="danger" @click="removeArchived(item.thread_id)">
+              删除
+            </el-button>
+          </div>
         </div>
-      </div>
-    </div>
 
-    <!-- 页内弹窗：Electron 渲染进程不支持 window.prompt / confirm -->
-    <div v-if="dialog" class="dialog-mask" @click.self="cancelDialog">
-      <div class="dialog-box" role="dialog" aria-modal="true">
-        <strong class="dialog-title">{{ dialog.title }}</strong>
-        <p v-if="dialog.message" class="dialog-msg">{{ dialog.message }}</p>
-        <input
-          v-if="dialog.kind === 'input'"
-          ref="dialogInput"
-          v-model="dialog.value"
-          class="dialog-input mono"
-          type="text"
-          @keydown.enter="submitDialog"
-          @keydown.esc="closeDialog(null)"
+        <el-empty
+          v-if="!sessions.archivedLoading && sessions.archivedSessions.length === 0"
+          :image-size="40"
+          description="暂无归档会话。会话行的「更多」菜单里可以选择归档。"
         />
-        <div class="dialog-actions">
-          <button v-if="dialog.kind !== 'alert'" type="button" class="dlg-btn" @click="cancelDialog">
-            取消
-          </button>
-          <button type="button" class="dlg-btn primary" :class="{ danger: dialog.danger }" @click="submitDialog">
-            确定
-          </button>
-        </div>
       </div>
-    </div>
+      <template #footer>
+        <el-button @click="archiveOpen = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </aside>
 </template>
 
@@ -880,44 +870,18 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid var(--line);
 }
 
-.side-action {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* 动作区按钮：铺满侧栏宽度，图标与文字左对齐 */
+.side-action.el-button {
   width: 100%;
   height: 34px;
+  margin-left: 0;
   padding: 0 11px;
   font-size: 12px;
-  text-align: left;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
+  justify-content: flex-start;
 }
 
-.side-action:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-  background: rgba(91, 140, 255, 0.06);
-}
-
-.side-action :deep(svg) {
-  color: var(--text-3);
-}
-
-.side-action.primary {
-  color: var(--text-1);
-  border-color: rgba(91, 140, 255, 0.3);
-  background: rgba(91, 140, 255, 0.08);
-}
-
-.side-action.primary :deep(svg) {
-  color: var(--accent);
-}
-
-.side-action.primary:hover {
-  border-color: var(--accent);
-  background: rgba(91, 140, 255, 0.14);
+.side-action.el-button + .side-action.el-button {
+  margin-left: 0;
 }
 
 /* 滚动区 */
@@ -1069,30 +1033,24 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.i-connect {
+.i-connect.el-button {
   flex: none;
-  padding: 2px 7px;
+  height: 20px;
+  margin-left: 0;
+  padding: 0 7px;
   font-size: 9.5px;
   color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.34);
-  border-radius: var(--radius-sm);
 }
 
-.i-connect:hover {
-  background: rgba(55, 208, 196, 0.1);
-}
-
-.i-new {
-  display: grid;
-  place-items: center;
+.i-new.el-button {
   width: 20px;
   height: 20px;
   flex: none;
+  margin-left: 0;
   color: var(--text-3);
-  border-radius: var(--radius-sm);
 }
 
-.i-new:hover {
+.i-new.el-button:hover {
   color: var(--accent-cyan);
   background: var(--bg-hover);
 }
@@ -1160,19 +1118,17 @@ onBeforeUnmount(() => {
   opacity: 1;
 }
 
-.mini {
+.mini.el-button {
   width: 20px;
   height: 20px;
+  margin-left: 0;
   padding: 0;
   font-size: 12px;
   line-height: 1;
   color: var(--text-3);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
 }
 
-.mini:hover {
+.mini.el-button:hover {
   color: var(--accent-cyan);
   background: var(--bg-hover);
 }
@@ -1200,6 +1156,15 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 
+/* 侧栏里的空态压缩留白，避免占满整列 */
+.group-body :deep(.el-empty) {
+  padding: 18px 0;
+}
+
+.archive-list :deep(.el-empty) {
+  padding: 16px 0;
+}
+
 /* 项目操作菜单 */
 .menu-mask {
   position: fixed;
@@ -1223,36 +1188,36 @@ onBeforeUnmount(() => {
   box-shadow: 0 8px 24px rgba(2, 6, 14, 0.5);
 }
 
-.p-menu button {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.p-menu-item.el-button {
   width: 100%;
+  height: auto;
+  margin-left: 0;
   padding: 6px 8px;
   font-size: 11px;
-  text-align: left;
   color: var(--text-2);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
+  justify-content: flex-start;
 }
 
-.p-menu button:hover {
+.p-menu-item.el-button + .p-menu-item.el-button {
+  margin-left: 0;
+}
+
+.p-menu-item.el-button:hover {
   color: var(--text-1);
   background: var(--bg-hover);
 }
 
-.p-menu button :deep(svg) {
+.p-menu-item.el-button :deep(svg) {
   color: var(--accent-cyan);
-  flex: none;
 }
 
-.p-menu button.danger {
+.p-menu-item.el-button.danger,
+.p-menu-item.el-button.danger :deep(svg) {
   color: var(--danger);
 }
 
-.p-menu button.danger :deep(svg) {
-  color: var(--danger);
+.p-menu-item.el-button.danger:hover {
+  background: rgba(226, 96, 94, 0.12);
 }
 
 .p-path {
@@ -1264,42 +1229,36 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.sp-notice {
-  margin: 0;
-  padding: 6px 10px;
-  font-size: 9.5px;
-  color: var(--accent-cyan);
-  border-top: 1px solid var(--line);
-  background: transparent;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* 侧边栏底部的「归档会话」入口 */
-.archive-entry {
-  display: flex;
-  align-items: center;
-  gap: 7px;
+.archive-entry.el-button {
   flex: none;
   width: calc(100% - 20px);
+  height: auto;
   margin: 6px 10px 8px;
   padding: 6px 10px;
   font-size: 11px;
-  text-align: left;
   color: var(--text-2);
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: transparent;
+  border-style: dashed;
+  border-color: var(--line-strong);
+  justify-content: flex-start;
 }
 
-.archive-entry:hover {
+/* 默认插槽包在 span 里：撑满剩余宽度，徽标才能贴右（排除徽标自身） */
+.archive-entry.el-button :deep(span:not(.arc-badge)) {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+}
+
+.archive-entry.el-button:hover {
   color: var(--text-1);
   border-color: var(--accent);
   background: rgba(91, 140, 255, 0.06);
 }
 
-.archive-entry :deep(svg) {
+.archive-entry.el-button :deep(svg) {
   color: var(--accent-cyan);
 }
 
@@ -1313,76 +1272,19 @@ onBeforeUnmount(() => {
   background: rgba(55, 208, 196, 0.12);
 }
 
-/* 归档会话管理弹窗 */
-.archive-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 58;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(2, 6, 14, 0.55);
-  backdrop-filter: blur(3px);
-}
-
-.archive-box {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: min(520px, 100%);
-  max-height: min(520px, 82vh);
-  padding: 14px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
-  background: var(--bg-elevated);
-  box-shadow: 0 16px 40px rgba(2, 6, 14, 0.55);
-}
-
-.archive-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-}
-
-.archive-heading {
-  flex: 1;
-  min-width: 0;
-}
-
-.archive-heading strong {
-  font-size: 13px;
-  color: var(--text-1);
-}
-
-.archive-heading p {
-  margin: 2px 0 0;
+/* 归档会话管理弹窗（el-dialog 内部） */
+.archive-tip {
+  margin: 0 0 10px;
   font-size: 10.5px;
   color: var(--text-3);
-}
-
-.archive-close {
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  flex: none;
-  padding: 0;
-  color: var(--text-3);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-}
-
-.archive-close:hover {
-  color: var(--text-1);
-  background: var(--bg-hover);
 }
 
 .archive-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  min-height: 0;
+  min-height: 80px;
+  max-height: 52vh;
   overflow-y: auto;
 }
 
@@ -1446,21 +1348,22 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
 }
 
-.arc-path {
+.arc-path.el-button {
   flex: none;
+  height: auto;
+  margin-left: 0;
   padding: 0;
   overflow: hidden;
   font-family: var(--font-mono);
-  font-size: inherit;
+  font-size: 9.5px;
   color: var(--accent-cyan);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  border: 0;
-  background: transparent;
+  justify-content: flex-start;
 }
 
-.arc-path:hover {
+.arc-path.el-button:hover {
+  color: var(--accent-cyan);
   text-decoration: underline;
+  background: transparent;
 }
 
 .arc-actions {
@@ -1470,121 +1373,15 @@ onBeforeUnmount(() => {
   flex: none;
 }
 
-.arc-actions button {
+.arc-actions .el-button {
   min-width: 52px;
+  margin-left: 0;
   padding: 3px 8px;
   font-size: 10.5px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
 }
 
-.arc-actions button:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-  background: var(--bg-hover);
-}
-
-.arc-actions button.danger {
-  color: var(--danger);
-  border-color: rgba(255, 96, 96, 0.4);
-}
-
-.arc-actions button.danger:hover {
-  background: rgba(255, 96, 96, 0.1);
-}
-
-.archive-list .empty {
-  text-align: center;
-}
-
-/* 页内弹窗 */
-.dialog-mask {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(2, 6, 14, 0.55);
-  backdrop-filter: blur(3px);
-}
-
-.dialog-box {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: min(360px, 100%);
-  padding: 16px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
-  background: var(--bg-elevated);
-  box-shadow: 0 16px 40px rgba(2, 6, 14, 0.55);
-}
-
-.dialog-title {
-  font-size: 13px;
-  color: var(--text-1);
-}
-
-.dialog-msg {
-  margin: 0;
-  font-size: 11.5px;
-  line-height: 1.6;
-  color: var(--text-2);
-  white-space: pre-wrap;
-}
-
-.dialog-input {
-  width: 100%;
-  height: 32px;
-  padding: 0 9px;
-  font-size: 12px;
-  color: var(--text-1);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.04);
-  outline: none;
-}
-
-.dialog-input:focus {
-  border-color: var(--accent);
-}
-
-.dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 2px;
-}
-
-.dlg-btn {
-  min-width: 64px;
-  height: 30px;
-  padding: 0 12px;
-  font-size: 12px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-}
-
-.dlg-btn:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-}
-
-.dlg-btn.primary {
-  color: var(--text-1);
-  border-color: rgba(91, 140, 255, 0.4);
-  background: rgba(91, 140, 255, 0.12);
-}
-
-.dlg-btn.primary.danger {
-  color: var(--danger);
-  border-color: rgba(255, 96, 96, 0.4);
-  background: rgba(255, 96, 96, 0.1);
+.arc-actions .el-button + .el-button {
+  margin-left: 0;
 }
 
 @media (max-width: 900px) {

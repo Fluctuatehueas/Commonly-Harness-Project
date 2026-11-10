@@ -119,6 +119,9 @@ async def approve_experience(
     experience_id: str,
     request: ExperienceStateRequest,
 ) -> dict[str, Any]:
+    from api.identity import effective_user_id
+
+    request.user_id = effective_user_id(request.user_id)
     record = await ExperienceStore(_require_store(), request.user_id).set_state(
         experience_id,
         AdmissionState.ACTIVE,
@@ -133,6 +136,9 @@ async def quarantine_experience(
     experience_id: str,
     request: ExperienceStateRequest,
 ) -> dict[str, Any]:
+    from api.identity import effective_user_id
+
+    request.user_id = effective_user_id(request.user_id)
     record = await ExperienceStore(_require_store(), request.user_id).set_state(
         experience_id,
         AdmissionState.QUARANTINED,
@@ -174,6 +180,9 @@ class RewardRequest(BaseModel):
 
 @router.post("/rewards")
 async def post_reward(request: RewardRequest) -> dict[str, Any]:
+    from api.identity import effective_user_id
+
+    request.user_id = effective_user_id(request.user_id)
     record = await append_reward(
         _require_store(),
         user_id=request.user_id,

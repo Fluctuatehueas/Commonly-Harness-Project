@@ -7,17 +7,25 @@ import { useDisplayStore } from '@/stores/display'
 import type { TreeNode } from './trajectoryTypes'
 import TrajectoryNode from './TrajectoryNode.vue'
 
-const props = defineProps<{ node: TreeNode }>()
+const props = defineProps<{ node: TreeNode; agentName?: string }>()
 const display = useDisplayStore()
 
-// 推理 / 子 Agent 输出在流式期间展开；工具节点在调用期间展开，
-// 结束后折叠，用户可点击节点再查看完整参数与结果。
+// 委派节点（SubAgent）默认折叠：子 Agent 的推理、工具与输出都收在
+// 折叠行后面，行内只显示最近一步预览。其他节点维持原有展开策略。
+const isDelegationNode = computed(
+  () => props.node.msg.kind === 'tool' && props.node.msg.category === 'delegation',
+)
 const open = ref(
-  Boolean(props.node.msg.streaming) || props.node.msg.status === 'calling',
+  !isDelegationNode.value &&
+    (Boolean(props.node.msg.streaming) || props.node.msg.status === 'calling'),
 )
 watch(
   () => [props.node.msg.streaming, props.node.msg.status] as const,
   ([streaming, status]) => {
+    if (isDelegationNode.value) {
+      // 委派节点只由用户点击展开 / 收起，不做流式自动展开。
+      return
+    }
     // 用户显式开启「参数默认展开」时，结束也不自动折叠。
     open.value = display.prefs.expandToolArgs
       ? true
@@ -27,15 +35,30 @@ watch(
 
 const msg = computed(() => props.node.msg)
 
+// 子 Agent 实际名称：后端 source 可能是具体名字，也可能退化成 "subagent"，
+// 后者从父节点继承，保证 UI 上始终显示 "web_researcher" 这类具体名字。
+const ownAgent = computed(() => {
+  const source = String(msg.value.source || '')
+  if (source && source !== 'main' && source !== 'subagent') return source
+  return String(msg.value.subagentName || '')
+})
+const effectiveAgent = computed(() => ownAgent.value || props.agentName || '')
+
 const skill = computed(() => msg.value.kind === 'tool' && msg.value.category === 'skill')
 const delegation = computed(
   () => msg.value.kind === 'tool' && msg.value.category === 'delegation',
 )
 const hasDetail = computed(
-  () => Boolean(msg.value.content || msg.value.args || msg.value.result) && !skill.value,
+  () =>
+    msg.value.kind !== 'marker' &&
+    (props.node.children.length > 0 ||
+      (Boolean(msg.value.content || msg.value.args || msg.value.result) && !skill.value)),
 )
 
 const icon = computed<IconName>(() => {
+  if (msg.value.kind === 'marker') {
+    return msg.value.markerType === 'taskflow' ? 'target' : 'sparkles'
+  }
   if (msg.value.kind === 'reasoning') return 'sparkles'
   if (msg.value.kind === 'subagent') return 'bot'
   if (msg.value.kind === 'assistant') return 'message'
@@ -47,15 +70,22 @@ const icon = computed<IconName>(() => {
 
 const label = computed(() => {
   const value = msg.value
+  if (value.kind === 'marker') {
+    return value.markerType === 'taskflow' ? '命中任务流' : '采用经验'
+  }
   if (value.kind === 'reasoning') return '思考'
-  if (value.kind === 'subagent') return '子智能体输出'
+  if (value.kind === 'subagent') {
+    return effectiveAgent.value
+      ? `子智能体 ${effectiveAgent.value} 输出`
+      : '子智能体输出'
+  }
   if (value.kind === 'assistant') return '模型输出'
   if (value.kind === 'interrupt') {
     return value.interruptType === 'hitl_approval' ? '人工审批' : '人工介入'
   }
   if (skill.value) return `使用技能 ${value.toolName || 'skill'}`
   if (delegation.value) {
-    return `委派 ${value.subagentName || value.toolName || '子任务'}`
+    return `委派 ${value.subagentName || effectiveAgent.value || value.toolName || '子任务'}`
   }
   return `调用工具 ${value.toolName || 'tool'}`
 })
@@ -76,6 +106,40 @@ const atLabel = computed(() => {
   const date = new Date(msg.value.at)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+})
+
+const markerItems = computed(() => msg.value.markerItems || [])
+
+function oneLine(value?: string, limit = 48): string {
+  const text = String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!text) return ''
+  return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
+// 折叠状态下只展示最近一步：工具调用、思考或输出摘要，保持一行。
+const collapsedPreview = computed(() => {
+  if (!isDelegationNode.value || open.value) return ''
+  const children = props.node.children.filter((child) => child.msg.kind !== 'marker')
+  const last = children[children.length - 1]
+  if (!last) return ''
+  const prefix = `${children.length} 步 · 最近：`
+  const child = last.msg
+  if (child.kind === 'tool') {
+    const action =
+      child.category === 'delegation'
+        ? `委派 ${child.subagentName || child.toolName || '子任务'}`
+        : `调用 ${child.toolName || '工具'}`
+    const detail = oneLine(child.result || child.args || child.content)
+    return `${prefix}${detail ? `${action} · ${detail}` : action}`
+  }
+  if (child.kind === 'reasoning') {
+    const detail = oneLine(child.content)
+    return `${prefix}${detail ? `思考：${detail}` : '思考中'}`
+  }
+  const detail = oneLine(child.content)
+  return detail ? `${prefix}输出：${detail}` : ''
 })
 
 function pretty(raw?: string) {
@@ -107,7 +171,26 @@ watch(
         <AppIcon :name="icon" :size="11" />
       </span>
       <span class="tnode-label">{{ label }}</span>
+      <span v-if="effectiveAgent && !delegation && msg.kind !== 'subagent'" class="tnode-agent">
+        {{ effectiveAgent }}
+      </span>
       <span v-if="statusText" class="tnode-status" :class="msg.kind === 'interrupt' ? 'resolved' : msg.status">{{ statusText }}</span>
+      <!-- 经验 / 任务流标记：直接在本行渲染命中标签 -->
+      <span v-if="msg.kind === 'marker'" class="tnode-marker-chips">
+        <span
+          v-for="(item, index) in markerItems"
+          :key="`${item.id}-${index}`"
+          class="marker-chip"
+          :title="item.rule || ''"
+        >
+          【根据{{ item.name }}经验】
+        </span>
+        <span v-if="msg.markerType === 'taskflow'" class="marker-chip flow">
+          {{ msg.content }}
+        </span>
+      </span>
+      <!-- 委派节点折叠时：只显示一行最近步骤预览 -->
+      <span v-else-if="collapsedPreview" class="tnode-preview">{{ collapsedPreview }}</span>
       <span v-if="atLabel" class="tnode-time">{{ atLabel }}</span>
       <AppIcon
         v-if="hasDetail"
@@ -134,8 +217,14 @@ watch(
       </template>
     </div>
 
-    <div v-if="node.children.length" class="tnode-children">
-      <TrajectoryNode v-for="child in node.children" :key="child.msg.id" :node="child" />
+    <!-- 子 Agent 轨迹跟随委派节点一起折叠，只有用户展开后才渲染 -->
+    <div v-if="open && node.children.length" class="tnode-children">
+      <TrajectoryNode
+        v-for="child in node.children"
+        :key="child.msg.id"
+        :node="child"
+        :agent-name="effectiveAgent || undefined"
+      />
     </div>
   </div>
 </template>
@@ -219,6 +308,66 @@ watch(
   font-size: 10px;
 }
 
+/* 子 Agent 名称徽标：让每个工具节点都能看出是谁调用的 */
+.tnode-agent {
+  flex: none;
+  padding: 0 6px;
+  font-size: 9.5px;
+  line-height: 16px;
+  color: #c3b6ff;
+  border: 1px solid rgba(143, 123, 255, 0.35);
+  border-radius: 999px;
+  background: rgba(143, 123, 255, 0.08);
+  white-space: nowrap;
+}
+
+/* 折叠委派节点的一行过程预览 */
+.tnode-preview {
+  flex: 2 1 0;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10.5px;
+  color: var(--text-3);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 经验 / 任务流命中标记：仅过程渲染，不进入轨迹存储 */
+.tnode.marker .rail-dot {
+  color: #9ff3df;
+  background: rgba(55, 208, 196, 0.12);
+}
+
+.tnode.marker .tnode-label {
+  flex: none;
+  color: #9ff3df;
+}
+
+.tnode-marker-chips {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.marker-chip {
+  padding: 1px 7px;
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: #9ff3df;
+  border: 1px solid rgba(55, 208, 196, 0.4);
+  border-radius: 999px;
+  background: rgba(55, 208, 196, 0.08);
+  white-space: nowrap;
+}
+
+.marker-chip.flow {
+  color: #c3b6ff;
+  border-color: rgba(143, 123, 255, 0.45);
+  background: rgba(143, 123, 255, 0.1);
+}
+
 .tnode-status.calling {
   color: var(--accent-cyan);
 }
@@ -299,8 +448,10 @@ watch(
 /* 子节点缩进 + 左侧竖线，形成树状结构 */
 .tnode-children {
   position: relative;
-  margin-left: 13px;
-  padding-left: 10px;
-  border-left: 1px solid var(--line);
+  margin-left: 17px;
+  padding-left: 11px;
+  border-left: 1px solid rgba(143, 123, 255, 0.35);
+  background: rgba(143, 123, 255, 0.025);
+  border-radius: 0 6px 6px 0;
 }
 </style>

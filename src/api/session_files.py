@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import os
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -266,8 +267,9 @@ async def download_session_file(
     user_id: str = Query(..., min_length=1),
     path: str = Query(..., min_length=1),
     source: FileOrigin = Query("sandbox"),
+    inline: bool = Query(False, description="图片消息内联展示时使用正确的 media type"),
 ) -> Response:
-    """按原始字节下载文件。"""
+    """按原始字节下载文件；图片可在 Markdown 气泡内联渲染。"""
     sandbox_root, _project_id, project_root = await _session_context(user_id, thread_id)
     sandbox = await _sandbox(user_id) if source == "sandbox" else None
     content = await _read_content(
@@ -278,9 +280,16 @@ async def download_session_file(
         project_root=project_root,
     )
     filename = PurePosixPath(path).name or "download"
-    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    # 只有图片允许内联展示，其他文件仍强制下载，避免把 HTML/SVG 当页面执行。
+    allow_inline = inline and media_type.startswith("image/")
+    disposition = (
+        f"inline; filename*=UTF-8''{quote(filename)}"
+        if allow_inline
+        else f"attachment; filename*=UTF-8''{quote(filename)}"
+    )
     return Response(
         content=content,
-        media_type="application/octet-stream",
+        media_type=media_type if allow_inline else "application/octet-stream",
         headers={"Content-Disposition": disposition},
     )

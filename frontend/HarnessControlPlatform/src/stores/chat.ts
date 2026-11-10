@@ -1,9 +1,13 @@
 // 对话测试：按会话隔离的 SSE 状态机 + 演示模式
 // 关键点：切换会话不 abort 正在运行的流，每个 thread 有独立消息缓冲区。
-import { defineStore } from 'pinia'
+import { defineStore, acceptHMRUpdate } from 'pinia'
 import { computed, ref } from 'vue'
 import { API_BASE } from '@/api/client'
+import { submitFeedback } from '@/api/feedback'
+import { USER_ID } from '@/stores/sessions'
+import { currentUser } from '@/api/identity'
 import type { ContextFile } from '@/api/context'
+import type { ExecutionStepView, StepTrace } from '@/api/taskflow'
 
 export type ToolCategory = 'tool' | 'skill' | 'delegation'
 
@@ -11,6 +15,8 @@ export interface MessageTokens {
   input: number
   output: number
   total: number
+  // 真实计费口径：历轮 input + output 之和；撤回消息不回退
+  spent?: number
   rounds?: number
   // 上下文窗口由后端返回，前端不再维护常量
   contextWindow?: number
@@ -19,7 +25,17 @@ export interface MessageTokens {
 
 export interface ChatMsg {
   id: string
-  kind: 'user' | 'assistant' | 'reasoning' | 'subagent' | 'tool' | 'interrupt' | 'system'
+  kind:
+    | 'user'
+    | 'assistant'
+    | 'reasoning'
+    | 'subagent'
+    | 'tool'
+    | 'interrupt'
+    | 'system'
+    | 'taskflow'
+    // 仅前端渲染的流程标记：经验命中 / 任务流命中，不写入轨迹存储
+    | 'marker'
   content?: string
   attachments?: ContextFile[]
   streaming?: boolean
@@ -42,6 +58,18 @@ export interface ChatMsg {
   resolved?: 'answered' | 'approved' | 'rejected'
   // 用户在 HITL 卡片里提交内容的简短摘要，卡片收起后用于轨迹树展示
   resolution?: string
+  // ---------- 任务流执行卡片 ----------
+  flowId?: string
+  flowName?: string
+  flowStatus?: 'running' | 'done' | 'failed' | 'aborted'
+  flowSteps?: ExecutionStepView[]
+  flowTraces?: StepTrace[]
+  flowCurrentStep?: string
+  // 用户对这条最终回答的最新反馈；刷新后由历史接口回填
+  feedback?: 'like' | 'dislike' | null
+  // ---------- 仅渲染的流程标记 ----------
+  markerType?: 'experience' | 'taskflow'
+  markerItems?: { id: string; name: string; rule?: string }[]
 }
 
 interface SseEvent {
@@ -87,6 +115,19 @@ interface ThreadChat {
   compactionTimers: number[]
   // 压缩进度看门狗：长时间没有心跳则提示连接可能已断开
   compactionWatchdog: number | null
+  // 重试时暂存被替换的旧回答，失败且未产生新内容时用于回滚
+  retryBackup: {
+    messageId: string
+    content: string
+    index: number
+    tokens?: MessageTokens
+  } | null
+  // 当前是否处于覆盖式重试中
+  retryPending: boolean
+  // 重试后是否已经收到新正文；没有则失败时恢复旧回答
+  retryReceived: boolean
+  // 用户消息 ID -> 连续重试次数（仅本地，用于防滥用提示）
+  retryCount: Record<string, number>
 }
 
 const SKILL_TOOLS = new Set([
@@ -177,6 +218,25 @@ function flushCompactionBuffer(state: ThreadChat) {
   })
 }
 
+/** 重试失败且尚未产生新回答时，把旧回答放回原位。 */
+function restoreRetryBackup(state: ThreadChat) {
+  const backup = state.retryBackup
+  if (!backup) return
+  if (!state.retryReceived) {
+    const index = Math.min(Math.max(backup.index, 0), state.messages.length)
+    state.messages.splice(index, 0, {
+      id: backup.messageId,
+      kind: 'assistant',
+      content: backup.content,
+      tokens: backup.tokens,
+      source: 'main',
+    })
+  }
+  state.retryBackup = null
+  state.retryPending = false
+  state.retryReceived = false
+}
+
 let seq = 0
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${seq++}`
 
@@ -260,6 +320,10 @@ export const useChatStore = defineStore('chat', () => {
       compactionBuffer: '',
       compactionTimers: [],
       compactionWatchdog: null,
+      retryBackup: null,
+      retryPending: false,
+      retryReceived: false,
+      retryCount: {},
     }
   }
 
@@ -303,6 +367,8 @@ export const useChatStore = defineStore('chat', () => {
   )
   const compactionCount = computed(() => current.value?.compactionCount ?? 0)
   const isEmpty = computed(() => messages.value.length === 0)
+  // 用户选择的 MyAgent；切换会话时保持，默认 Agent 始终可选。
+  const selectedAgentId = ref('default')
 
   // 后台仍在运行的会话集合，供侧边栏动画使用
   const runningThreadIds = computed(() =>
@@ -322,6 +388,40 @@ export const useChatStore = defineStore('chat', () => {
     )
   }
 
+  /**
+   * 把仅渲染的流程标记插到本轮过程的最前面。
+   *
+   * 经验注入发生在首次模型调用前，应排在推理 / 工具之前；即使 SSE
+   * 兜底事件到得较晚，也不能追加到最终回答之后，否则会破坏轮次分组。
+   */
+  function insertTurnMarker(state: ThreadChat, marker: ChatMsg) {
+    let lastUser = -1
+    for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+      if (state.messages[i]?.kind === 'user') {
+        lastUser = i
+        break
+      }
+    }
+    // 标记发生在本轮首次模型调用前，时间戳对齐到用户消息之后，
+    // 保证轨迹树按时间排序时仍排在本轮过程最前面。
+    const userMessage = lastUser >= 0 ? state.messages[lastUser] : undefined
+    marker.at = (userMessage?.at || Date.now()) + 1
+    let index = lastUser + 1
+    while (index < state.messages.length && state.messages[index]?.kind === 'marker') {
+      index += 1
+    }
+    state.messages.splice(index, 0, marker)
+  }
+
+  // 任务流执行卡片：同一条流在一次回复中只保留一张卡片。
+  function findTaskFlowMsg(state: ThreadChat): ChatMsg | undefined {
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const msg = state.messages[i]
+      if (msg?.kind === 'taskflow') return msg
+    }
+    return undefined
+  }
+
   function migrateThread(from: string, to: string) {
     if (!from || !to || from === to) return
     const state = threads.value[from]
@@ -338,6 +438,7 @@ export const useChatStore = defineStore('chat', () => {
     // 同一段流式内容在相邻 chunk 中增量拼接；切换来源或父节点时新建一条。
     function appendDelta(kind: 'assistant' | 'reasoning' | 'subagent') {
       state.thinking = false
+      if (kind === 'assistant' && state.retryPending) state.retryReceived = true
       const source = String(evt.source || 'main')
       const parent = evt.parent_tool_call_id
         ? String(evt.parent_tool_call_id)
@@ -347,6 +448,23 @@ export const useChatStore = defineStore('chat', () => {
       if (state.compaction?.active && !state.compaction.exiting && kind === 'assistant') {
         state.compactionBuffer += text
         return
+      }
+      // 子 Agent 的文本流会被推理 / 工具事件打断；按（来源 + 父委派）
+      // 合并成一条完整输出，避免出现「松江区」「6,608 人」这种碎片节点。
+      if (kind === 'subagent') {
+        const merged = [...state.messages]
+          .reverse()
+          .find(
+            (message) =>
+              message.kind === 'subagent' &&
+              message.source === source &&
+              message.parentToolCallId === parent &&
+              message.streaming,
+          )
+        if (merged) {
+          merged.content = (merged.content || '') + text
+          return
+        }
       }
       const last = state.messages[state.messages.length - 1]
       if (
@@ -371,6 +489,30 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     switch (evt.type) {
+      case 'retry_start': {
+        // 后端已从旧回答之前的分叉点重新生成；本地若已主动移除则无需重复。
+        const replaced = String(evt.replaced_message_id || '')
+        state.thinking = true
+        state.sending = true
+        if (replaced && !state.retryPending) {
+          const index = state.messages.findIndex(
+            (message) => message.kind === 'assistant' && message.id === replaced,
+          )
+          if (index >= 0) {
+            const previous = state.messages[index]!
+            state.retryBackup = {
+              messageId: previous.id,
+              content: previous.content || '',
+              index,
+              tokens: previous.tokens,
+            }
+            state.messages.splice(index, 1)
+          }
+        }
+        state.retryPending = true
+        state.retryReceived = false
+        break
+      }
       case 'token':
         appendDelta('assistant')
         break
@@ -417,6 +559,69 @@ export const useChatStore = defineStore('chat', () => {
       case 'tool_end': {
         const tool = findTool(state, String(evt.tool_call_id))
         if (tool && tool.status === 'calling') tool.status = 'done'
+        break
+      }
+      case 'subagent_progress': {
+        // 子 Agent 进度：每个 run_id 一条独立进度节点，并发实例不会互相覆盖。
+        const runId = String(evt.run_id || '')
+        if (!runId) break
+        const childId = `subagent-progress-${runId}`
+        const subagent = String(evt.subagent || 'subagent')
+        let child = state.messages.find((m) => m.id === childId)
+        if (!child) {
+          const boundParents = new Set<string>(
+            state.messages
+              .filter((m) => m.id.startsWith('subagent-progress-'))
+              .map((m) => m.parentToolCallId)
+              .filter((value): value is string => Boolean(value)),
+          )
+          // 按启动顺序把实例绑定到同类型、仍在执行且尚未绑定进度的委派节点。
+          const parent =
+            state.messages.find(
+              (m) =>
+                m.kind === 'tool' &&
+                m.category === 'delegation' &&
+                m.subagentName === subagent &&
+                m.toolCallId &&
+                m.status === 'calling' &&
+                !boundParents.has(m.toolCallId),
+            ) ||
+            state.messages.find(
+              (m) =>
+                m.kind === 'tool' &&
+                m.category === 'delegation' &&
+                m.toolCallId &&
+                m.status === 'calling' &&
+                !boundParents.has(m.toolCallId),
+            )
+          child = {
+            id: childId,
+            kind: 'tool',
+            toolName: '进度',
+            category: 'tool',
+            source: subagent,
+            parentToolCallId: parent?.toolCallId,
+            args: '',
+            result: '',
+            status: 'done',
+            at: Date.now(),
+          }
+          state.messages.push(child)
+        }
+        const phase = String(evt.event || '')
+        const detail = String(evt.message || '')
+        const label =
+          phase === 'started'
+            ? '开始处理'
+            : phase === 'tool_start'
+              ? `调用 ${String(evt.tool || '工具')}`
+              : phase === 'tool_end'
+                ? `${String(evt.tool || '工具')} ${evt.status === 'error' ? '失败' : '完成'}`
+                : '完成'
+        child.toolName = `进度 · ${subagent}`
+        child.result = detail ? `${label}：${detail}` : label
+        child.status = evt.status === 'error' ? 'error' : 'done'
+        child.at = Date.now()
         break
       }
       case 'interrupt': {
@@ -529,12 +734,168 @@ export const useChatStore = defineStore('chat', () => {
         }
         break
       }
+      case 'context_marker': {
+        // 经验命中插入为一条仅前端渲染的流程节点，按到达时间参与轨迹排序；
+        // 不写消息历史、不产生轨迹存储记录。
+        if (String(evt.marker_type || '') === 'experience') {
+          const rawItems = Array.isArray(evt.items) ? evt.items : []
+          const items = rawItems
+            .map((item) => {
+              const record = item as { id?: string; name?: string; rule?: string }
+              return {
+                id: String(record.id || ''),
+                name: String(record.name || record.id || '经验'),
+                rule: record.rule ? String(record.rule) : undefined,
+              }
+            })
+            .filter((item) => item.id || item.name)
+          if (items.length) {
+            insertTurnMarker(state, {
+              id: uid('mk'),
+              kind: 'marker',
+              markerType: 'experience',
+              markerItems: items,
+              content: items.map((item) => `【根据${item.name}经验】`).join(''),
+              at: Date.now(),
+            })
+          }
+        }
+        break
+      }
+      case 'task_flow_start': {
+        state.thinking = false
+        const flowName = String(evt.flow_name || '任务流')
+        insertTurnMarker(state, {
+          id: uid('mk'),
+          kind: 'marker',
+          markerType: 'taskflow',
+          content: `【使用${flowName}任务流执行该任务】`,
+          at: Date.now(),
+        })
+        const rawSteps = Array.isArray(evt.steps) ? evt.steps : []
+        state.messages.push({
+          id: uid('tf'),
+          kind: 'taskflow',
+          flowId: String(evt.flow_id || ''),
+          flowName: String(evt.flow_name || '任务流'),
+          flowStatus: 'running',
+          flowSteps: rawSteps.map((item) => {
+            const step = item as { id?: string; name?: string; branch?: string | null }
+            return {
+              id: String(step.id || ''),
+              name: String(step.name || step.id || '步骤'),
+              branch: step.branch ?? null,
+              status: 'pending' as const,
+              output: '',
+            }
+          }),
+          flowTraces: [],
+          flowCurrentStep: '',
+          at: Date.now(),
+        })
+        break
+      }
+      case 'task_flow_progress': {
+        state.thinking = false
+        const card = findTaskFlowMsg(state)
+        if (!card) break
+        const status = String(evt.status || '')
+        const stepId = String(evt.step_id || '')
+        const attempt = Number(evt.attempts || 1)
+        const step = card.flowSteps?.find((item) => item.id === stepId)
+        const delta = String(evt.delta || '')
+        if (step) {
+          if (status === 'step_started') {
+            // 重试会从头重放增量，先清空上一轮已渲染的产出。
+            step.status = 'running'
+            step.output = ''
+            card.flowCurrentStep = step.name
+          } else if (status === 'step_retry') {
+            step.status = 'running'
+            step.output = ''
+          } else if (status === 'step_token') {
+            step.status = 'running'
+            step.output = `${step.output || ''}${delta}`
+          } else if (status === 'step_done') {
+            step.status = 'done'
+          } else if (status === 'step_degraded') {
+            step.status = 'degraded'
+          } else if (status === 'step_failed') {
+            step.status = 'failed'
+          }
+          if (status === 'step_started' && attempt > 1) card.flowCurrentStep = step.name
+        }
+        card.flowStatus = 'running'
+        break
+      }
+      case 'task_flow_end': {
+        const card = findTaskFlowMsg(state)
+        if (!card) break
+        const status = String(evt.status || 'done')
+        card.flowStatus =
+          status === 'failed' || status === 'aborted' ? status : 'done'
+        card.flowTraces = Array.isArray(evt.step_traces)
+          ? (evt.step_traces as StepTrace[])
+          : []
+        if (card.flowStatus !== 'done') {
+          for (const step of card.flowSteps || []) {
+            if (step.status === 'running') step.status = 'failed'
+          }
+        }
+        card.flowCurrentStep = ''
+        break
+      }
       case 'done': {
         if (typeof evt.round_limit === 'number' && evt.round_limit > 0) {
           roundLimit.value = evt.round_limit
         }
+        // 后端最终回答是权威文本（可能含自检提示）。流式期间若只有子 Agent 输出、
+        // 主回答没有落到气泡里，这里用 done.content 补齐，避免"看不到正式结果"。
+        const doneContent = typeof evt.content === 'string' ? evt.content : ''
+        if (doneContent) {
+          const lastAssistant = [...state.messages]
+            .reverse()
+            .find((message) => message.kind === 'assistant')
+          if (lastAssistant) {
+            lastAssistant.content = doneContent
+            lastAssistant.streaming = false
+          } else {
+            state.messages.push({
+              id: uid('a'),
+              kind: 'assistant',
+              content: doneContent,
+              source: 'main',
+              at: Date.now(),
+            })
+          }
+        }
         const realId = evt.thread_id ? String(evt.thread_id) : ''
         if (realId) migrateThread(key, realId)
+
+        // 流式期间使用的气泡 ID 是临时的；done 把它归一到 checkpoint 中的
+        // 稳定消息 ID，反馈刷新后才能重新关联到同一条回答。
+        const stableId =
+          (typeof evt.final_message_id === 'string' && evt.final_message_id) ||
+          (typeof (evt.usage as { message_id?: unknown } | undefined)?.message_id === 'string'
+            ? String((evt.usage as { message_id?: string }).message_id)
+            : '')
+        if (stableId) {
+          const lastAssistant = [...state.messages]
+            .reverse()
+            .find((message) => message.kind === 'assistant' && message.content)
+          if (lastAssistant && lastAssistant.id !== stableId) {
+            lastAssistant.id = stableId
+          }
+        }
+        // 一轮结束后停止所有过程节点的流式脉冲；子 Agent 输出已合并成整段。
+        for (const message of state.messages) {
+          if (message.streaming && message.kind !== 'assistant') {
+            message.streaming = false
+          }
+        }
+        state.retryBackup = null
+        state.retryPending = false
+        state.retryReceived = false
 
         const usage = evt.usage as Partial<MessageTokens> | undefined
         if (usage && typeof usage.total === 'number' && usage.total > 0) {
@@ -561,6 +922,7 @@ export const useChatStore = defineStore('chat', () => {
             input: session.input || 0,
             output: session.output || 0,
             total: session.total,
+            spent: session.spent,
             rounds: session.rounds || 0,
             contextWindow: session.context_window || 0,
             contextUsed: session.context_used ?? session.input ?? 0,
@@ -590,6 +952,8 @@ export const useChatStore = defineStore('chat', () => {
         state.thinking = false
         state.controller = null
         state.activeTurnKey = null
+        const flowCard = findTaskFlowMsg(state)
+        if (flowCard && flowCard.flowStatus === 'running') flowCard.flowStatus = 'done'
         if (!evt.interrupted) state.pendingInterrupt = null
         lastTurnThreadId.value = realId || key
         turnVersion.value++
@@ -597,6 +961,8 @@ export const useChatStore = defineStore('chat', () => {
       }
       case 'error': {
         lastError.value = String(evt.message || '未知错误')
+        // 重试在产生任何新正文前失败：恢复旧回答，避免界面变空。
+        restoreRetryBackup(state)
         state.messages.push({
           id: uid('s'),
           kind: 'system',
@@ -615,6 +981,8 @@ export const useChatStore = defineStore('chat', () => {
         state.thinking = false
         state.controller = null
         state.activeTurnKey = null
+        const flowCard = findTaskFlowMsg(state)
+        if (flowCard && flowCard.flowStatus === 'running') flowCard.flowStatus = 'failed'
         break
       }
     }
@@ -720,13 +1088,100 @@ export const useChatStore = defineStore('chat', () => {
       {
         message,
         thread_id: key,
-        user_id: 'console_user',
-        username: '控制台用户',
+        user_id: USER_ID,
+        username: currentUser().name,
+        agent_id: selectedAgentId.value,
         attachments: attachments.map((item) => item.id),
       },
       state,
       key,
     )
+  }
+
+  /** 赞同 / 不赞同：乐观更新，失败回滚。 */
+  async function sendFeedback(
+    message: ChatMsg,
+    action: 'like' | 'dislike',
+    options: { userId: string; userExcerpt?: string; tools?: string[] },
+  ) {
+    const key = threadId.value
+    if (!key || message.kind !== 'assistant') return
+    const previous = message.feedback
+    const next = previous === action ? undefined : action
+    message.feedback = next
+    try {
+      await submitFeedback({
+        user_id: options.userId,
+        thread_id: key,
+        message_id: message.id,
+        action: next ?? 'none',
+        user_excerpt: options.userExcerpt || '',
+        answer_excerpt: (message.content || '').slice(0, 800),
+        meta: {
+          tools: options.tools || [],
+          answer_chars: (message.content || '').length,
+        },
+      })
+    } catch (error) {
+      message.feedback = previous
+      throw error
+    }
+  }
+
+  /** 覆盖式重试最后一条最终回答；本地先移除旧气泡，失败时回滚。 */
+  function retryLast(message: ChatMsg): boolean {
+    const key = threadId.value
+    const state = key ? threads.value[key] : undefined
+    if (!key || !state || state.sending || demoMode.value) return false
+    if (message.kind !== 'assistant') return false
+    const index = state.messages.findIndex(
+      (item) => item.kind === 'assistant' && item.id === message.id,
+    )
+    if (index < 0) return false
+    state.retryBackup = {
+      messageId: message.id,
+      content: message.content || '',
+      index,
+      tokens: message.tokens,
+    }
+    state.messages.splice(index, 1)
+    state.retryPending = true
+    state.retryReceived = false
+    state.sending = true
+    state.thinking = true
+    const lastUser = [...state.messages].reverse().find((item) => item.kind === 'user')
+    if (lastUser) {
+      state.retryCount[lastUser.id] = (state.retryCount[lastUser.id] || 0) + 1
+    }
+    void streamPost(
+      `/chat/${key}/retry`,
+      {
+        user_id: USER_ID,
+        username: currentUser().name,
+        message_id: message.id,
+      },
+      state,
+      key,
+    )
+    return true
+  }
+
+  /** 连续重试次数，供界面提示用户补充具体要求。 */
+  function retryCountFor(turnKey: string): number {
+    return current.value?.retryCount[turnKey] || 0
+  }
+
+  /** 追加一条本地系统提示（不进入后端历史）。 */
+  function addNote(text: string) {
+    const key = threadId.value
+    const state = key ? threads.value[key] : undefined
+    if (!state) return
+    state.messages.push({
+      id: uid('s'),
+      kind: 'system',
+      content: text,
+      at: Date.now(),
+    })
   }
 
   // HITL 恢复：补充信息 / 审批决策
@@ -754,7 +1209,7 @@ export const useChatStore = defineStore('chat', () => {
     }
     void streamPost(
       `/chat/${key}/resume`,
-      { resume: payload, user_id: 'console_user', username: '控制台用户' },
+      { resume: payload, user_id: USER_ID, username: currentUser().name },
       state,
       key,
     )
@@ -771,6 +1226,7 @@ export const useChatStore = defineStore('chat', () => {
     removeCompactionNotes(state)
     state.compaction = null
     state.compactionBuffer = ''
+    restoreRetryBackup(state)
     state.sending = false
     state.thinking = false
     state.activeTurnKey = null
@@ -798,6 +1254,10 @@ export const useChatStore = defineStore('chat', () => {
       clearCompactionWatchdog(state)
       state.compaction = null
       state.compactionBuffer = ''
+      state.retryBackup = null
+      state.retryPending = false
+      state.retryReceived = false
+      state.retryCount = {}
     }
     threadId.value = tid
     lastError.value = ''
@@ -826,8 +1286,8 @@ export const useChatStore = defineStore('chat', () => {
       {
         type: 'done',
         thread_id: key,
-        user_id: 'console_user',
-        username: '控制台用户',
+        user_id: USER_ID,
+        username: currentUser().name,
         content: '',
         interrupted,
         usage,
@@ -864,7 +1324,7 @@ export const useChatStore = defineStore('chat', () => {
     await typeOut(state, `收到「${userText.slice(0, 18)}」。我先读取你的偏好文件，再检索资料。`)
     handleEvent({ type: 'tool_start', tool_call_id: 'call-1', tool_name: 'read_file', source: 'main' }, state, key)
     await sleep(300)
-    handleEvent({ type: 'tool_args', tool_call_id: 'call-1', args: '{"path": "/memories/console_user/preferences.md"}', source: 'main' }, state, key)
+    handleEvent({ type: 'tool_args', tool_call_id: 'call-1', args: `{"path": "/memories/${USER_ID}/preferences.md"}`, source: 'main' }, state, key)
     await sleep(600)
     handleEvent({ type: 'tool_result', tool_call_id: 'call-1', tool_name: 'read_file', status: 'done', text: 'preferred:\n  language: zh-CN\n  output_style: concise\nrecent_queries:\n  - 控制台演示', source: 'main' }, state, key)
     handleEvent({ type: 'tool_end', tool_call_id: 'call-1', status: 'done', source: 'main' }, state, key)
@@ -963,6 +1423,7 @@ export const useChatStore = defineStore('chat', () => {
     compacting,
     compactionCount,
     isEmpty,
+    selectedAgentId,
     turnVersion,
     lastTurnThreadId,
     runningThreadIds,
@@ -976,5 +1437,14 @@ export const useChatStore = defineStore('chat', () => {
     newChat,
     loadHistory,
     setTurnDurations,
+    sendFeedback,
+    retryLast,
+    retryCountFor,
+    addNote,
   }
 })
+
+// setup store 新增 action 时，让 Vite HMR 替换定义，避免旧实例缺少新方法。
+if (import.meta.hot) {
+  import.meta.hot.accept(acceptHMRUpdate(useChatStore, import.meta.hot))
+}

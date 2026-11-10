@@ -136,9 +136,8 @@ api_key = "sk-harness-local-7c1a9e4b2d8f6a35"  <---  默认是注释掉的。这
 ```
 
 5. 启动opensandbox服务  
-回到 /opt/opensandbox/ 目录下执行
+回到 /opt/opensandbox/ 目录下执行启动
 ```bash
-# 4启动
 opensandbox-server --config /opt/opensandbox/sandbox.toml
 ```
 
@@ -198,8 +197,8 @@ date
 本系统的Agent自我优化与迭代能力大部分也基于轨迹的充分发掘来实现。   
 **详见  [文档-Agent自我迭代优化机制]()**
 
-### 五、我的任务图
-暂未开发，尽情期待
+### 五、我的任务流
+定义任务执行流程，Agent 命中后按统一方法执行；支持内置流只读复制、可视化编辑、发布与执行回放。
 
 ### 六、模型配置
 该模块提供一些模型配置卡片信息，便于你快速LLM模型API KYE 与 厂商服务URL等参数。
@@ -211,54 +210,7 @@ date
 ---
 
 
-
-首先你需要配置.env,参考.env.example，删除.example后缀，然后填写配置文件
-如下的是建议必填的
-```text
-DEEPSEEK_API_KEY= 
-DEEPSEEK_BASE_URL= 
-DEEPSEEK_MODEL_NAME=
-
-# LangGraph PostgreSQL 持久化
-DB_HOST=  # linux 虚拟机IP
-DB_PORT=5432
-DB_NAME= 
-DB_USER= 
-DB_PASSWORD=123456
-DB_SSLMODE=disable
-```
-
-**.env详细参数解释，见[第三章节]()**
-
-你需要启动如下服务
-
-1. Harness Agent FastAPI后端服务  
-  在当前根目录下执行
-```bash
-python main.py 
-```
-会启动FastAPI服务，端口号8000
-
-2. 启动VUE前端项目
-  在当前项目目录/frontend/HarnessControlPlatform下执行
-```bash
-npm run dev
-```
-如缺少相关依赖，使用npm install等命令安装依赖
-
-3. 在Docker，下，拉去PostgreSQL镜像并启动容器，下面给的在Linux操作系统下执行的。本项目也是在Linux操作系统提供PostgreSQL服务。
-```bash
-// 1. 先拉取镜像
-docker pull postgres:16
-
-// 2. 启动容器，注意环境变量名字要和.env相同，默认端口号5432，可自定义
-docker run -d --name harness-postgres 
- -e POSTGRES_USER=fluctuate_user
- -e POSTGRES_PASSWORD=123456 
- -e POSTGRES_DB=fluctuate_db 
- -p 5432:5432 
- -v harness_pgdata:/var/lib/postgresql/data 
- postgres:16
-docker run -d --name harness-postgres -e POSTGRES_USER=fluctuate_user -e POSTGRES_PASSWORD=123456 -e POSTGRES_DB=fluctuate_db -p 5432:5432 -v harness_pgdata:/var/lib/postgresql/data postgres:16
-```
----
+## 关于演示用户
+系统提供了4个用户id，你可以在
+[用户id预设代码配置](./frontend/HarnessControlPlatform/api/identity.ts#L10-L17)
+新增你的用户id，主要是为了验证多用户隔离的功能。

@@ -1,11 +1,57 @@
 <script setup lang="ts">
 // Markdown 渲染：marked 解析 + DOMPurify 消毒
 // 代码块额外带语言标签与一键复制按钮（头部，位于代码上方）
-import { computed } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { marked, Renderer, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
+import { API_BASE } from '@/api/client'
+import { currentUserId } from '@/api/identity'
+import { saveBlob } from '@/stores/files'
+import MediaViewer from './MediaViewer.vue'
+import type { MediaKind } from './mediaTypes'
+import { normalizeChartOption } from './chartOption'
 
-const props = defineProps<{ content: string }>()
+const props = defineProps<{
+  content: string
+  /** 会话 ID：用于把 Markdown 里的本地图片解析为会话文件下载地址 */
+  threadId?: string | null
+  /** 流式输出中先不渲染图表，避免半截 Mermaid / JSON 反复报错 */
+  streaming?: boolean
+}>()
+
+const container = ref<HTMLElement | null>(null)
+let chartInstances: { resize: () => void; dispose: () => void }[] = []
+
+const VIZ_LANGUAGES = new Set(['mermaid', 'echarts', 'echart', 'chart'])
+
+// 全屏查看器状态：Mermaid SVG、ECharts option、本地/远程图片共用。
+const viewer = reactive({
+  open: false,
+  kind: 'image' as MediaKind,
+  src: '',
+  svg: '',
+  option: null as Record<string, unknown> | null,
+  title: '',
+  filename: '',
+})
+
+const chartOptions = new WeakMap<HTMLElement, Record<string, unknown>>()
+const svgByBlock = new WeakMap<HTMLElement, string>()
+
+const EXPAND_ICON =
+  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>'
+
+const DOWNLOAD_ICON =
+  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>'
+
+const ZOOM_ICON =
+  '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+  '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M8 11h6"/><path d="M11 8v6"/></svg>'
 
 // Electron/桌面壳可注入 openExternal；没有时退回浏览器新窗口。
 interface ExternalBridge {
@@ -60,7 +106,80 @@ function safeExternalHref(href: string): string {
   return /^(https?:\/\/|mailto:)/i.test(value) ? value : ''
 }
 
+/** 把 Agent 写的本地图片路径转换成会话文件下载地址。 */
+function buildSessionFileUrl(path: string, origin: 'project' | 'sandbox'): string {
+  const threadId = encodeURIComponent(props.threadId || '')
+  const query = new URLSearchParams({
+    user_id: currentUserId(),
+    path,
+    source: origin,
+    inline: 'true',
+  })
+  return `${API_BASE}/threads/${threadId}/files/download?${query.toString()}`
+}
+
+interface LocalImage {
+  path: string
+  origin: 'project' | 'sandbox'
+}
+
+function resolveLocalImage(raw: string): LocalImage | null {
+  if (!props.threadId) return null
+  let value = (raw || '').trim()
+  if (!value) return null
+  if (/^(https?:|data:|blob:)/i.test(value)) return null
+  // 明确协议：![图](sandbox:/chart.png) / ![图](project:/report/chart.png)
+  const protocol = /^(sandbox|project):(.*)$/i.exec(value)
+  if (protocol) {
+    const origin = protocol[1]!.toLowerCase() as 'project' | 'sandbox'
+    const rest = (protocol[2] || '/').trim() || '/'
+    return { path: rest.startsWith('/') ? rest : `/${rest}`, origin }
+  }
+  if (value.startsWith('file://')) {
+    try {
+      value = decodeURIComponent(value.replace(/^file:\/\//, ''))
+    } catch {
+      return null
+    }
+  }
+  const threadId = props.threadId
+  // 沙箱绝对路径：/workspace/sessions/{thread_id}/xxx 或 /workspace/{project}/xxx
+  const sessionPrefix = `/workspace/sessions/${threadId}/`
+  if (value.startsWith(sessionPrefix)) {
+    return { path: `/${value.slice(sessionPrefix.length)}`, origin: 'sandbox' }
+  }
+  if (value.startsWith('/workspace/')) {
+    const rest = value.replace(/^\/workspace\/[^/]+\//, '')
+    return { path: `/${rest}`, origin: 'sandbox' }
+  }
+  // Windows 绝对路径无法通过会话文件接口读取
+  if (/^[A-Za-z]:[\\/]/.test(value)) return null
+  const path = value.startsWith('/') ? value : `/${value}`
+  return { path, origin: 'project' }
+}
+
 const renderer = new Renderer()
+
+// 本地图片：解析成会话文件地址；失败时由后续事件监听自动尝试另一来源。
+renderer.image = (token: Tokens.Image) => {
+  const raw = (token.href || '').trim()
+  const alt = escapeHtml(token.text || '')
+  const local = resolveLocalImage(raw)
+  const image = local
+    ? `<img class="md-local-image" src="${escapeHtml(buildSessionFileUrl(local.path, local.origin))}"` +
+      ` data-local-path="${escapeHtml(local.path)}"` +
+      ` data-local-origin="${local.origin}" alt="${alt}" loading="lazy" />`
+    : `<img src="${escapeHtml(raw)}" alt="${alt}" loading="lazy" />`
+  return (
+    `<span class="md-image-block">` +
+    image +
+    `<span class="md-image-actions">` +
+    `<button type="button" class="md-image-action" data-image-action="download" title="保存到本地">${DOWNLOAD_ICON}</button>` +
+    `<button type="button" class="md-image-action" data-image-action="fullscreen" title="全屏查看">${EXPAND_ICON}</button>` +
+    `</span>` +
+    `</span>`
+  )
+}
 
 // 链接统一带 target=_blank；点击事件里再交给桌面壳或浏览器新开窗口。
 renderer.link = function (this: Renderer, token: Tokens.Link) {
@@ -75,11 +194,30 @@ renderer.link = function (this: Renderer, token: Tokens.Link) {
   )
 }
 
-// 代码块自定义渲染：语言标签 + 复制按钮放在代码上方
+// 代码块自定义渲染：语言标签 + 复制按钮放在代码上方。
+// mermaid / echarts 代码块先保留源码，待本次回答结束后由 renderVisuals 渲染成图表。
 renderer.code = ({ text, lang, escaped }) => {
   const language = (lang || '').trim().split(/\s+/)[0] || 'text'
   const body = escaped ? text : escapeHtml(text)
   const languageAttr = escapeHtml(language)
+  if (VIZ_LANGUAGES.has(language.toLowerCase())) {
+    const vizType = language.toLowerCase() === 'mermaid' ? 'mermaid' : 'echarts'
+    return (
+      `<div class="viz-block" data-viz="${vizType}">` +
+      `<div class="code-head">` +
+      `<span class="code-lang">${languageAttr.toUpperCase()}</span>` +
+      `<span class="code-actions">` +
+      `<button type="button" class="viz-action" data-viz-action="zoom" title="缩放查看">${ZOOM_ICON}<span>缩放</span></button>` +
+      `<button type="button" class="viz-action" data-viz-action="fullscreen" title="全屏查看">${EXPAND_ICON}<span>全屏</span></button>` +
+      `<button type="button" class="viz-copy" aria-label="复制源码">${COPY_ICON}<span>复制</span></button>` +
+      `</span>` +
+      `</div>` +
+      `<pre class="viz-source"><code class="language-${languageAttr}">${body}</code></pre>` +
+      `<div class="viz-output"></div>` +
+      `<div class="viz-error"></div>` +
+      `</div>`
+    )
+  }
   return (
     `<div class="code-block">` +
     `<div class="code-head">` +
@@ -101,6 +239,160 @@ const html = computed(() => {
   return DOMPurify.sanitize(raw)
 })
 
+// ---------- Mermaid / ECharts 渲染 ----------
+let mermaidPromise: Promise<any> | null = null
+let vizRun = 0
+
+async function getMermaid(): Promise<any> {
+  if (!mermaidPromise) {
+    mermaidPromise = import('mermaid').then((mod) => {
+      const mermaid = mod.default
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: 'dark',
+        securityLevel: 'strict',
+        // 关键：语法错误时不要把「炸弹」错误图追加到 body 底部。
+        suppressErrorRendering: true,
+        fontFamily: 'Inter, "Microsoft YaHei", sans-serif',
+      })
+      return mermaid
+    })
+  }
+  return mermaidPromise
+}
+
+function disposeCharts() {
+  for (const chart of chartInstances) {
+    try {
+      chart.dispose()
+    } catch {
+      /* ignore */
+    }
+  }
+  chartInstances = []
+}
+
+/** 清理旧版本 Mermaid 渲染失败时追加到 body 的错误图（炸弹）。 */
+function cleanupMermaidErrorArtifacts() {
+  document
+    .querySelectorAll<SVGElement>('body > svg, body > div > svg')
+    .forEach((svg) => {
+      const text = svg.textContent || ''
+      if (text.includes('Syntax error in text') || text.includes('mermaid version')) {
+        svg.remove()
+      }
+    })
+}
+
+function attachImageFallbacks() {
+  const host = container.value
+  if (!host) return
+  host.querySelectorAll<HTMLImageElement>('img[data-local-path]').forEach((img) => {
+    if (img.dataset.fallbackBound) return
+    img.dataset.fallbackBound = '1'
+    img.addEventListener(
+      'error',
+      () => {
+        const path = img.dataset.localPath
+        if (!path) return
+        // 项目 / 沙箱路径无法从链接本身判断时，失败后自动换另一来源再试一次。
+        const next = img.dataset.localOrigin === 'project' ? 'sandbox' : 'project'
+        img.dataset.localOrigin = next
+        img.src = buildSessionFileUrl(path, next)
+      },
+      { once: true },
+    )
+  })
+}
+
+async function renderVisuals() {
+  const host = container.value
+  if (!host) return
+  cleanupMermaidErrorArtifacts()
+  const run = ++vizRun
+  disposeCharts()
+  host.querySelectorAll<HTMLElement>('.viz-block').forEach((block) => {
+    block.classList.remove('rendered')
+    const output = block.querySelector<HTMLElement>('.viz-output')
+    const error = block.querySelector<HTMLElement>('.viz-error')
+    if (output) output.innerHTML = ''
+    if (error) error.textContent = ''
+  })
+  attachImageFallbacks()
+  // 流式阶段保留源码，避免半截 Mermaid / JSON 反复报错和闪烁。
+  if (props.streaming) return
+
+  const blocks = Array.from(host.querySelectorAll<HTMLElement>('.viz-block'))
+  for (const block of blocks) {
+    if (run !== vizRun) return
+    const source = block.querySelector<HTMLElement>('.viz-source code')?.textContent || ''
+    const output = block.querySelector<HTMLElement>('.viz-output')
+    const error = block.querySelector<HTMLElement>('.viz-error')
+    if (!output || !source.trim()) continue
+    try {
+      if (block.dataset.viz === 'mermaid') {
+        const mermaid = await getMermaid()
+        // 先静默校验语法，避免 render 失败时向页面注入错误图。
+        const valid = await mermaid.parse(source, { suppressErrors: true })
+        if (!valid) throw new Error('Mermaid 语法错误')
+        const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const result = await mermaid.render(id, source)
+        if (run !== vizRun) return
+        output.innerHTML = result.svg
+        svgByBlock.set(block, result.svg)
+        block.classList.add('rendered')
+      } else {
+        const parsed = JSON.parse(source) as Record<string, unknown>
+        const option = normalizeChartOption(
+          parsed && typeof parsed === 'object' && 'option' in parsed
+            ? parsed.option
+            : parsed,
+        )
+        // ECharts 初始化时必须已有宽高，先让输出容器显示出来。
+        block.classList.add('rendered')
+        const echarts = await import('echarts')
+        if (run !== vizRun) return
+        const chart = echarts.init(output, undefined, { renderer: 'canvas' })
+        chart.setOption(option, true)
+        chartInstances.push(chart)
+        chartOptions.set(block, option)
+      }
+    } catch (err) {
+      block.classList.remove('rendered')
+      svgByBlock.delete(block)
+      chartOptions.delete(block)
+      if (error) {
+        error.textContent =
+          block.dataset.viz === 'mermaid'
+            ? `Mermaid 渲染失败：${(err as Error).message}`
+            : `ECharts 配置解析失败：${(err as Error).message}`
+      }
+    }
+  }
+}
+
+function resizeCharts() {
+  for (const chart of chartInstances) chart.resize()
+}
+
+watch(
+  () => [html.value, props.streaming] as const,
+  () => {
+    void nextTick(() => void renderVisuals())
+  },
+)
+
+onMounted(() => {
+  window.addEventListener('resize', resizeCharts)
+  void nextTick(() => void renderVisuals())
+})
+
+onBeforeUnmount(() => {
+  vizRun += 1
+  window.removeEventListener('resize', resizeCharts)
+  disposeCharts()
+})
+
 async function copyText(text: string) {
   try {
     await navigator.clipboard.writeText(text)
@@ -115,8 +407,92 @@ async function copyText(text: string) {
   }
 }
 
+function openVizViewer(block: HTMLElement) {
+  if (block.dataset.viz === 'mermaid') {
+    const svg = svgByBlock.get(block)
+    if (!svg) return
+    viewer.kind = 'svg'
+    viewer.svg = svg
+    viewer.option = null
+    viewer.title = 'Mermaid 图表'
+    viewer.filename = 'diagram'
+  } else {
+    const option = chartOptions.get(block)
+    if (!option) return
+    viewer.kind = 'chart'
+    viewer.option = option
+    viewer.svg = ''
+    viewer.title = 'ECharts 图表'
+    viewer.filename = 'chart'
+  }
+  viewer.open = true
+}
+
+function imageFilename(img: HTMLImageElement): string {
+  const localPath = img.dataset.localPath || ''
+  const name = localPath.split('/').filter(Boolean).pop()
+  if (name) return name
+  const alt = (img.alt || '').trim()
+  return alt ? `${alt}.png` : 'image.png'
+}
+
+function openImageViewer(block: HTMLElement) {
+  const img = block.querySelector('img')
+  if (!img?.src) return
+  viewer.kind = 'image'
+  viewer.src = img.src
+  viewer.svg = ''
+  viewer.option = null
+  viewer.title = img.alt || '图片预览'
+  viewer.filename = imageFilename(img)
+  viewer.open = true
+}
+
+async function downloadImage(block: HTMLElement) {
+  const img = block.querySelector('img')
+  if (!img?.src) return
+  try {
+    const res = await fetch(img.src)
+    if (!res.ok) throw new Error(String(res.status))
+    saveBlob(imageFilename(img), await res.blob())
+  } catch {
+    // 跨域外链无法读取字节时，打开原图交给用户保存。
+    window.open(img.src, '_blank', 'noopener,noreferrer')
+  }
+}
+
 async function onBodyClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null
+
+  // 图表 Header：查看大图 / 全屏
+  const vizAction = target?.closest('.viz-action') as HTMLElement | null
+  if (vizAction) {
+    const block = vizAction.closest('.viz-block') as HTMLElement | null
+    if (block) openVizViewer(block)
+    return
+  }
+
+  // 图片右下角：保存 / 全屏查看
+  const imageAction = target?.closest('.md-image-action') as HTMLElement | null
+  if (imageAction) {
+    const block = imageAction.closest('.md-image-block') as HTMLElement | null
+    if (!block) return
+    if (imageAction.dataset.imageAction === 'download') await downloadImage(block)
+    else openImageViewer(block)
+    return
+  }
+
+  // 图表源码复制
+  const vizButton = target?.closest('.viz-copy') as HTMLElement | null
+  if (vizButton) {
+    const block = vizButton.closest('.viz-block')
+    const code = block?.querySelector('.viz-source code')?.textContent || ''
+    if (!code) return
+    await copyText(code)
+    vizButton.classList.add('copied')
+    window.setTimeout(() => vizButton.classList.remove('copied'), 1500)
+    return
+  }
 
   // 优先处理代码复制，避免链接点击逻辑误触
   const button = target?.closest('.code-copy') as HTMLElement | null
@@ -147,7 +523,16 @@ async function onBodyClick(event: MouseEvent) {
 </script>
 
 <template>
-  <div class="markdown-body" v-html="html" @click="onBodyClick"></div>
+  <div ref="container" class="markdown-body" v-html="html" @click="onBodyClick"></div>
+  <MediaViewer
+    v-model="viewer.open"
+    :kind="viewer.kind"
+    :src="viewer.src"
+    :svg="viewer.svg"
+    :option="viewer.option"
+    :title="viewer.title"
+    :filename="viewer.filename"
+  />
 </template>
 
 <style scoped>
@@ -215,12 +600,148 @@ async function onBodyClick(event: MouseEvent) {
 }
 
 /* ---------- 代码块：语言标签 + 复制（顶部） ---------- */
-.markdown-body :deep(.code-block) {
+.markdown-body :deep(.code-block),
+.markdown-body :deep(.viz-block) {
   margin: 8px 0 12px;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: rgba(4, 10, 22, 0.85);
+}
+
+/* ---------- Mermaid / ECharts 可视化 ---------- */
+.markdown-body :deep(.viz-source) {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.markdown-body :deep(.viz-output) {
+  display: none;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.markdown-body :deep(.viz-block.rendered .viz-source) {
+  display: none;
+}
+
+.markdown-body :deep(.viz-block.rendered .viz-output) {
+  display: block;
+}
+
+/* ECharts 需要明确高度才能绘制 canvas */
+.markdown-body :deep(.viz-block[data-viz='echarts'].rendered .viz-output) {
+  height: 420px;
+}
+
+.markdown-body :deep(.viz-output svg) {
+  max-width: 100%;
+  height: auto;
+}
+
+.markdown-body :deep(.viz-error) {
+  padding: 0 12px 8px;
+  font-size: 10.5px;
+  color: #ff9e9e;
+}
+
+.markdown-body :deep(.viz-error:empty) {
+  display: none;
+}
+
+.markdown-body :deep(.code-actions) {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.markdown-body :deep(.viz-copy),
+.markdown-body :deep(.viz-action) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.markdown-body :deep(.viz-copy):hover,
+.markdown-body :deep(.viz-action):hover {
+  color: var(--accent-cyan);
+  border-color: rgba(53, 224, 255, 0.4);
+}
+
+.markdown-body :deep(.viz-copy.copied) {
+  color: var(--green);
+  border-color: rgba(61, 220, 132, 0.5);
+}
+
+/* ---------- 图片块：右下角保存 / 全屏 ---------- */
+.markdown-body :deep(.md-image-block) {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  line-height: 0;
+}
+
+.markdown-body :deep(.md-image-block img) {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+.markdown-body :deep(.md-image-actions) {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  gap: 5px;
+  padding: 3px;
+  border: 1px solid rgba(126, 154, 198, 0.25);
+  border-radius: 8px;
+  background: rgba(3, 9, 18, 0.72);
+  opacity: 0;
+  transform: translateY(3px);
+  transition: opacity 0.15s, transform 0.15s;
+}
+
+.markdown-body :deep(.md-image-block:hover .md-image-actions),
+.markdown-body :deep(.md-image-block:focus-within .md-image-actions) {
+  opacity: 1;
+  transform: none;
+}
+
+.markdown-body :deep(.md-image-action) {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--text-2);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+}
+
+.markdown-body :deep(.md-image-action:hover) {
+  color: var(--accent-cyan);
+  border-color: rgba(55, 208, 196, 0.45);
+  background: rgba(55, 208, 196, 0.1);
+}
+
+/* 触屏设备没有 hover，图片操作按钮常驻 */
+@media (hover: none) {
+  .markdown-body :deep(.md-image-actions) {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .markdown-body :deep(.code-head) {

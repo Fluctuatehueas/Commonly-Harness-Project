@@ -1,6 +1,16 @@
 <script setup lang="ts">
 // 文件抽屉：按本机/沙箱分组 + 目录树；本机文件定位到资源管理器，沙箱文件下载。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import {
+  ArrowLeft,
+  Close,
+  Download,
+  EditPen,
+  FolderOpened,
+  Refresh,
+  View,
+} from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import MarkdownView from './MarkdownView.vue'
 import FileTreeNode from './FileTreeNode.vue'
@@ -26,8 +36,6 @@ const isMarkdown = computed(() =>
   /\.(?:md|markdown|mdx)$/i.test(files.current?.path || ''),
 )
 const previewMode = ref(false)
-const notice = ref('')
-let noticeTimer: number | undefined
 
 watch(
   () => [props.threadId, props.refreshKey] as const,
@@ -50,9 +58,7 @@ function reload() {
 }
 
 function flash(message: string) {
-  notice.value = message
-  if (noticeTimer) window.clearTimeout(noticeTimer)
-  noticeTimer = window.setTimeout(() => (notice.value = ''), 2600)
+  ElMessage.info(message)
 }
 
 function isNew(file: FileMeta) {
@@ -140,28 +146,40 @@ onBeforeUnmount(stopResize)
       <strong>会话文件</strong>
       <span class="src">{{ files.source === 'project+sandbox' ? '本机 + 沙箱' : '沙箱' }}</span>
       <span v-if="newCount" class="new-tag head-new">本轮 +{{ newCount }} new</span>
-      <button class="icon-btn" type="button" title="刷新" @click="reload">
-        <AppIcon name="timer" :size="14" />
-      </button>
-      <button class="icon-btn" type="button" title="关闭" @click="emit('close')">
-        <AppIcon name="close" :size="14" />
-      </button>
+      <el-button
+        class="icon-btn"
+        :icon="Refresh"
+        text
+        circle
+        size="small"
+        title="刷新"
+        @click="reload"
+      />
+      <el-button
+        class="icon-btn"
+        :icon="Close"
+        text
+        circle
+        size="small"
+        title="关闭"
+        @click="emit('close')"
+      />
     </header>
 
     <div v-if="files.error" class="fp-error">{{ files.error }}</div>
-    <p v-if="notice" class="fp-notice mono">{{ notice }}</p>
 
-    <div v-if="!files.current" class="fp-list">
+    <div v-if="!files.current" v-loading="files.loading" class="fp-list">
       <p class="fp-hint">
         {{ files.projectId
           ? '项目会话同时展示本机项目目录与沙箱工作目录：本机文件可在资源管理器定位，沙箱文件可下载。'
           : '自由会话的 AI 产物保留在沙箱内，可在这里预览与下载。' }}
       </p>
 
-      <div v-if="files.loading" class="fp-empty">加载中…</div>
-      <div v-else-if="files.files.length === 0" class="fp-empty">
-        当前会话还没有文件。让 Agent 写一个文件试试，例如“把刚才的结论保存为 notes.md”。
-      </div>
+      <el-empty
+        v-if="!files.loading && files.files.length === 0"
+        :image-size="54"
+        description="当前会话还没有文件。让 Agent 写一个文件试试，例如“把刚才的结论保存为 notes.md”。"
+      />
 
       <section v-for="group in groups" :key="group.origin" class="file-group">
         <header class="group-head">
@@ -191,17 +209,26 @@ onBeforeUnmount(stopResize)
           <span class="f-origin" :class="files.current.origin">
             {{ files.current.origin === 'project' ? '本机' : '沙箱' }}
           </span>
-          <button class="mini" type="button" @click="files.closePreview()">
-            <AppIcon name="chevronRight" :size="12" style="transform: rotate(180deg)" /> 列表
-          </button>
-          <button v-if="isMarkdown" class="mini" type="button" @click="previewMode = !previewMode">
-            <AppIcon :name="previewMode ? 'edit' : 'eye'" :size="12" />
+          <el-button class="mini" :icon="ArrowLeft" size="small" @click="files.closePreview()">
+            列表
+          </el-button>
+          <el-button
+            v-if="isMarkdown"
+            class="mini"
+            :icon="previewMode ? EditPen : View"
+            size="small"
+            @click="previewMode = !previewMode"
+          >
             {{ previewMode ? '源码' : '预览' }}
-          </button>
-          <button class="mini" type="button" @click="previewAction">
-            <AppIcon :name="files.current.origin === 'project' ? 'external' : 'download'" :size="12" />
+          </el-button>
+          <el-button
+            class="mini"
+            :icon="files.current.origin === 'project' ? FolderOpened : Download"
+            size="small"
+            @click="previewAction"
+          >
             {{ files.current.origin === 'project' ? '在资源管理器打开' : '下载' }}
-          </button>
+          </el-button>
         </div>
       </div>
       <div v-if="previewMode && isMarkdown" class="fp-preview">
@@ -277,15 +304,12 @@ onBeforeUnmount(stopResize)
   margin-left: 0;
 }
 
-.icon-btn {
-  display: grid;
-  place-items: center;
+.icon-btn.el-button {
   width: 26px;
   height: 26px;
+  margin-left: 0;
+  padding: 0;
   color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: transparent;
 }
 
 .fp-error {
@@ -296,19 +320,6 @@ onBeforeUnmount(stopResize)
   border: 1px solid rgba(255, 182, 72, 0.3);
   border-radius: 8px;
   background: rgba(255, 182, 72, 0.05);
-}
-
-.fp-notice {
-  margin: 8px 12px 0;
-  padding: 6px 9px;
-  overflow: hidden;
-  font-size: 9.5px;
-  color: var(--accent-cyan);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  border: 1px solid rgba(53, 224, 255, 0.2);
-  border-radius: 7px;
-  background: rgba(53, 224, 255, 0.05);
 }
 
 .fp-list {
@@ -326,15 +337,6 @@ onBeforeUnmount(stopResize)
   font-size: 10.5px;
   line-height: 1.6;
   color: var(--text-3);
-}
-
-.fp-empty {
-  margin: auto;
-  padding: 24px 18px;
-  font-size: 12px;
-  line-height: 1.7;
-  color: var(--text-3);
-  text-align: center;
 }
 
 .file-group {
@@ -400,21 +402,15 @@ onBeforeUnmount(stopResize)
   align-items: center;
 }
 
-.mini {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+.mini.el-button {
+  margin-left: 0;
   padding: 5px 9px;
   font-size: 11px;
   color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: transparent;
 }
 
-.mini:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
+.mini.el-button + .mini.el-button {
+  margin-left: 0;
 }
 
 .f-path {

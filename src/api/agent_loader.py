@@ -34,6 +34,10 @@ from agent.history_reader import ThreadHistoryReader
 from agent.schema import AsyncTaskBinding, UserGroup
 from agent.trajectory_store import delete_trajectory, list_trajectory_events
 from agent.usage_store import delete_usage, read_usage
+from agent.feedback_store import (
+    delete_feedback_thread,
+    feedback_map_for_thread,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,18 @@ AgentFactory = Callable[..., Awaitable[Any]]
 SESSION_NAMESPACE_PREFIX = ("sessions",)
 ASYNC_TASK_NAMESPACE_PREFIX = ("async_tasks",)
 ASYNC_TASK_MESSAGE_PREFIX = "async-task-result:"
+
+
+def _pick_state_node(agent: Any) -> str | None:
+    """选一个真实节点作为 aupdate_state 的写入方（首次对话无法自动推断时使用）。"""
+    nodes = getattr(agent, "nodes", None) or {}
+    for preferred in ("model", "agent", "chat"):
+        if preferred in nodes:
+            return preferred
+    for name in nodes:
+        if name not in ("__start__", "__end__"):
+            return name
+    return None
 
 
 class AgentLoader:
@@ -74,12 +90,11 @@ class AgentLoader:
             if self._initialized:
                 return
             from agent.main_agent import create_main_agent
-            from agent.mcp.runtime import mcp_runtime
+            from agent.mcp.runtime import set_mcp_structure_handler
 
-            # 启动阶段只加载 MCP 配置与 LKG 工具缓存，不建立任何连接。
-            # 真正的连接由首次 Agent 构图 / 前端 probe 触发（懒连接）。
-            await mcp_runtime.initialize()
-            mcp_runtime.set_structure_handler(self._on_mcp_structure_change)
+            # MCP 配置按用户隔离：真实运行时就绪由首次请求触发。
+            # 这里只登记结构变更回调，工具集变化时清空该用户的 Agent 缓存。
+            set_mcp_structure_handler(self._on_mcp_structure_change)
 
             store, checkpointer = await create_async_persistence()
             manager = None
@@ -100,13 +115,6 @@ class AgentLoader:
             self._agent_factory = create_main_agent
             self._history_reader = reader
             self._initialized = True
-
-            # 文件监听：mcp_servers.yaml 变化后只重载配置，不主动连接。
-            # 工具名集合变化时清空图缓存，让下一次请求按新工具集重建。
-            self._mcp_watch_task = asyncio.create_task(
-                mcp_runtime.watch_config(),
-                name="mcp-config-watch",
-            )
 
     @property
     def store(self) -> Any | None:
@@ -178,8 +186,13 @@ class AgentLoader:
         user_id: str,
         username: str,
         thread_id: str,
+        agent_id: str = "default",
     ) -> Any:
-        """获取用户 Agent，并登记该用户访问过的会话。"""
+        """获取用户所选 Agent 的图，并登记该用户访问过的会话。
+
+        缓存键包含 ``agent_id``：同一用户招募的多个 Agent 各自拥有独立的
+        系统提示词、模型配置与 MCP 工具集，不能复用同一张图。
+        """
         await self.initialize()
         assert self._agent_factory is not None
         assert self._store is not None
@@ -192,6 +205,7 @@ class AgentLoader:
         integration_server_id = str(
             (session or {}).get("integration_server_id") or ""
         )
+        resolved_agent_id = str(agent_id or "default").strip() or "default"
 
         # 用户级锁防止重复构建；沙箱探测和构图不会阻塞其他用户。
         async with self._user_locks.setdefault(user_id, asyncio.Lock()):
@@ -215,8 +229,19 @@ class AgentLoader:
                     user_id,
                 )
 
-            agent = group.agents.get(integration_server_id)
+            cache_key = f"{resolved_agent_id}:{integration_server_id}"
+            agent = group.agents.get(cache_key)
             if agent is None:
+                from agent.agent_profiles import AgentProfileStore
+
+                profile = await AgentProfileStore(
+                    self._store, user_id
+                ).get(resolved_agent_id)
+                if profile is None or not bool(profile.get("enabled", True)):
+                    # 档案被删除或停用时回退默认 Agent，避免会话直接失败。
+                    profile = await AgentProfileStore(
+                        self._store, user_id
+                    ).get("default")
                 agent = await self._agent_factory(
                     self.create_config(
                         thread_id=thread_id,
@@ -227,8 +252,9 @@ class AgentLoader:
                     checkpointer=self._checkpointer,
                     sandbox_backend=sandbox_backend,
                     integration_server_id=integration_server_id or None,
+                    agent_profile=profile,
                 )
-                group.agents[integration_server_id] = agent
+                group.agents[cache_key] = agent
             return agent
 
     async def reset_agents(self) -> None:
@@ -236,6 +262,12 @@ class AgentLoader:
         async with self._lock:
             self._user_groups.clear()
             self._user_locks.clear()
+
+    async def reset_user_agents(self, user_id: str) -> None:
+        """只清空指定用户的 Agent 缓存（MyAgent 档案变更后调用）。"""
+        async with self._lock:
+            self._user_groups.pop(user_id, None)
+            self._user_locks.pop(user_id, None)
 
     async def reload_sandbox(self) -> None:
         """系统设置保存沙箱配置后重建沙箱管理器与 Agent 图。
@@ -309,9 +341,9 @@ class AgentLoader:
                 if manager is not None:
                     await manager.close()
             finally:
-                from agent.mcp.runtime import mcp_runtime
+                from agent.mcp.runtime import shutdown_mcp_runtimes
 
-                await mcp_runtime.shutdown()
+                await shutdown_mcp_runtimes()
                 if store is not None and checkpointer is not None:
                     await close_async_persistence(store, checkpointer)
 
@@ -325,6 +357,8 @@ class AgentLoader:
         bind_project: bool = False,
         integration_server_id: str | None = None,
         bind_integration: bool = False,
+        agent_id: str | None = None,
+        bind_agent: bool = False,
     ) -> None:
         """将用户会话索引保存到 PostgreSQL 的 LangGraph Store。
 
@@ -349,6 +383,8 @@ class AgentLoader:
             value["project_id"] = project_id or None
         if bind_integration:
             value["integration_server_id"] = integration_server_id or None
+        if bind_agent:
+            value["agent_id"] = agent_id or "default"
         value.update(
             {
                 "thread_id": thread_id,
@@ -500,6 +536,76 @@ class AgentLoader:
         assert self._history_reader is not None
         return await self._history_reader.get_state(thread_id)
 
+    async def reset_thread_checkpoint(self, thread_id: str) -> None:
+        """物理删除一个会话的全部 checkpoint 正文，保留会话索引与用量。"""
+        await self.initialize()
+        assert self._checkpointer is not None
+        await self._checkpointer.adelete_thread(thread_id)
+
+    async def append_thread_messages(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        thread_id: str,
+        user_content: str,
+        assistant_content: str,
+    ) -> bool:
+        """把一轮任务流对话写入 checkpoint，保证刷新后历史可回看。
+
+        任务流在 Agent 图之外执行，不会自动产生 checkpoint 消息；这里用
+        ``aupdate_state`` 追加一条用户消息与最终回答。若会话处于暂停（HITL
+        中断或待执行节点），跳过写入，避免破坏后续恢复调度。
+        """
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        try:
+            await self.initialize()
+            state = await self.get_thread_state(thread_id)
+            if state.next or state.interrupts:
+                logger.info("会话 %s 处于暂停状态，跳过任务流消息写入", thread_id)
+                return False
+            session = await self.get_session(user_id, thread_id)
+            agent = await self.get_agent_for_user(
+                user_id=user_id,
+                username=username,
+                thread_id=thread_id,
+                agent_id=str((session or {}).get("agent_id") or "default"),
+            )
+            config = self.create_config(
+                thread_id=thread_id,
+                user_id=user_id,
+                username=username,
+            )
+            values = {
+                "messages": [
+                    HumanMessage(
+                        id=f"tf-user-{uuid.uuid4().hex}",
+                        content=user_content,
+                    ),
+                    AIMessage(
+                        id=f"tf-ai-{uuid.uuid4().hex}",
+                        content=assistant_content,
+                        additional_kwargs={"source": "main"},
+                    ),
+                ]
+            }
+            try:
+                await agent.aupdate_state(config, values)
+            except Exception as exc:
+                # 极少数情况下（首次对话 + 多节点图）LangGraph 无法推断写入节点；
+                # 显式指定一个真实节点，避免退化成「待执行输入」而不进状态。
+                if "as_node" not in str(exc):
+                    raise
+                as_node = _pick_state_node(agent)
+                if as_node is None:
+                    raise
+                await agent.aupdate_state(config, values, as_node=as_node)
+            return True
+        except Exception:
+            logger.exception("任务流对话写入 checkpoint 失败：thread=%s", thread_id)
+            return False
+
     async def list_trajectory(
         self, user_id: str, thread_id: str,
     ) -> list[dict[str, Any]]:
@@ -517,6 +623,24 @@ class AgentLoader:
         await self.initialize()
         assert self._store is not None
         return await read_usage(self._store, user_id=user_id, thread_id=thread_id)
+
+    async def get_store(self) -> Any:
+        """返回已初始化的 Store，供反馈等附属数据直接读写。"""
+        await self.initialize()
+        assert self._store is not None
+        return self._store
+
+    async def get_thread_feedback(
+        self, user_id: str, thread_id: str
+    ) -> dict[str, str]:
+        """读取会话内每条助手消息的最新反馈，供历史回显。"""
+        await self.initialize()
+        assert self._store is not None
+        return await feedback_map_for_thread(
+            self._store,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
 
     async def bind_async_task(
         self,
@@ -644,6 +768,9 @@ class AgentLoader:
         # 轨迹与 checkpoint 同生命周期，会话删除后不再保留过程记录。
         await delete_trajectory(self._store, user_id=user_id, thread_id=thread_id)
         await delete_usage(self._store, user_id=user_id, thread_id=thread_id)
+        await delete_feedback_thread(
+            self._store, user_id=user_id, thread_id=thread_id
+        )
         group = self._user_groups.get(user_id)
         if group is not None:
             group.thread_ids.discard(thread_id)

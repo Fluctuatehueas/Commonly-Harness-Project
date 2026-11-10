@@ -4,6 +4,7 @@
 # 模型配置
 # ============================================================
 import asyncio # Windows 事件循环策略，以及提供异步 API。
+import hashlib
 import logging
 import os
 import shutil
@@ -54,9 +55,10 @@ MODEL_REQUESTS_PER_SECOND = float(os.getenv("HARNESS_MODEL_REQUESTS_PER_SECOND",
 MODEL_RATE_LIMIT_BURST = int(os.getenv("HARNESS_MODEL_RATE_LIMIT_BURST", "3"))
 # OpenAI 兼容客户端的 429 重试次数（指数退避，服务端有 Retry-After 时优先遵循）。
 MODEL_MAX_RETRIES = int(os.getenv("HARNESS_MODEL_MAX_RETRIES", "5"))
-# 默认禁止模型一次发多个工具调用：避免并行 HITL 卡片同时爆发。
+# 默认为开启：主 Agent 需要在一条消息里并发委派多个子 Agent 实例。
+# 如果并行 HITL 卡片带来困扰，可显式设置 HARNESS_MODEL_PARALLEL_TOOL_CALLS=0 关闭。
 MODEL_PARALLEL_TOOL_CALLS = os.getenv(
-    "HARNESS_MODEL_PARALLEL_TOOL_CALLS", "0"
+    "HARNESS_MODEL_PARALLEL_TOOL_CALLS", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 _MODEL_RATE_LIMITER: InMemoryRateLimiter | None = None
@@ -153,74 +155,125 @@ VISION_API_KEY = os.getenv("HARNESS_VISION_API_KEY")
 
 # 模型在首次构图/调用时才创建：缺少 API Key 时应用仍可导入并启动只读接口，
 # 真正的模型调用会给出明确错误。
-_MAIN_MODEL: ChatDeepSeek | None = None
-_SUMMARY_MODEL: ChatDeepSeek | None = None
-_VISION_MODEL: ChatDeepSeek | None = None
+# 配置按用户隔离后，模型对象以 ``角色:用户:配置指纹`` 缓存，同一用户复用、
+# 不同用户互不覆盖；系统设置保存时整体清空。
+_MODEL_CACHE: dict[str, ChatDeepSeek] = {}
 
 
-def _require_model_credentials() -> None:
+def _require_model_credentials(api_key: str | None) -> None:
     """模型调用前确认凭据已配置。"""
-    if not DEEPSEEK_API_KEY:
+    if not api_key:
         raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法调用模型服务")
 
 
-def get_main_model() -> ChatDeepSeek:
-    """返回主 Agent 模型（进程内单例）。"""
-    global _MAIN_MODEL
-    if _MAIN_MODEL is None:
-        _require_model_credentials()
-        _MAIN_MODEL = ChatDeepSeek(
-            model=DEEPSEEK_MODEL_NAME,
-            # 思考模式由 HARNESS_MODEL_THINKING 控制，默认关闭。
-            extra_body={"thinking": {"type": "enabled" if MODEL_THINKING_ENABLED else "disabled"}},
-            api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL,
-            max_retries=MODEL_MAX_RETRIES,
-            rate_limiter=get_model_rate_limiter(),
-            model_kwargs=_model_kwargs(),
-        )
-    return _MAIN_MODEL
+def _api_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12] if api_key else "none"
 
 
-def get_summary_model() -> ChatDeepSeek:
-    """返回会话摘要专用模型（进程内单例）。"""
-    global _SUMMARY_MODEL
-    if _SUMMARY_MODEL is None:
-        _require_model_credentials()
-        _SUMMARY_MODEL = ChatDeepSeek(
-            model=DEEPSEEK_MODEL_NAME,
-            temperature=0.3,  # 摘要要求输出稳定，减少发挥
-            extra_body={"thinking": {"type": "enabled" if MODEL_THINKING_ENABLED else "disabled"}},
-            api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL,
-            max_retries=MODEL_MAX_RETRIES,
-            rate_limiter=get_model_rate_limiter(),
-            model_kwargs=_model_kwargs(),
-        )
-    return _SUMMARY_MODEL
+def build_model(
+    settings: dict[str, Any],
+    *,
+    role: str = "main",
+    user_id: str = "",
+) -> ChatDeepSeek:
+    """按一组生效配置构建模型客户端；同配置按用户复用。
 
-
-def get_vision_model() -> ChatDeepSeek:
-    """返回视觉子 Agent 专用模型（进程内单例）。
-
-    ``HARNESS_VISION_MODEL_NAME`` 未配置时回退到主模型：此时视觉理解依赖
-    MCP 视觉工具（把图像转成文本描述），而不是模型原生多模态能力。
+    ``settings`` 至少包含 ``model_name`` / ``base_url`` / ``api_key`` /
+    ``thinking_enabled``；Agent 档案可以用自己的配置覆盖用户默认值。
     """
-    global _VISION_MODEL
+    model_name = str(settings.get("model_name") or "")
+    base_url = str(settings.get("base_url") or "")
+    api_key = str(settings.get("api_key") or "")
+    thinking = bool(settings.get("thinking_enabled"))
+    _require_model_credentials(api_key)
+    key = ":".join(
+        [
+            role,
+            user_id or "-",
+            model_name,
+            base_url,
+            _api_key_fingerprint(api_key),
+            "think" if thinking else "fast",
+        ]
+    )
+    cached = _MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "extra_body": {"thinking": {"type": "enabled" if thinking else "disabled"}},
+        "api_key": api_key,
+        "base_url": base_url or None,
+        "max_retries": MODEL_MAX_RETRIES,
+        "rate_limiter": get_model_rate_limiter(),
+        "model_kwargs": _model_kwargs(),
+    }
+    if role == "summary":
+        kwargs["temperature"] = 0.3
+    client = ChatDeepSeek(**kwargs)
+    _MODEL_CACHE[key] = client
+    return client
+
+
+def _user_id_or_current(user_id: str | None) -> str:
+    if user_id:
+        return user_id
+    from agent.identity import current_user_id
+
+    return current_user_id()
+
+
+def get_main_model(user_id: str | None = None) -> ChatDeepSeek:
+    """返回当前用户生效的主 Agent 模型。"""
+    from agent.user_data import model_settings
+
+    resolved_user = _user_id_or_current(user_id)
+    return build_model(
+        model_settings(resolved_user),
+        role="main",
+        user_id=resolved_user,
+    )
+
+
+def get_summary_model(user_id: str | None = None) -> ChatDeepSeek:
+    """返回当前用户生效的摘要模型；与主模型共用配置。"""
+    from agent.user_data import model_settings
+
+    resolved_user = _user_id_or_current(user_id)
+    return build_model(
+        model_settings(resolved_user),
+        role="summary",
+        user_id=resolved_user,
+    )
+
+
+def get_vision_model(user_id: str | None = None) -> ChatDeepSeek:
+    """返回视觉子 Agent 专用模型。
+
+    ``HARNESS_VISION_MODEL_NAME`` 未配置时回退到当前用户的主模型。
+    """
+    resolved_user = _user_id_or_current(user_id)
     if not VISION_MODEL_NAME:
-        return get_main_model()
-    if _VISION_MODEL is None:
-        _require_model_credentials()
-        _VISION_MODEL = ChatDeepSeek(
-            model=VISION_MODEL_NAME,
-            extra_body={"thinking": {"type": "enabled" if MODEL_THINKING_ENABLED else "disabled"}},
-            api_key=VISION_API_KEY or DEEPSEEK_API_KEY,
-            base_url=VISION_BASE_URL or DEEPSEEK_BASE_URL,
-            max_retries=MODEL_MAX_RETRIES,
-            rate_limiter=get_model_rate_limiter(),
-            model_kwargs=_model_kwargs(),
-        )
-    return _VISION_MODEL
+        return get_main_model(resolved_user)
+    api_key = VISION_API_KEY or os.getenv("DEEPSEEK_API_KEY") or ""
+    base_url = VISION_BASE_URL or os.getenv("DEEPSEEK_BASE_URL") or ""
+    return build_model(
+        {
+            "model_name": VISION_MODEL_NAME,
+            "base_url": base_url,
+            "api_key": api_key,
+            "thinking_enabled": MODEL_THINKING_ENABLED,
+        },
+        role="vision",
+        user_id=resolved_user,
+    )
+
+
+def context_limit_for(user_id: str | None = None) -> int:
+    """该用户生效的上下文窗口上限。"""
+    from agent.user_data import model_settings
+
+    return int(model_settings(_user_id_or_current(user_id))["context_limit"])
 
 
 def reload_model_config() -> None:
@@ -232,7 +285,6 @@ def reload_model_config() -> None:
     global DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL_NAME
     global MODEL_THINKING_ENABLED, WEB_SEARCH_ENABLED, MODEL_CONTEXT_LIMIT
     global VISION_MODEL_NAME, VISION_BASE_URL, VISION_API_KEY
-    global _MAIN_MODEL, _SUMMARY_MODEL, _VISION_MODEL
     global _MODEL_RATE_LIMITER
     global CONTEXT_COMPACT_ENABLED, CONTEXT_COMPACT_TRIGGER, CONTEXT_COMPACT_HARD
     global CONTEXT_COMPACT_KEEP, CONTEXT_COMPACT_MIN_ROUNDS
@@ -258,9 +310,8 @@ def reload_model_config() -> None:
     VISION_MODEL_NAME = os.getenv("HARNESS_VISION_MODEL_NAME")
     VISION_BASE_URL = os.getenv("HARNESS_VISION_BASE_URL")
     VISION_API_KEY = os.getenv("HARNESS_VISION_API_KEY")
-    _MAIN_MODEL = None
-    _SUMMARY_MODEL = None
-    _VISION_MODEL = None
+    # 用户级模型缓存整体失效，下一次构图按各自配置重建。
+    _MODEL_CACHE.clear()
     # 上下文压缩参数同样支持热更新；重建 Agent 图后新阈值生效。
     CONTEXT_ALERT_THRESHOLD = float(os.getenv("HARNESS_CONTEXT_ALERT_THRESHOLD", "0.70"))
     CONTEXT_COMPACT_ENABLED = _env_flag("HARNESS_CONTEXT_COMPACT_ENABLED", True)
@@ -324,15 +375,29 @@ MEMORY_UPDATE_ASYNC = os.getenv("HARNESS_MEMORY_UPDATE_ASYNC", "1").strip().lowe
     "no",
 }
 
+# ============================================================
+# 消息反馈（赞同 / 不赞同 / 重试）
+# ============================================================
+# 总开关：关闭后前端隐藏按钮，写入与重试接口直接拒绝。
+FEEDBACK_ENABLED = _env_flag("HARNESS_FEEDBACK_ENABLED", True)
+# 单用户单日反馈写入上限，防止异常客户端刷量。
+FEEDBACK_DAILY_LIMIT = int(os.getenv("HARNESS_FEEDBACK_DAILY_LIMIT", "500"))
+# 账本只保留摘要，服务端再次截断，避免客户端提交超长文本。
+FEEDBACK_MAX_USER_EXCERPT = int(os.getenv("HARNESS_FEEDBACK_MAX_USER_EXCERPT", "200"))
+FEEDBACK_MAX_ANSWER_EXCERPT = int(os.getenv("HARNESS_FEEDBACK_MAX_ANSWER_EXCERPT", "400"))
+# 账本保留策略：超过天数或条数后由维护任务清理。
+FEEDBACK_RETENTION_DAYS = int(os.getenv("HARNESS_FEEDBACK_RETENTION_DAYS", "180"))
+FEEDBACK_MAX_RECORDS = int(os.getenv("HARNESS_FEEDBACK_MAX_RECORDS", "20000"))
+
 
 # ============================================================
 # Agent 运行保护
 # ============================================================
 # 限制按单次 Agent run 计数；恢复中断（checkpoint resume）会开启新的 run，避免长期会话被历史调用耗尽。
 MAIN_AGENT_MODEL_RUN_LIMIT = 50  # 单词Agent对话次数
-MAIN_AGENT_TOOL_RUN_LIMIT = 50 # 单词Agent可调用工具限制
-SUBAGENT_MODEL_RUN_LIMIT = 50 # 子智能体对话次数
-SUBAGENT_TOOL_RUN_LIMIT = 50 # 子智能体工具运行限制
+MAIN_AGENT_TOOL_RUN_LIMIT = 500 # 单词Agent可调用工具限制
+SUBAGENT_MODEL_RUN_LIMIT = 100 # 子智能体对话次数
+SUBAGENT_TOOL_RUN_LIMIT = 500 # 子智能体工具运行限制
 ASYNC_SUBAGENT_MODEL_RUN_LIMIT = 50 # 异步子 Agent 的预算。
 # 不改变每次新询问重新计数的语义，也继续保留循环保护。
 ASYNC_SUBAGENT_TOOL_RUN_LIMIT = 32
@@ -615,22 +680,25 @@ def _safe_mcp_dir_name(server_id: str) -> str:
     )[:64] or "server"
 
 
+def _mcp_user_dir(server_id: str) -> Path:
+    """MCP 运行态目录按用户隔离，避免同名服务的缓存与日志互相覆盖。"""
+    from agent.identity import current_user_id, safe_user_id
+
+    user_dir = safe_user_id(current_user_id())
+    return mcp_workspace_root() / "users" / user_dir / _safe_mcp_dir_name(server_id)
+
+
 def mcp_npm_cache_dir(server_id: str) -> Path:
     """npx / npm 型 stdio 服务的专用 npm 缓存目录。
 
-    目录布局：``<MCP 工作目录>/<server_id>/npm-cache``，npm 会在里面建
-    ``_cacache`` / ``_npx``，因此配置、下载的包与产物都归在同一个服务目录下。
+    目录布局：``<MCP 工作目录>/users/<user_id>/<server_id>/npm-cache``。
     """
-    return mcp_workspace_root() / _safe_mcp_dir_name(server_id) / "npm-cache"
+    return _mcp_user_dir(server_id) / "npm-cache"
 
 
 def mcp_stdio_log_path(server_id: str) -> Path:
-    """stdio MCP 子进程的 stderr 日志文件。
-
-    每次连接覆盖写入，只保留本次连接的输出，避免文件无限增长；
-    同时被 MCP 运行时 tail 到观测层，供前端「日志 / 状态卡片」展示。
-    """
-    return mcp_workspace_root() / _safe_mcp_dir_name(server_id) / "logs" / "stdio.log"
+    """stdio MCP 子进程的 stderr 日志文件（按用户隔离）。"""
+    return _mcp_user_dir(server_id) / "logs" / "stdio.log"
 
 
 def _resolve_skills_root() -> Path:

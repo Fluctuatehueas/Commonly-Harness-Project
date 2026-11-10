@@ -57,21 +57,27 @@ async def _load_subagent_config(name: str) -> dict[str, Any]:
 
 
 async def _get_subagent_config(name: str) -> dict[str, Any]:
-    """按名称读取并缓存子 Agent 配置。"""
-    if name not in _SUBAGENT_CONFIGS:
-        _SUBAGENT_CONFIGS[name] = await _load_subagent_config(name)
-    return _SUBAGENT_CONFIGS[name]
+    """按「用户 + 名称」读取并缓存子 Agent 配置（MCP 绑定随用户变化）。"""
+    from agent.identity import current_user_id
+
+    cache_key = f"{current_user_id()}:{name}"
+    if cache_key not in _SUBAGENT_CONFIGS:
+        _SUBAGENT_CONFIGS[cache_key] = await _load_subagent_config(name)
+    return _SUBAGENT_CONFIGS[cache_key]
 
 
 def build_async_subagent_graph(
     name: str,
     subagent_config: dict[str, Any],
     sandbox_backend: SandboxBackendProxy,
+    user_id: str = "anonymous",
 ) -> Any:
     """用共享沙箱后端构建一个异步子 Agent 图。"""
+    from agent.user_data import user_skills_root
+
     backend = CompositeBackend(default=sandbox_backend, routes={})
     skill_synchronizer = SandboxSkillSynchronizer(
-        SKILLS_ROOT,
+        user_skills_root(user_id),
         Path(__file__).parent.parent / "memory" / "AGENTS.md",
     )
     skills = subagent_config.get("skills", [])
@@ -111,28 +117,34 @@ def _context_value(context: Any, key: str) -> Any:
 @asynccontextmanager
 async def async_subagent_graph(runtime: ServerRuntime) -> AsyncIterator[Any]:
     """只在执行上下文连接沙箱，并在图生命周期结束后释放客户端。"""
+    from agent.identity import reset_current_user_id, set_current_user_id
+    from agent.user_data import sandbox_settings
+
     proxy = SandboxBackendProxy()
+    execution = runtime.execution_runtime
+    context = execution.context if execution is not None else None
+    subagent_name = _context_value(context, "subagent_name")
+    if not subagent_name:
+        raise RuntimeError("异步任务缺少 subagent_name 上下文")
+    # 异步图是独立进程入口：从执行上下文恢复用户身份，
+    # 让技能、MCP、模型与沙箱配置都按该用户解析。
+    user_id = str(_context_value(context, "user_id") or "anonymous")
+    user_token = set_current_user_id(user_id)
     try:
-        execution = runtime.execution_runtime
-        context = execution.context if execution is not None else None
-        subagent_name = _context_value(context, "subagent_name")
-        if not subagent_name:
-            raise RuntimeError("异步任务缺少 subagent_name 上下文")
-
         subagent_config = await _get_subagent_config(str(subagent_name))
-
         if execution is not None:
             sandbox_id = _context_value(context, "sandbox_id")
             if not sandbox_id:
                 raise RuntimeError("异步任务缺少 sandbox_id 上下文")
-            if not OPEN_SANDBOX_API_KEY:
+            settings = sandbox_settings(user_id)
+            if not settings["api_key"]:
                 raise RuntimeError(
                     "未配置 OPEN_SANDBOX_API_KEY，异步子 Agent 无法连接沙箱"
                 )
             connection = ConnectionConfigSync(
-                api_key=OPEN_SANDBOX_API_KEY,
-                domain=f"{OPEN_SANDBOX_HOST}:{OPEN_SANDBOX_PORT}",
-                use_server_proxy=OPEN_SANDBOX_USE_SERVER_PROXY,
+                api_key=settings["api_key"],
+                domain=f"{settings['host']}:{settings['port']}",
+                use_server_proxy=settings["use_server_proxy"],
             )
             task = asyncio.create_task(
                 asyncio.to_thread(
@@ -152,13 +164,16 @@ async def async_subagent_graph(runtime: ServerRuntime) -> AsyncIterator[Any]:
                 raise
             try:
                 backend = OpenSandboxBackend(
-                    sandbox, OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS,
+                    sandbox, settings["default_timeout_seconds"],
                 )
             except BaseException:
                 await asyncio.to_thread(sandbox.close)
                 raise
             proxy.replace_backend(backend)
 
-        yield build_async_subagent_graph(str(subagent_name), subagent_config, proxy)
+        yield build_async_subagent_graph(
+            str(subagent_name), subagent_config, proxy, user_id,
+        )
     finally:
         await asyncio.to_thread(proxy.close)
+        reset_current_user_id(user_token)

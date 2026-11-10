@@ -1,23 +1,39 @@
 <script setup lang="ts">
 // 模型管理：选卡片 → 回填参数（含思考能力）→ 保存才写 .env 并热更新
-import { onMounted } from 'vue'
+import { onMounted, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { Check } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
-import UiSwitch from '@/components/console/UiSwitch.vue'
 import { formatContext, useModelStore } from '@/stores/models'
 
 const store = useModelStore()
 onMounted(() => store.load())
+
+// store 仍只维护 toast 文案与类型，展示层统一交给 Element Plus 全局消息
+watch(
+  () => store.toast,
+  (message) => {
+    if (!message) return
+    if (store.toastType === 'err') ElMessage.error(message)
+    else ElMessage.success(message)
+  },
+)
 </script>
 
 <template>
   <div class="app-shell">
     <TopNav />
     <div class="page">
-        <div v-if="store.offline" class="notice">
-          <AppIcon name="shield" :size="14" />
-          后端未连接（{{ store.offline ? 'http://127.0.0.1:8000' : '' }}）：可浏览与选择模型，保存更改需要启动 FastAPI 服务。
-        </div>
+        <!-- 离线提示改用 el-alert：图标、配色、关闭行为都由 EP 统一 -->
+        <el-alert
+          v-if="store.offline"
+          class="offline-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="后端未连接（http://127.0.0.1:8000）：可浏览与选择模型，保存更改需要启动 FastAPI 服务。"
+        />
 
         <div class="columns">
           <section class="panel catalog">
@@ -34,6 +50,8 @@ onMounted(() => store.load())
                   <span class="vendor-name">{{ group.provider }}</span>
                   <small>{{ group.models.length }} 个模型</small>
                 </header>
+                <!-- 模型卡片是带渐变头像与多行信息的展示型卡片，保持原生 button：
+                     换成 el-button 必须覆盖 EP 的背景/边框，反而与主题桥接打架 -->
                 <div class="grid">
                   <button
                     v-for="m in group.models"
@@ -74,23 +92,25 @@ onMounted(() => store.load())
                 <span class="title-icon"><AppIcon name="sliders" :size="14" /></span>
                 配置面板
               </div>
-              <span v-if="store.dirty" class="dirty">未保存</span>
+              <!-- 未保存状态用 el-tag，语义色与仪表盘其他地方一致 -->
+              <el-tag v-if="store.dirty" type="warning" size="small" effect="plain">未保存</el-tag>
             </div>
 
             <div class="fields">
               <label>
                 <span>模型名称 <em>DEEPSEEK_MODEL_NAME</em></span>
-                <input v-model="store.form.model_name" placeholder="如 deepseek-chat" />
+                <el-input v-model="store.form.model_name" placeholder="如 deepseek-chat" />
               </label>
               <label>
                 <span>Base URL <em>DEEPSEEK_BASE_URL</em></span>
-                <input v-model="store.form.base_url" placeholder="https://api.deepseek.com" />
+                <el-input v-model="store.form.base_url" placeholder="https://api.deepseek.com" />
               </label>
               <label>
                 <span>API Key <em>DEEPSEEK_API_KEY</em></span>
-                <input
+                <el-input
                   v-model="store.form.api_key"
                   type="password"
+                  show-password
                   autocomplete="off"
                   :placeholder="store.current.has_api_key ? '留空保持不变；切换模型后已清空' : '尚未配置，请输入'"
                 />
@@ -105,7 +125,11 @@ onMounted(() => store.load())
                   <strong>思考能力</strong>
                   <span>开启后模型返回推理过程（thinking），适合复杂任务，但更慢、更耗额度</span>
                 </div>
-                <UiSwitch v-model="store.form.thinking_enabled" />
+                <!-- el-switch 的 update 事件是 string | number | boolean 联合类型，这里显式收窄回 boolean -->
+                <el-switch
+                  :model-value="store.form.thinking_enabled"
+                  @update:model-value="(v: string | number | boolean) => (store.form.thinking_enabled = Boolean(v))"
+                />
               </div>
 
               <div v-if="store.selected" class="ctx-row">
@@ -113,18 +137,16 @@ onMounted(() => store.load())
                   <span>上下文窗口 <em>HARNESS_MODEL_CONTEXT_LIMIT</em></span>
                   <strong class="ctx-current">{{ formatContext(store.form.context_limit) }}</strong>
                 </div>
-                <div class="ctx-options">
-                  <button
+                <!-- 单选语义用 el-radio-group，分段样式已由主题桥接统一 -->
+                <el-radio-group v-model="store.form.context_limit" size="small">
+                  <el-radio-button
                     v-for="opt in store.selected.contextOptions"
                     :key="opt"
-                    type="button"
-                    class="ctx-chip"
-                    :class="{ on: store.form.context_limit === opt }"
-                    @click="store.form.context_limit = opt"
+                    :value="opt"
                   >
                     {{ formatContext(opt) }}
-                  </button>
-                </div>
+                  </el-radio-button>
+                </el-radio-group>
                 <p class="ctx-tip">
                   只用于上下文监控与压缩阈值，不影响模型真实能力。DeepSeek V4 系列窗口 1M，
                   V3 系列 128K；取服务端允许的最大输入 token 即可。
@@ -136,22 +158,21 @@ onMounted(() => store.load())
                 <p>推荐温度 {{ store.selected.temperature }} · {{ store.selected.context }}{{ store.selected.note ? ' · ' + store.selected.note : '' }}</p>
               </div>
 
-              <button class="save" type="button" :disabled="!store.dirty || store.saving" @click="store.save()">
-                <AppIcon name="check" :size="14" />
+              <el-button
+                class="save"
+                type="primary"
+                :icon="Check"
+                :loading="store.saving"
+                :disabled="!store.dirty || store.saving"
+                @click="store.save()"
+              >
                 {{ store.saving ? '保存中…' : '保存更改' }}
-              </button>
+              </el-button>
               <p class="hint">保存后写入 .env 并热更新运行中的模型；API Key 留空则保留原值。</p>
             </div>
           </aside>
         </div>
       </div>
-
-      <Transition name="toast">
-        <div v-if="store.toast" class="toast" :class="store.toastType">
-          <AppIcon :name="store.toastType === 'ok' ? 'check' : 'close'" :size="14" />
-          {{ store.toast }}
-        </div>
-      </Transition>
   </div>
 </template>
 
@@ -197,35 +218,6 @@ onMounted(() => store.load())
   color: var(--accent-cyan);
 }
 
-/* 固定选项，横向换行，不出现滚动条 */
-.ctx-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  overflow: visible;
-}
-
-.ctx-chip {
-  padding: 4px 11px;
-  font-size: 11px;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-}
-
-.ctx-chip:hover {
-  color: var(--text-1);
-  border-color: var(--line-strong);
-}
-
-.ctx-chip.on {
-  color: var(--text-1);
-  border-color: var(--accent);
-  background: rgba(91, 140, 255, 0.12);
-}
-
 .ctx-tip {
   margin: 0;
   font-size: 10.5px;
@@ -261,17 +253,9 @@ onMounted(() => store.load())
   color: var(--text-3);
 }
 
-.notice {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* 离线提示交给 el-alert，只保留与下方内容的分隔间距 */
+.offline-alert {
   margin-bottom: 14px;
-  padding: 9px 12px;
-  font-size: 12px;
-  color: var(--amber);
-  border: 1px solid rgba(242, 176, 60, 0.3);
-  border-radius: var(--radius-sm);
-  background: rgba(242, 176, 60, 0.05);
 }
 
 .columns {
@@ -474,14 +458,6 @@ onMounted(() => store.load())
   background: transparent;
 }
 
-.dirty {
-  padding: 1px 8px;
-  font-size: 10px;
-  color: var(--amber);
-  border: 1px solid rgba(242, 176, 60, 0.4);
-  border-radius: var(--radius-sm);
-}
-
 .fields {
   display: flex;
   flex-direction: column;
@@ -508,20 +484,10 @@ onMounted(() => store.load())
   margin-left: 6px;
 }
 
-.fields input {
-  padding: 8px 11px;
-  font-size: 12px;
+/* 输入框的背景/边框/聚焦态由主题桥接统一，这里只把字体换成等宽，便于核对变量值 */
+.fields :deep(.el-input__inner) {
   font-family: var(--font-mono);
-  color: var(--text-1);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-deep);
-  outline: none;
-}
-
-.fields input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(91, 140, 255, 0.22);
+  font-size: 12px;
 }
 
 .key-state {
@@ -563,28 +529,10 @@ onMounted(() => store.load())
   color: var(--text-3);
 }
 
+/* 主按钮配色由 el-button--primary 提供，这里只让它铺满配置面板宽度 */
 .save {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  padding: 9px;
+  width: 100%;
   font-size: 12.5px;
-  color: #fff;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  transition: filter 0.16s;
-}
-
-.save:hover {
-  filter: brightness(1.1);
-}
-
-.save:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-  filter: none;
 }
 
 .hint {
@@ -592,39 +540,6 @@ onMounted(() => store.load())
   font-size: 10.5px;
   line-height: 1.6;
   color: var(--text-3);
-}
-
-.toast {
-  position: fixed;
-  right: 26px;
-  bottom: 26px;
-  z-index: 50;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 16px;
-  font-size: 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(55, 208, 196, 0.35);
-  color: var(--text-1);
-  background: var(--bg-elevated);
-}
-
-.toast.err {
-  border-color: rgba(226, 96, 94, 0.45);
-  color: var(--text-1);
-  background: var(--bg-elevated);
-}
-
-.toast-enter-active,
-.toast-leave-active {
-  transition: all 0.3s;
-}
-
-.toast-enter-from,
-.toast-leave-to {
-  opacity: 0;
-  transform: translateY(12px);
 }
 
 @media (max-width: 1180px) {

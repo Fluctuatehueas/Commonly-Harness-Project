@@ -13,6 +13,13 @@ export type ModelSettingsPatch = Partial<
   Pick<ModelSettings, 'thinking_enabled' | 'web_search_enabled'>
 >
 
+/** 消息反馈开关：关闭时前端隐藏赞同/不赞同/重试按钮。 */
+export async function fetchFeedbackSettings(): Promise<{ enabled: boolean }> {
+  const res = await fetch(`${API_BASE}/settings/feedback`)
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return (await res.json()) as { enabled: boolean }
+}
+
 export interface SandboxSettings {
   configured: boolean
   mode: 'sandbox' | 'local'

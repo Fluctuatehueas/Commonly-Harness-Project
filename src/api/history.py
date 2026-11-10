@@ -53,6 +53,22 @@ def _user_display_content(content: Any) -> str:
     return content_to_text(content)
 
 
+# 旧版本会把自检结论拼在回答开头；这些内容不应再展示给用户。
+_SELF_CHECK_HEADERS = (
+    "【自检提示】以下回答未通过完整自检，请谨慎核对。",
+    "【自检提示】本次回答未通过完整性校验，已保留原始回答供人工核对。",
+)
+
+
+def _strip_self_check_header(content: str) -> str:
+    """移除历史回答开头的自检提示，只保留模型原始回答。"""
+    for header in _SELF_CHECK_HEADERS:
+        if content.startswith(header):
+            _, _, original = content.partition("\n\n")
+            return original.strip()
+    return content
+
+
 def _message_value(message: Any, name: str, default: Any = None) -> Any:
     """从 LangChain 消息对象或 checkpoint 字典中读取指定字段。"""
     # checkpoint 迁移或不同 LangGraph 版本可能产生对象或字典，两种格式必须兼容。
@@ -117,6 +133,7 @@ def _message_reasoning(message: Any) -> str:
 def serialize_messages(
     messages: list[Any],
     usage_by_message: dict[str, dict[str, int]] | None = None,
+    feedback_by_message: dict[str, str] | None = None,
 ) -> list[Message]:
     """将 checkpoint 消息转换为与 SSE 流式过程一致的前端展示消息。
 
@@ -143,6 +160,7 @@ def serialize_messages(
             else content_to_text(message_content)
         )
         if role == "assistant":
+            content = _strip_self_check_header(content)
             # AIMessage 可同时携带文本和工具调用，必须先保留文本的原始顺序。
             additional_kwargs = _message_value(message, "additional_kwargs", {}) or {}
             source = str(additional_kwargs.get("source", "main"))
@@ -175,6 +193,13 @@ def serialize_messages(
                                 str(_message_value(message, "id", "") or "")
                             )
                             if usage_by_message
+                            else None
+                        ),
+                        feedback=(
+                            feedback_by_message.get(
+                                str(_message_value(message, "id", "") or "")
+                            )
+                            if feedback_by_message
                             else None
                         ),
                     )
@@ -264,6 +289,7 @@ def _session_from_index(item: dict[str, Any], message_count: int) -> Session:
         pinned=bool(item.get("pinned", False)),
         project_id=item.get("project_id") or None,
         integration_server_id=item.get("integration_server_id") or None,
+        agent_id=item.get("agent_id") or None,
         archived=bool(item.get("archived", False)),
         archived_at=(
             datetime.fromisoformat(item["archived_at"])
@@ -278,6 +304,7 @@ async def create_session(
     user_id: str = Query("anonymous", min_length=1),
     project_id: str | None = Query(None, min_length=1),
     integration_server_id: str | None = Query(None, min_length=1),
+    agent_id: str = Query("default", min_length=1, max_length=64),
 ) -> Session:
     """创建一条尚未发送消息的会话。
 
@@ -320,6 +347,8 @@ async def create_session(
         bind_project=True,
         integration_server_id=integration_server_id,
         bind_integration=True,
+        agent_id=agent_id,
+        bind_agent=True,
     )
     session = await agent_loader.get_session(user_id, thread_id)
     assert session is not None
@@ -345,14 +374,11 @@ async def list_sessions(
     return SessionListResponse(sessions=sessions)
 
 
-def _archive_days() -> int:
-    """读取自动归档天数；未配置或非法时回落到 30 天，0 表示关闭。"""
-    raw = os.getenv(ENV_KEY_ARCHIVE_DAYS, "").strip()
-    try:
-        days = int(raw) if raw else DEFAULT_ARCHIVE_DAYS
-    except ValueError:
-        days = DEFAULT_ARCHIVE_DAYS
-    return max(days, 0)
+def _archive_days(user_id: str) -> int:
+    """读取该用户的自动归档天数；0 表示关闭。"""
+    from agent.user_data import archive_settings
+
+    return int(archive_settings(user_id)["days"])
 
 
 @router.post("/auto-archive")
@@ -363,9 +389,20 @@ async def auto_archive_sessions(
 
     前端只在进入对话页时调用一次，不在后台常驻计时器。
     """
-    days = _archive_days()
+    days = _archive_days(user_id)
     archived = await agent_loader.archive_stale_sessions(user_id, days)
     return {"archived": archived, "days": days}
+
+
+@router.get("/{thread_id}/usage")
+async def get_session_usage(
+    thread_id: str,
+    user_id: str = Query("anonymous", min_length=1),
+) -> dict[str, Any]:
+    """返回会话累计用量；前端可在本地缺少 spent 字段时补拉。"""
+    await agent_loader.require_session(user_id, thread_id, allow_archived=True)
+    usage_data = await agent_loader.get_thread_usage(user_id, thread_id)
+    return dict(usage_data.get("session", {}))
 
 
 @router.get("/{thread_id}/messages", response_model=SessionMessagesResponse)
@@ -389,10 +426,13 @@ async def get_session_messages(
         for entry in usage_data.get("rounds", [])
         if entry.get("message_id")
     }
+    feedback_by_message = await agent_loader.get_thread_feedback(user_id, thread_id)
     return SessionMessagesResponse(
         thread_id=thread_id,
         messages=serialize_messages(
-            list(state.values.get("messages", [])), usage_by_message
+            list(state.values.get("messages", [])),
+            usage_by_message,
+            feedback_by_message,
         ),
         interrupt=(
             serialize_interrupt(interrupts[0], thread_id) if interrupts else None

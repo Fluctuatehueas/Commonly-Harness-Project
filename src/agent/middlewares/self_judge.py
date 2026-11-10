@@ -1,8 +1,8 @@
 """输出前两层自我裁定中间件。
 
 L1 使用独立摘要模型做结构化自检；L2 使用确定性验证器。只对最终回答
-生效，避免每次模型调用都增加固定开销。验证失败时有限重试一次，仍失败
-则阻止原答案直接作为最终结果，并标记验证失败供后续归因。
+生效，避免每次模型调用都增加固定开销。验证失败时有限重试一次；仍失败
+只记录内部失败信号，不改动用户可见回答。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 
 from agent.config import (
     EVOLUTION_ENABLED,
@@ -146,7 +146,7 @@ class SelfJudgeMiddleware(AgentMiddleware):
         if candidate is None:
             return response
 
-        message, answer = candidate
+        _, answer = candidate
         context = getattr(request.runtime, "context", None)
         state = getattr(request, "state", None) or {}
         tier = _risk_tier(state, answer)
@@ -179,7 +179,7 @@ class SelfJudgeMiddleware(AgentMiddleware):
         if corrected is not None:
             retry_candidate = _should_judge(corrected)
             if retry_candidate is not None:
-                retry_message, retry_answer = retry_candidate
+                _, retry_answer = retry_candidate
                 retry_verdict = await self._judge.judge_l1(
                     user_text=user_text,
                     answer=retry_answer,
@@ -197,12 +197,11 @@ class SelfJudgeMiddleware(AgentMiddleware):
                     ]
                 if retry_verdict.passed and not retry_l2_failed:
                     return corrected
-                message, answer = retry_message, retry_answer
                 response = corrected
 
-        return self._block_or_annotate(
+        # 自检结果只留在内部信号里，绝不能拼进用户可见回答。
+        return self._record_verification_failure(
             response=response,
-            message=message,
             reason=reason,
             tier=tier,
             context=context,
@@ -233,43 +232,24 @@ class SelfJudgeMiddleware(AgentMiddleware):
             return None
 
     @staticmethod
-    def _block_or_annotate(
+    def _record_verification_failure(
         *,
         response: ModelResponse,
-        message: Any,
         reason: str,
         tier: RiskTier,
         context: Any,
     ) -> ModelResponse:
+        """记录自检失败，但不改动用户可见回答。
+
+        失败信号供演进模块做奖励、归因与经验抽取；回答本身原样交付，
+        避免把「自检提示 / 校验原因」暴露给用户。
+        """
         try:
             setattr(context, "evolution_verification_failed", True)
             setattr(context, "evolution_verification_reason", reason)
             setattr(context, "evolution_risk_tier", tier.value)
         except Exception:
             pass
-
-        if tier == RiskTier.T2:
-            # 高风险任务失败关闭：不把可能错误的原答案直接作为最终交付。
-            replacement = (
-                "【验证未通过，已阻止自动继续】\n"
-                f"原因：{reason}\n"
-                "请人工确认后重试；系统已记录本次验证失败用于后续归因。"
-            )
-        else:
-            replacement = (
-                "【验证提示】以下答案未通过完整自检，请谨慎核对。\n"
-                f"原因：{reason}\n\n{_message_text(message)}"
-            )
-        try:
-            message.content = replacement
-        except Exception:
-            try:
-                response.result = [
-                    AIMessage(content=replacement, id=getattr(message, "id", None))
-                    if item is message
-                    else item
-                    for item in response.result
-                ]
-            except Exception:
-                logger.warning("自检失败后标注答案失败", exc_info=True)
+        preview = " ".join(str(reason or "").split())[:180] or "自检未通过"
+        logger.warning("自检未通过：tier=%s，原因：%s", tier.value, preview)
         return response

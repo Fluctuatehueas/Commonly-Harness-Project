@@ -14,11 +14,13 @@ import re
 import socket
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from agent import config as agent_config
+from agent import user_data
 from agent.config import PROJECT_ROOT, reload_model_config, reload_sandbox_config
+from api.identity import effective_user_id
 from utils.integrity import integrity_hint, is_low_integrity, process_integrity
 from utils.runtime_probe import detect_local_environment
 
@@ -89,57 +91,66 @@ def _update_env_file(updates: dict[str, str]) -> None:
     ENV_PATH.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
-def _current_state() -> dict[str, Any]:
-    return {
-        "model_name": os.getenv(ENV_KEY_MODEL, ""),
-        "base_url": os.getenv(ENV_KEY_BASE_URL, ""),
-        "has_api_key": bool(os.getenv(ENV_KEY_API)),
-        # 读模块属性而非环境变量：reload 后与模型单例实际生效值保持一致。
-        "thinking_enabled": bool(agent_config.MODEL_THINKING_ENABLED),
-        "context_limit": int(agent_config.MODEL_CONTEXT_LIMIT),
-        "web_search_enabled": bool(agent_config.WEB_SEARCH_ENABLED),
-    }
+def _current_state(user_id: str) -> dict[str, Any]:
+    """读取该用户实际生效的模型配置（用户覆盖 > 部署级默认）。"""
+    return user_data.public_model_settings(user_id)
 
 
 @router.get("/settings/model")
-async def get_model_settings() -> dict[str, Any]:
-    """返回当前生效的模型配置。"""
-    return _current_state()
+async def get_model_settings(
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """返回当前用户生效的模型配置。"""
+    return _current_state(effective_user_id(user_id))
+
+
+@router.get("/settings/feedback")
+async def get_feedback_settings() -> dict[str, Any]:
+    """返回消息反馈开关，前端据此决定是否展示赞同/不赞同/重试按钮。"""
+    return {"enabled": bool(agent_config.FEEDBACK_ENABLED)}
 
 
 @router.put("/settings/model")
-async def update_model_settings(body: ModelSettingsUpdate) -> dict[str, Any]:
-    """写入 .env 并热更新模型；API Key 仅在显式提供非空值时更新。"""
-    updates: dict[str, str] = {}
+async def update_model_settings(
+    body: ModelSettingsUpdate,
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """写入当前用户的模型配置并热更新；API Key 仅在显式提供非空值时更新。"""
+    uid = effective_user_id(user_id)
+    patch: dict[str, Any] = {}
     if body.model_name:
-        updates[ENV_KEY_MODEL] = body.model_name.strip()
+        patch["model_name"] = body.model_name.strip()
     if body.base_url is not None:
         value = body.base_url.strip()
         if value and not value.startswith(("http://", "https://")):
             raise HTTPException(status_code=422, detail="base_url 必须以 http:// 或 https:// 开头")
-        updates[ENV_KEY_BASE_URL] = value
+        patch["base_url"] = value
     if body.api_key:
-        updates[ENV_KEY_API] = body.api_key.strip()
+        patch["api_key"] = body.api_key.strip()
     if body.thinking_enabled is not None:
-        updates[ENV_KEY_THINKING] = "true" if body.thinking_enabled else "false"
+        patch["thinking_enabled"] = bool(body.thinking_enabled)
     if body.web_search_enabled is not None:
-        updates[ENV_KEY_WEB_SEARCH] = "true" if body.web_search_enabled else "false"
+        patch["web_search_enabled"] = bool(body.web_search_enabled)
     if body.context_limit is not None:
-        updates[ENV_KEY_CONTEXT_LIMIT] = str(int(body.context_limit))
-    if not updates:
+        patch["context_limit"] = int(body.context_limit)
+    if not patch:
         raise HTTPException(status_code=422, detail="没有需要更新的字段")
 
     try:
-        _update_env_file(updates)
+        user_data.update_user_settings(uid, {"model": patch})
     except OSError as error:
-        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
+        raise HTTPException(status_code=500, detail=f"写入用户配置失败: {error}") from error
 
-    # 热更新：重置模型单例 + 清空按用户缓存的 Agent 图
+    # 热更新：清空模型缓存，只重建该用户的 Agent 图。
     reload_model_config()
     from api.agent_loader import agent_loader
 
-    await agent_loader.reset_agents()
-    return {"ok": True, "updated": sorted(updates), "current": _current_state()}
+    await agent_loader.reset_user_agents(uid)
+    return {
+        "ok": True,
+        "updated": sorted(patch),
+        "current": _current_state(uid),
+    }
 
 
 # ============================================================
@@ -164,38 +175,31 @@ class ContextSettingsUpdate(BaseModel):
     heartbeat_seconds: int | None = Field(None, ge=2, le=60)
 
 
-def _context_state() -> dict[str, Any]:
-    """返回当前生效的压缩配置与推导出的预算数字。"""
+def _context_state(user_id: str) -> dict[str, Any]:
+    """返回该用户的压缩配置与推导出的预算数字。"""
     from agent.context.budget import build_budget
 
-    budget = build_budget()
-    return {
-        "enabled": bool(agent_config.CONTEXT_COMPACT_ENABLED),
-        "trigger": float(agent_config.CONTEXT_COMPACT_TRIGGER),
-        "hard": float(agent_config.CONTEXT_COMPACT_HARD),
-        "keep": float(agent_config.CONTEXT_COMPACT_KEEP),
-        "alert_threshold": float(agent_config.CONTEXT_ALERT_THRESHOLD),
-        "min_rounds": int(agent_config.CONTEXT_COMPACT_MIN_ROUNDS),
-        "cooldown": int(agent_config.CONTEXT_COMPACT_COOLDOWN),
-        "max_defer": int(agent_config.CONTEXT_COMPACT_MAX_DEFER),
-        "timeout_seconds": int(agent_config.CONTEXT_COMPACT_TIMEOUT),
-        "eval_enabled": bool(agent_config.CONTEXT_COMPACT_EVAL_ENABLED),
-        "eval_judge": bool(agent_config.CONTEXT_COMPACT_EVAL_JUDGE),
-        "heartbeat_seconds": int(agent_config.CONTEXT_COMPACT_HEARTBEAT),
-        "budget": budget.as_dict(),
-    }
+    data = user_data.context_settings(user_id)
+    data["budget"] = build_budget().as_dict()
+    return data
 
 
 @router.get("/settings/context")
-async def get_context_settings() -> dict[str, Any]:
-    """返回当前上下文压缩配置。"""
-    return _context_state()
+async def get_context_settings(
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """返回当前用户的上下文压缩配置。"""
+    return _context_state(effective_user_id(user_id))
 
 
 @router.put("/settings/context")
-async def update_context_settings(body: ContextSettingsUpdate) -> dict[str, Any]:
-    """写入 .env 并热重建 Agent 图，使新阈值立即生效。"""
-    current = _context_state()
+async def update_context_settings(
+    body: ContextSettingsUpdate,
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """写入当前用户的压缩配置并热重建该用户的 Agent 图。"""
+    uid = effective_user_id(user_id)
+    current = _context_state(uid)
     trigger = float(body.trigger if body.trigger is not None else current["trigger"])
     hard = float(body.hard if body.hard is not None else current["hard"])
     keep = float(body.keep if body.keep is not None else current["keep"])
@@ -205,45 +209,44 @@ async def update_context_settings(body: ContextSettingsUpdate) -> dict[str, Any]
             detail="必须满足 0 < keep < trigger < hard <= 1",
         )
 
-    updates: dict[str, str] = {}
+    patch: dict[str, Any] = {}
     if body.enabled is not None:
-        updates[ENV_KEY_CTX_ENABLED] = "true" if body.enabled else "false"
+        patch["enabled"] = bool(body.enabled)
     if body.trigger is not None:
-        updates[ENV_KEY_CTX_TRIGGER] = f"{trigger:g}"
+        patch["trigger"] = trigger
     if body.hard is not None:
-        updates[ENV_KEY_CTX_HARD] = f"{hard:g}"
+        patch["hard"] = hard
     if body.keep is not None:
-        updates[ENV_KEY_CTX_KEEP] = f"{keep:g}"
+        patch["keep"] = keep
     if body.alert_threshold is not None:
-        updates[ENV_KEY_CTX_ALERT] = f"{body.alert_threshold:g}"
+        patch["alert_threshold"] = body.alert_threshold
     if body.min_rounds is not None:
-        updates[ENV_KEY_CTX_MIN_ROUNDS] = str(body.min_rounds)
+        patch["min_rounds"] = body.min_rounds
     if body.cooldown is not None:
-        updates[ENV_KEY_CTX_COOLDOWN] = str(body.cooldown)
+        patch["cooldown"] = body.cooldown
     if body.max_defer is not None:
-        updates[ENV_KEY_CTX_MAX_DEFER] = str(body.max_defer)
+        patch["max_defer"] = body.max_defer
     if body.timeout_seconds is not None:
-        updates[ENV_KEY_CTX_TIMEOUT] = str(body.timeout_seconds)
+        patch["timeout_seconds"] = body.timeout_seconds
     if body.eval_enabled is not None:
-        updates[ENV_KEY_CTX_EVAL] = "true" if body.eval_enabled else "false"
+        patch["eval_enabled"] = bool(body.eval_enabled)
     if body.eval_judge is not None:
-        updates[ENV_KEY_CTX_JUDGE] = "true" if body.eval_judge else "false"
+        patch["eval_judge"] = bool(body.eval_judge)
     if body.heartbeat_seconds is not None:
-        updates[ENV_KEY_CTX_HEARTBEAT] = str(body.heartbeat_seconds)
-    if not updates:
+        patch["heartbeat_seconds"] = body.heartbeat_seconds
+    if not patch:
         raise HTTPException(status_code=422, detail="没有需要更新的字段")
 
     try:
-        _update_env_file(updates)
+        user_data.update_user_settings(uid, {"context": patch})
     except OSError as error:
-        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
+        raise HTTPException(status_code=500, detail=f"写入用户配置失败: {error}") from error
 
-    # 热更新：重载配置常量，并清空用户级 Agent 图（下一次请求按新阈值重建）。
     reload_model_config()
     from api.agent_loader import agent_loader
 
-    await agent_loader.reset_agents()
-    return {"ok": True, "updated": sorted(updates), "current": _context_state()}
+    await agent_loader.reset_user_agents(uid)
+    return {"ok": True, "updated": sorted(patch), "current": _context_state(uid)}
 
 
 # ============================================================
@@ -257,30 +260,30 @@ class ArchiveSettingsUpdate(BaseModel):
     days: int = Field(..., ge=0, le=3650)
 
 
-def _archive_state() -> dict[str, Any]:
-    raw = os.getenv(ENV_KEY_ARCHIVE_DAYS, "").strip()
-    try:
-        days = int(raw) if raw else DEFAULT_ARCHIVE_DAYS
-    except ValueError:
-        days = DEFAULT_ARCHIVE_DAYS
-    return {"days": max(days, 0)}
+def _archive_state(user_id: str) -> dict[str, Any]:
+    return user_data.archive_settings(user_id)
 
 
 @router.get("/settings/archive")
-async def get_archive_settings() -> dict[str, Any]:
-    """返回自动归档天数配置。"""
-    return _archive_state()
+async def get_archive_settings(
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """返回当前用户的自动归档天数配置。"""
+    return _archive_state(effective_user_id(user_id))
 
 
 @router.put("/settings/archive")
-async def update_archive_settings(body: ArchiveSettingsUpdate) -> dict[str, Any]:
-    """写入 .env 并同步运行中的环境变量，下一次进入对话页生效。"""
+async def update_archive_settings(
+    body: ArchiveSettingsUpdate,
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """写入当前用户的归档配置，下一次进入对话页生效。"""
+    uid = effective_user_id(user_id)
     try:
-        _update_env_file({ENV_KEY_ARCHIVE_DAYS: str(body.days)})
+        user_data.update_user_settings(uid, {"archive": {"days": body.days}})
     except OSError as error:
-        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
-    os.environ[ENV_KEY_ARCHIVE_DAYS] = str(body.days)
-    return {"ok": True, "current": _archive_state()}
+        raise HTTPException(status_code=500, detail=f"写入用户配置失败: {error}") from error
+    return {"ok": True, "current": _archive_state(uid)}
 
 
 # ============================================================
@@ -302,38 +305,41 @@ class SandboxSettingsUpdate(BaseModel):
     use_server_proxy: bool | None = None
 
 
-def _sandbox_state() -> dict[str, Any]:
-    """返回当前沙箱配置（密钥只回传是否已设置）。"""
-    configured = bool(agent_config.OPEN_SANDBOX_API_KEY)
-    if configured:
-        notice = ""
-    else:
+def _sandbox_state(user_id: str) -> dict[str, Any]:
+    """返回该用户的沙箱配置（密钥只回传是否已设置）。"""
+    settings = user_data.sandbox_settings(user_id)
+    configured = bool(settings["api_key"])
+    notice = ""
+    if not configured:
         notice = (
             "未配置沙箱服务，当前为项目工作区模式：Agent 只能读写项目文件，不能执行命令。"
         )
     return {
         "configured": configured,
         "mode": "sandbox" if configured else "local",
-        "host": agent_config.OPEN_SANDBOX_HOST,
-        "port": agent_config.OPEN_SANDBOX_PORT,
+        "host": settings["host"],
+        "port": settings["port"],
         "has_api_key": configured,
-        "image": agent_config.OPEN_SANDBOX_IMAGE,
-        "default_timeout_seconds": agent_config.OPEN_SANDBOX_DEFAULT_TIMEOUT_SECONDS,
-        "sandbox_timeout_seconds": agent_config.OPEN_SANDBOX_SANDBOX_TIMEOUT_SECONDS,
-        "prewarm_enabled": agent_config.OPEN_SANDBOX_PREWARM_ENABLED,
-        "use_server_proxy": agent_config.OPEN_SANDBOX_USE_SERVER_PROXY,
+        "image": settings["image"],
+        "default_timeout_seconds": settings["default_timeout_seconds"],
+        "sandbox_timeout_seconds": settings["sandbox_timeout_seconds"],
+        "prewarm_enabled": settings["prewarm_enabled"],
+        "use_server_proxy": settings["use_server_proxy"],
         "notice": notice,
     }
 
 
 @router.get("/settings/sandbox")
-async def get_sandbox_settings() -> dict[str, Any]:
-    """返回沙箱配置、执行模式、本机运行时探测与存储路径。"""
+async def get_sandbox_settings(
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """返回当前用户的沙箱配置、执行模式、本机运行时探测与存储路径。"""
     from api.agent_loader import agent_loader
 
+    uid = effective_user_id(user_id)
     local_env = detect_local_environment()
     return {
-        "sandbox": _sandbox_state(),
+        "sandbox": _sandbox_state(uid),
         "status": agent_loader.sandbox_status(),
         "local_env": local_env,
         "integrity": {
@@ -344,9 +350,7 @@ async def get_sandbox_settings() -> dict[str, Any]:
         "paths": {
             **agent_config.user_data_info(),
             "workspace_root": str(agent_config.USER_DATA_DIR),
-            "mcp_root": str(agent_config.MCP_ROOT),
-            "mcp_config": str(agent_config.MCP_CONFIG_PATH),
-            "skills_root": str(agent_config.SKILLS_ROOT),
+            **user_data.user_paths(uid),
         },
     }
 
@@ -360,43 +364,47 @@ async def get_sandbox_status() -> dict[str, Any]:
 
 
 @router.put("/settings/sandbox")
-async def update_sandbox_settings(body: SandboxSettingsUpdate) -> dict[str, Any]:
-    """写入 .env 并重建沙箱管理器；api_key 留空时保留原值。"""
-    updates: dict[str, str] = {}
+async def update_sandbox_settings(
+    body: SandboxSettingsUpdate,
+    user_id: str = Query("", max_length=64),
+) -> dict[str, Any]:
+    """写入当前用户的沙箱配置；api_key 留空时保留原值。"""
+    uid = effective_user_id(user_id)
+    patch: dict[str, Any] = {}
     if body.host is not None:
-        updates[ENV_KEY_SANDBOX_HOST] = body.host.strip() or "127.0.0.1"
+        patch["host"] = body.host.strip() or "127.0.0.1"
     if body.port is not None:
-        updates[ENV_KEY_SANDBOX_PORT] = str(body.port)
+        patch["port"] = body.port
     if body.clear_api_key:
-        updates[ENV_KEY_SANDBOX_API] = ""
+        patch["api_key"] = ""
     elif body.api_key:
-        updates[ENV_KEY_SANDBOX_API] = body.api_key.strip()
+        patch["api_key"] = body.api_key.strip()
     if body.image is not None:
-        updates[ENV_KEY_SANDBOX_IMAGE] = body.image.strip() or "myagent-sandbox:1"
+        patch["image"] = body.image.strip() or "myagent-sandbox:1"
     if body.default_timeout_seconds is not None:
-        updates[ENV_KEY_SANDBOX_CALL_TIMEOUT] = str(body.default_timeout_seconds)
+        patch["default_timeout_seconds"] = body.default_timeout_seconds
     if body.sandbox_timeout_seconds is not None:
-        updates[ENV_KEY_SANDBOX_LIFETIME] = str(body.sandbox_timeout_seconds)
+        patch["sandbox_timeout_seconds"] = body.sandbox_timeout_seconds
     if body.prewarm_enabled is not None:
-        updates[ENV_KEY_SANDBOX_PREWARM] = "true" if body.prewarm_enabled else "false"
+        patch["prewarm_enabled"] = bool(body.prewarm_enabled)
     if body.use_server_proxy is not None:
-        updates[ENV_KEY_SANDBOX_PROXY] = "true" if body.use_server_proxy else "false"
-    if not updates:
+        patch["use_server_proxy"] = bool(body.use_server_proxy)
+    if not patch:
         raise HTTPException(status_code=422, detail="没有需要更新的字段")
 
     try:
-        _update_env_file(updates)
+        user_data.update_user_settings(uid, {"sandbox": patch})
     except OSError as error:
-        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
+        raise HTTPException(status_code=500, detail=f"写入用户配置失败: {error}") from error
 
     reload_sandbox_config()
     from api.agent_loader import agent_loader
 
-    await agent_loader.reload_sandbox()
+    await agent_loader.reset_user_agents(uid)
     return {
         "ok": True,
-        "updated": sorted(updates),
-        "sandbox": _sandbox_state(),
+        "updated": sorted(patch),
+        "sandbox": _sandbox_state(uid),
         "status": agent_loader.sandbox_status(),
     }
 
@@ -405,13 +413,15 @@ async def update_sandbox_settings(body: SandboxSettingsUpdate) -> dict[str, Any]
 async def check_sandbox_port(
     host: str | None = None,
     port: int | None = None,
+    user_id: str = Query("", max_length=64),
 ) -> dict[str, Any]:
     """TCP 探测沙箱服务端口；只是连通性检查，不代表凭据有效。
 
-    可传入前端表单中的 host/port，未传时使用已保存配置。
+    可传入前端表单中的 host/port，未传时使用当前用户已保存配置。
     """
-    host = (host or "").strip() or agent_config.OPEN_SANDBOX_HOST
-    port = int(port or agent_config.OPEN_SANDBOX_PORT)
+    settings = user_data.sandbox_settings(effective_user_id(user_id))
+    host = (host or "").strip() or settings["host"]
+    port = int(port or settings["port"])
     try:
         with socket.create_connection((host, port), timeout=3):
             pass
@@ -422,7 +432,7 @@ async def check_sandbox_port(
             "port": port,
             "message": f"无法连接 {host}:{port}（{type(error).__name__}）。请确认 OpenSandbox 服务已启动、端口正确且未被防火墙拦截。",
         }
-    if not agent_config.OPEN_SANDBOX_API_KEY:
+    if not settings["api_key"]:
         return {
             "reachable": True,
             "host": host,

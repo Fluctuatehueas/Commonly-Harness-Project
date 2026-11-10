@@ -135,3 +135,53 @@ async def delete_trajectory(
     items = await store.asearch(namespace, limit=DEFAULT_EVENT_LIMIT)
     for item in items:
         await store.adelete(namespace, item.key)
+
+
+async def delete_trajectory_events_since(
+    store: Any,
+    *,
+    user_id: str,
+    thread_id: str,
+    cutoff: str,
+) -> int:
+    """删除 ``start`` 晚于 cutoff 的轨迹事件，用于撤回用户消息。
+
+    时间戳均为 UTC ISO 字符串，字典序与时间顺序一致。
+    """
+    if store is None or not user_id or not thread_id or not cutoff:
+        return 0
+    namespace = trajectory_namespace(user_id, thread_id)
+    try:
+        events = await list_trajectory_events(
+            store, user_id=user_id, thread_id=thread_id
+        )
+    except Exception:
+        logger.warning(
+            "读取轨迹事件失败，跳过撤回清理：user=%s thread=%s",
+            user_id,
+            thread_id,
+            exc_info=True,
+        )
+        return 0
+    deleted = 0
+    for event in events:
+        started = str(event.get("start", ""))
+        if not started or started <= cutoff:
+            continue
+        key = (
+            f"{event.get('run_id', '')}:"
+            f"{event.get('start', '')}:"
+            f"{event.get('id', '')}"
+        )
+        try:
+            await store.adelete(namespace, key)
+            deleted += 1
+        except Exception:
+            logger.warning(
+                "删除轨迹事件失败：user=%s thread=%s key=%s",
+                user_id,
+                thread_id,
+                key,
+                exc_info=True,
+            )
+    return deleted

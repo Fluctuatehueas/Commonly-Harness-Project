@@ -1,9 +1,10 @@
 <script setup lang="ts">
 // 工作台：轨道式模块导航 + 内陷卡片 + 全息列表 + 本机硬件信息
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { Close, View } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
-import AppIcon from '@/components/console/AppIcon.vue'
 import brandIcon from '@/assets/icon.png'
 import { ICONS } from '@/components/console/icons'
 import { NAV_ITEMS } from '@/mock/dashboard'
@@ -40,7 +41,6 @@ const workspace = useWorkspaceStore()
 const canvas = ref<HTMLCanvasElement | null>(null)
 const stage = ref<HTMLElement | null>(null)
 const online = ref<boolean | null>(null)
-const notice = ref('')
 const holoMode = ref<'sessions' | 'projects' | null>(null)
 const revealed = ref(false)
 const showHardware = ref(true)
@@ -49,7 +49,6 @@ const cpuLabel = ref('检测中…')
 const memoryLabel = ref('—')
 const gpuLabel = ref('检测中…')
 
-let noticeTimer: number | undefined
 let clockTimer: number | undefined
 let raf = 0
 let resizeHandler: (() => void) | null = null
@@ -62,6 +61,67 @@ let brandImage: HTMLImageElement | null = null
 const pointer = { x: -9999, y: -9999, active: false }
 
 const modules = computed(() => NAV_ITEMS.filter((item) => item.key !== 'home'))
+const moduleIntro = computed(
+  () => new Map(modules.value.map((item) => [item.key, item.description])),
+)
+
+// ---------- 悬停全息屏 + 打字机 ----------
+interface HoverInfo {
+  key: string
+  label: string
+  description: string
+  x: number
+  y: number
+}
+
+const hoverInfo = ref<HoverInfo | null>(null)
+const typedText = ref('')
+const typingDone = ref(false)
+const warping = ref(false)
+let typeTimer: number | undefined
+let warpTimer: number | undefined
+
+function stopTyping() {
+  if (typeTimer) window.clearInterval(typeTimer)
+  typeTimer = undefined
+}
+
+function startTyping(info: HoverInfo) {
+  stopTyping()
+  typedText.value = ''
+  typingDone.value = false
+  const text = info.description
+  let index = 0
+  typeTimer = window.setInterval(() => {
+    index = Math.min(text.length, index + 2)
+    typedText.value = text.slice(0, index)
+    if (index >= text.length) {
+      typingDone.value = true
+      stopTyping()
+    }
+  }, 24)
+}
+
+watch(
+  () => hoverInfo.value?.key,
+  (key) => {
+    if (!key || !hoverInfo.value) {
+      stopTyping()
+      typedText.value = ''
+      typingDone.value = false
+      return
+    }
+    startTyping(hoverInfo.value)
+  },
+)
+
+function triggerWarp() {
+  if (warping.value) return
+  warping.value = true
+  warpTimer = window.setTimeout(() => {
+    void router.push('/chat')
+  }, 720)
+}
 const visibleProjects = computed(() =>
   workspace.sorted.filter((project) => !project.is_default),
 )
@@ -71,8 +131,9 @@ const projectList = computed(() => visibleProjects.value.slice(0, 24))
 const statusLabel = computed(() =>
   online.value === null ? '检测后端…' : online.value ? '后端在线' : '后端离线',
 )
-const statusTone = computed(() =>
-  online.value === null ? 'checking' : online.value ? 'online' : 'offline',
+// 状态标签交给 el-tag，按后端连通性映射 EP 的语义色
+const statusTagType = computed<'success' | 'warning' | 'danger'>(() =>
+  online.value === null ? 'warning' : online.value ? 'success' : 'danger',
 )
 
 const holoTitle = computed(() =>
@@ -87,9 +148,8 @@ const latestProjectName = computed(
 )
 
 function flash(message: string) {
-  notice.value = message
-  if (noticeTimer) window.clearTimeout(noticeTimer)
-  noticeTimer = window.setTimeout(() => (notice.value = ''), 2600)
+  // 提示统一走 Element Plus 全局消息，不再维护自定义悬浮条与定时器
+  ElMessage.info(message)
 }
 
 function fmtTime(iso: string): string {
@@ -439,6 +499,13 @@ function mountOrbit() {
     raf = requestAnimationFrame(frame)
   }
 
+  function centerHit(x: number, y: number): boolean {
+    const size = Math.min(116, Math.max(92, Math.min(width, height) * 0.12))
+    const dx = x - width / 2
+    const dy = y - height / 2
+    return dx * dx + dy * dy <= (size * 0.72) ** 2
+  }
+
   resizeHandler = resize
   moveHandler = (event) => {
     const rect = el.getBoundingClientRect()
@@ -453,19 +520,33 @@ function mountOrbit() {
         // 进入气泡瞬间保留当前速度，由阻尼产生刹停惯性
         b.vx *= 0.6
         b.vy *= 0.6
+        hoverInfo.value = {
+          key: b.key,
+          label: b.label,
+          description: moduleIntro.value.get(b.key) || '',
+          // 全息屏锚定在气泡上方，并夹在舞台范围内，避免贴边溢出。
+          x: Math.min(Math.max(b.x, 170), Math.max(width - 170, 170)),
+          y: Math.max(b.y - b.h / 2 - 16, 150),
+        }
       }
       hoveredIndex = index
       el.style.cursor = 'pointer'
-    } else {
-      hoveredIndex = -1
-      el.style.cursor = 'crosshair'
+      return
     }
+
+    hoveredIndex = -1
+    hoverInfo.value = null
+    el.style.cursor = centerHit(pointer.x, pointer.y) ? 'pointer' : 'crosshair'
   }
   downHandler = (event) => {
-    if (event.button !== 0) return
+    if (event.button !== 0 || warping.value) return
     const rect = el.getBoundingClientRect()
     const x = event.clientX - rect.left
     const y = event.clientY - rect.top
+    if (centerHit(x, y)) {
+      triggerWarp()
+      return
+    }
     const index = hitTest(x, y, 20)
     const b = index >= 0 ? bubbles[index] : undefined
     if (b) {
@@ -475,6 +556,7 @@ function mountOrbit() {
   leaveHandler = () => {
     pointer.active = false
     hoveredIndex = -1
+    hoverInfo.value = null
     if (el) el.style.cursor = 'crosshair'
   }
 
@@ -506,8 +588,9 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf)
+  stopTyping()
+  if (warpTimer) window.clearTimeout(warpTimer)
   if (clockTimer) window.clearInterval(clockTimer)
-  if (noticeTimer) window.clearTimeout(noticeTimer)
   const el = canvas.value
   if (el && moveHandler) el.removeEventListener('pointermove', moveHandler)
   if (el && downHandler) el.removeEventListener('pointerdown', downHandler)
@@ -520,16 +603,70 @@ onBeforeUnmount(() => {
   <div class="app-shell">
     <TopNav>
       <template #actions>
-        <span class="orbit-status" :class="statusTone">
-          <i></i>{{ statusLabel }}
-        </span>
+        <!-- 状态指示改用 el-tag：语义色跟随 EP，省掉手写三套状态样式 -->
+        <el-tag
+          class="orbit-status"
+          :type="statusTagType"
+          effect="plain"
+          size="small"
+          round
+        >
+          <i class="status-dot"></i>{{ statusLabel }}
+        </el-tag>
       </template>
     </TopNav>
 
     <main ref="stage" class="orbit-stage">
       <canvas ref="canvas" class="orbit-canvas" aria-hidden="true"></canvas>
 
-      <p v-if="notice" class="orbit-notice mono">{{ notice }}</p>
+      <!-- 中央入口：可点击 / 可键盘聚焦，点击后播放跃迁动画再进入对话 -->
+      <button
+        class="center-orb-hit"
+        type="button"
+        aria-label="进入对话"
+        title="进入对话"
+        @click="triggerWarp"
+      ></button>
+
+      <!-- 模块悬停：全息屏 + 打字机简介 -->
+      <Transition name="holo">
+        <aside
+          v-if="hoverInfo"
+          class="holo-tip"
+          :style="{
+            left: `${hoverInfo.x}px`,
+            top: `${hoverInfo.y}px`,
+          }"
+        >
+          <span class="holo-corner tl"></span>
+          <span class="holo-corner tr"></span>
+          <span class="holo-corner bl"></span>
+          <span class="holo-corner br"></span>
+          <header class="holo-tip-head">
+            <span class="holo-scan"></span>
+            <strong>{{ hoverInfo.label }}</strong>
+            <code>MODULE // {{ hoverInfo.key.toUpperCase() }}</code>
+          </header>
+          <p class="holo-typing">
+            {{ typedText }}<i v-if="!typingDone" class="holo-caret"></i>
+          </p>
+          <footer class="holo-tip-foot">
+            <span>HOLOGRAPHIC MODULE BRIEF</span>
+            <span>点击气泡进入</span>
+          </footer>
+        </aside>
+      </Transition>
+
+      <!-- 中央按钮点击：环形跃迁过渡 -->
+      <Transition name="warp">
+        <div v-if="warping" class="warp-overlay" aria-hidden="true">
+          <span class="warp-ring r1"></span>
+          <span class="warp-ring r2"></span>
+          <span class="warp-ring r3"></span>
+          <span class="warp-core"></span>
+          <span class="warp-label">ENTERING CONVERSATION</span>
+        </div>
+      </Transition>
 
       <!-- 左下：内陷卡片 + ComboBox 式全息列表 -->
       <div v-if="holoMode" class="combo-mask" @click="holoMode = null"></div>
@@ -541,19 +678,24 @@ onBeforeUnmount(() => {
                 <span class="holo-kicker mono">HOLO ARCHIVE</span>
                 <h2>{{ holoTitle }}</h2>
               </div>
-              <button type="button" class="holo-close" title="关闭" @click="holoMode = null">
-                <AppIcon name="close" :size="14" />
-              </button>
+              <el-button
+                class="holo-close"
+                :icon="Close"
+                circle
+                size="small"
+                title="关闭"
+                @click="holoMode = null"
+              />
             </header>
             <div class="holo-grid" aria-hidden="true"></div>
 
             <ul v-if="holoMode === 'sessions'" class="holo-list">
               <li v-for="item in recentSessions" :key="item.thread_id">
-                <button type="button" @click="openSession(item.thread_id)">
+                <el-button class="holo-row" text @click="openSession(item.thread_id)">
                   <span class="holo-index mono">{{ item.thread_id.slice(0, 6) }}</span>
                   <span class="holo-main">{{ item.title || '新对话' }}</span>
                   <span class="holo-meta mono">{{ fmtTime(item.updated_at) }}</span>
-                </button>
+                </el-button>
               </li>
               <li v-if="recentSessions.length === 0" class="holo-empty">
                 {{ sessions.offline ? '后端离线，暂时读不到对话' : '还没有对话，去对话页发一条消息' }}
@@ -562,11 +704,11 @@ onBeforeUnmount(() => {
 
             <ul v-else class="holo-list">
               <li v-for="project in projectList" :key="project.id">
-                <button type="button" @click="openProject(project.id)">
+                <el-button class="holo-row" text @click="openProject(project.id)">
                   <span class="holo-index mono">{{ project.marker_state === 'ok' ? 'OK' : '!' }}</span>
                   <span class="holo-main">{{ project.name }}</span>
                   <span class="holo-meta mono">{{ project.path }}</span>
-                </button>
+                </el-button>
               </li>
               <li v-if="projectList.length === 0" class="holo-empty">
                 {{ workspace.error ? workspace.error : '还没有项目，去侧边栏新建或打开一个目录' }}
@@ -594,9 +736,15 @@ onBeforeUnmount(() => {
         <div v-if="showHardware" class="depth-card hardware-card">
           <header class="hw-head">
             <span class="card-kicker">系统状态</span>
-            <button class="hw-toggle" type="button" title="隐藏硬件信息" @click="showHardware = false">
-              <AppIcon name="close" :size="11" />
-            </button>
+            <el-button
+              class="hw-toggle"
+              :icon="Close"
+              text
+              circle
+              size="small"
+              title="隐藏硬件信息"
+              @click="showHardware = false"
+            />
           </header>
           <div class="hw-row">
             <span>时间</span>
@@ -615,10 +763,15 @@ onBeforeUnmount(() => {
             <strong :title="gpuLabel">{{ gpuLabel }}</strong>
           </div>
         </div>
-        <button v-else class="depth-card hw-collapsed" type="button" @click="showHardware = true">
-          <AppIcon name="eye" :size="13" />
-          <span>显示硬件信息</span>
-        </button>
+        <el-button
+          v-else
+          class="hw-collapsed"
+          :icon="View"
+          text
+          @click="showHardware = true"
+        >
+          显示硬件信息
+        </el-button>
       </div>
     </main>
   </div>
@@ -644,54 +797,44 @@ onBeforeUnmount(() => {
   cursor: crosshair;
 }
 
+.center-orb-hit {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
+  width: clamp(92px, 12vmin, 116px);
+  height: clamp(92px, 12vmin, 116px);
+  padding: 0;
+  transform: translate(-50%, -50%);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+}
+
+.center-orb-hit:focus-visible {
+  outline: 1px solid var(--accent-cyan);
+  outline-offset: 6px;
+}
+
+/* el-tag 自带描边与语义色，这里只保留紧凑尺寸与间距 */
 .orbit-status {
+  flex: none;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.orbit-status :deep(.el-tag__content) {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex: none;
-  padding: 3px 9px;
-  font-size: 10.5px;
-  white-space: nowrap;
-  color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
 }
 
-.orbit-status i {
+.status-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: currentColor;
-}
-
-.orbit-status.online {
-  color: var(--accent-cyan);
-  border-color: rgba(55, 208, 196, 0.32);
-}
-
-.orbit-status.offline {
-  color: var(--danger);
-  border-color: rgba(226, 96, 94, 0.32);
-}
-
-.orbit-status.checking {
-  color: var(--amber);
-}
-
-.orbit-notice {
-  position: absolute;
-  top: 18px;
-  left: 50%;
-  z-index: 10;
-  transform: translateX(-50%);
-  margin: 0;
-  padding: 7px 16px;
-  font-size: 10.5px;
-  color: var(--accent-cyan);
-  border: 1px solid rgba(55, 208, 196, 0.3);
-  border-radius: 999px;
-  background: rgba(6, 14, 26, 0.66);
-  backdrop-filter: blur(10px);
 }
 
 /* ---------- 内陷卡片 ---------- */
@@ -822,20 +965,9 @@ onBeforeUnmount(() => {
   gap: 10px;
 }
 
+/* el-button 的尺寸/悬停底色由主题桥接统一提供，这里只约束占位 */
 .hw-toggle {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  color: var(--text-3);
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-}
-
-.hw-toggle:hover {
-  color: var(--text-1);
-  background: rgba(126, 154, 198, 0.1);
+  flex: none;
 }
 
 .hw-row {
@@ -860,13 +992,8 @@ onBeforeUnmount(() => {
 }
 
 .hw-collapsed {
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-  width: auto;
-  padding: 12px 16px;
+  flex: none;
   font-size: 11.5px;
-  color: var(--text-2);
 }
 
 /* ---------- ComboBox 式全息列表 ---------- */
@@ -962,19 +1089,7 @@ onBeforeUnmount(() => {
 }
 
 .holo-close {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  color: var(--text-2);
-  border: 1px solid rgba(55, 208, 196, 0.3);
-  border-radius: 6px;
-  background: transparent;
-}
-
-.holo-close:hover {
-  color: #dffaff;
-  border-color: rgba(55, 208, 196, 0.7);
+  flex: none;
 }
 
 .holo-list {
@@ -991,21 +1106,29 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid rgba(55, 208, 196, 0.1);
 }
 
-.holo-list button {
+/* 列表行改用 el-button(text)：保留整行可点击，网格布局与原来一致 */
+.holo-list .holo-row {
   display: grid;
   grid-template-columns: 58px minmax(0, 1fr) auto;
   gap: 14px;
   align-items: center;
   width: 100%;
+  height: auto;
   padding: 12px 6px;
+  justify-content: normal;
+  font-weight: 400;
+  font-size: 13px;
   text-align: left;
   color: var(--text-1);
-  border: 0;
-  background: transparent;
+  border-radius: 0;
 }
 
-.holo-list button:hover {
-  background: rgba(55, 208, 196, 0.07);
+/*
+  el-button 会给默认插槽再包一层 <span>，用 display:contents 让它“消失”，
+  三个子元素就能直接参与上面的网格布局。
+*/
+.holo-list .holo-row :deep(> span) {
+  display: contents;
 }
 
 .holo-index {
@@ -1047,6 +1170,228 @@ onBeforeUnmount(() => {
 .combo-leave-to {
   opacity: 0;
   transform: translateY(16px) scale(0.98);
+}
+
+/* ---------- 模块悬停全息屏 ---------- */
+.holo-tip {
+  position: absolute;
+  z-index: 9;
+  width: min(320px, 76vw);
+  padding: 14px 16px 12px;
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+  border: 1px solid rgba(55, 208, 196, 0.55);
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(55, 208, 196, 0.06) 0,
+      rgba(55, 208, 196, 0.06) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(145deg, rgba(5, 26, 38, 0.96), rgba(3, 10, 22, 0.92));
+  box-shadow:
+    0 0 0 1px rgba(55, 208, 196, 0.12),
+    0 22px 60px rgba(0, 0, 0, 0.62),
+    inset 0 0 40px rgba(55, 208, 196, 0.08);
+  clip-path: polygon(
+    0 10px, 10px 0, calc(100% - 18px) 0, 100% 18px,
+    100% calc(100% - 10px), calc(100% - 10px) 100%,
+    18px 100%, 0 calc(100% - 18px)
+  );
+}
+
+.holo-tip::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  width: 12px;
+  height: 12px;
+  transform: translateX(-50%) rotate(45deg);
+  border-right: 1px solid rgba(55, 208, 196, 0.55);
+  border-bottom: 1px solid rgba(55, 208, 196, 0.55);
+  background: rgba(4, 16, 28, 0.96);
+}
+
+.holo-corner {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-color: rgba(160, 240, 255, 0.9);
+  border-style: solid;
+  border-width: 0;
+}
+
+.holo-corner.tl { top: 5px; left: 5px; border-top-width: 1px; border-left-width: 1px; }
+.holo-corner.tr { top: 5px; right: 5px; border-top-width: 1px; border-right-width: 1px; }
+.holo-corner.bl { bottom: 5px; left: 5px; border-bottom-width: 1px; border-left-width: 1px; }
+.holo-corner.br { bottom: 5px; right: 5px; border-bottom-width: 1px; border-right-width: 1px; }
+
+.holo-tip-head {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 7px;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(55, 208, 196, 0.28);
+}
+
+.holo-tip-head strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: #dffaff;
+  letter-spacing: 0.02em;
+}
+
+.holo-tip-head code {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  color: rgba(55, 208, 196, 0.7);
+  letter-spacing: 0.08em;
+}
+
+.holo-scan {
+  position: absolute;
+  top: 0;
+  left: -40%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(160, 240, 255, 0.28), transparent);
+  animation: holo-scan 2.4s linear infinite;
+}
+
+@keyframes holo-scan {
+  to { left: 110%; }
+}
+
+.holo-typing {
+  margin: 9px 0 8px;
+  min-height: 54px;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.holo-caret {
+  display: inline-block;
+  width: 6px;
+  height: 12px;
+  margin-left: 2px;
+  vertical-align: -1px;
+  background: rgba(160, 240, 255, 0.9);
+  box-shadow: 0 0 8px rgba(55, 208, 196, 0.8);
+  animation: caret-blink 0.82s steps(1) infinite;
+}
+
+@keyframes caret-blink {
+  50% { opacity: 0; }
+}
+
+.holo-tip-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 7px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  color: rgba(126, 154, 198, 0.65);
+  border-top: 1px solid rgba(55, 208, 196, 0.16);
+}
+
+.holo-enter-active,
+.holo-leave-active {
+  transition: opacity 0.18s ease, transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.holo-enter-from,
+.holo-leave-to {
+  opacity: 0;
+  transform: translate(-50%, calc(-100% + 8px)) scale(0.98);
+}
+
+/* ---------- 中央按钮跃迁动画 ---------- */
+.warp-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 50%, rgba(6, 30, 42, 0.5), rgba(2, 6, 14, 0.86));
+  animation: warp-bg 0.72s ease forwards;
+}
+
+@keyframes warp-bg {
+  from { opacity: 0; }
+  35% { opacity: 1; }
+  to { opacity: 1; }
+}
+
+.warp-ring {
+  position: absolute;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  border: 1px solid rgba(160, 240, 255, 0.9);
+  box-shadow: 0 0 30px rgba(55, 208, 196, 0.55), inset 0 0 26px rgba(55, 208, 196, 0.25);
+  animation: warp-ring 0.72s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.warp-ring.r2 { animation-delay: 0.07s; border-color: rgba(91, 140, 255, 0.8); }
+.warp-ring.r3 { animation-delay: 0.14s; border-color: rgba(55, 208, 196, 0.5); }
+
+@keyframes warp-ring {
+  from { transform: scale(0.2); opacity: 0.1; }
+  40% { opacity: 1; }
+  to { transform: scale(9); opacity: 0; }
+}
+
+.warp-core {
+  position: absolute;
+  width: 110px;
+  height: 110px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(160, 240, 255, 0.95), rgba(55, 208, 196, 0.35) 45%, transparent 72%);
+  animation: warp-core 0.72s ease forwards;
+}
+
+@keyframes warp-core {
+  from { transform: scale(0.4); opacity: 0.3; }
+  45% { transform: scale(1.25); opacity: 1; }
+  to { transform: scale(0.1); opacity: 0; }
+}
+
+.warp-label {
+  position: absolute;
+  margin-top: 210px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.32em;
+  color: rgba(160, 240, 255, 0.9);
+  text-shadow: 0 0 12px rgba(55, 208, 196, 0.8);
+  animation: warp-label 0.72s ease forwards;
+}
+
+@keyframes warp-label {
+  from { opacity: 0; transform: translateY(6px); }
+  40% { opacity: 1; transform: none; }
+  to { opacity: 0; transform: translateY(-6px); }
+}
+
+.warp-enter-active,
+.warp-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.warp-enter-from,
+.warp-leave-to {
+  opacity: 0;
 }
 
 @media (max-width: 900px) {

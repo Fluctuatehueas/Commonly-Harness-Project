@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -36,6 +36,8 @@ class HarnessContext:
     # 自检是否失败以及风险等级。进程内上下文，不落库。
     evolution_experience_injected: bool = False
     evolution_experience_ids: str = ""
+    # 本轮命中的经验条目（JSON 字符串），仅用于前端轨迹标签渲染，不落库。
+    evolution_experience_items: str = ""
     evolution_verification_failed: bool = False
     evolution_verification_reason: str = ""
     evolution_risk_tier: str = ""
@@ -78,6 +80,12 @@ class ChatRequest(BaseModel):
         default_factory=list,
         description="上下文附件 ID 列表（先调用 /context/upload 获得）",
     )
+    # 任务流显式指定 / 中途接管参数（可选，见 src/task_flow）。
+    flow_id: Optional[str] = Field(None, description="显式指定的任务流 ID")
+    entry_step: Optional[str] = Field(None, description="中途接管入口步骤 ID")
+    user_state: str = Field("", description="中途接管时用户已完成部分的产出描述")
+    # 用户选择的 MyAgent 档案；为空时沿用会话绑定，再回退默认 Agent。
+    agent_id: Optional[str] = Field(None, description="执行本轮任务的 MyAgent ID")
 
     @model_validator(mode="after")
     def set_username(self) -> "ChatRequest":
@@ -110,6 +118,66 @@ class ResumeChatRequest(BaseModel):
         """未显式提供用户名时退回用户 ID。"""
         self.username = self.username or self.user_id
         return self
+
+
+class FeedbackRequest(BaseModel):
+    """一条消息级反馈：赞同 / 不赞同 / 取消。"""
+
+    user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
+    thread_id: str = Field(..., min_length=1, description="会话 ID")
+    message_id: str = Field(..., min_length=1, description="稳定的助手消息 ID")
+    action: Literal["like", "dislike", "none"] = Field(..., description="反馈动作")
+    user_excerpt: str = Field("", max_length=400, description="对应用户消息摘要")
+    answer_excerpt: str = Field("", max_length=800, description="对应回答摘要")
+    meta: Optional[Dict[str, Any]] = Field(
+        None, description="工具名、回答长度等轻量旁证"
+    )
+
+
+class FeedbackResponse(BaseModel):
+    """反馈写入结果。"""
+
+    message_id: str
+    action: str
+
+
+class RetryChatRequest(BaseModel):
+    """覆盖式重新生成最后一条最终回答。"""
+
+    user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
+    username: Optional[str] = Field(None, min_length=1, description="用户名")
+    tenant_id: str = Field("", description="部署级租户标识")
+    message_id: Optional[str] = Field(
+        None, description="可选：前端展示的被替换消息 ID，用于一致性校验"
+    )
+
+    @model_validator(mode="after")
+    def set_username(self) -> "RetryChatRequest":
+        """未显式提供用户名时退回用户 ID。"""
+        self.username = self.username or self.user_id
+        return self
+
+
+class WithdrawChatRequest(BaseModel):
+    """撤回最新一条用户消息；始终作用于当前会话的最新用户消息。"""
+
+    user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
+    username: Optional[str] = Field(None, min_length=1, description="用户名")
+    tenant_id: str = Field("", description="部署级租户标识")
+
+    @model_validator(mode="after")
+    def set_username(self) -> "WithdrawChatRequest":
+        """未显式提供用户名时退回用户 ID。"""
+        self.username = self.username or self.user_id
+        return self
+
+
+class WithdrawChatResponse(BaseModel):
+    """撤回结果：返回被撤回的用户原文，供发送框回填。"""
+
+    thread_id: str
+    content: str = ""
+    session_usage: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AsyncTaskStatusResponse(BaseModel):
@@ -148,6 +216,8 @@ class Message(BaseModel):
     async_task_id: Optional[str] = Field(None, description="可继续轮询的远程异步任务 ID")
     # 助手消息：本轮最终回答的 Token 消耗（来自 TokenUsageMiddleware 统计）。
     tokens: Optional[Dict[str, int]] = Field(None, description="单轮 Token 消耗 input/output/total")
+    # 助手消息：用户对这条回答的最新反馈，供刷新后回显。
+    feedback: Optional[str] = Field(None, description="like / dislike / null")
 
 
 class Session(BaseModel):
@@ -164,6 +234,10 @@ class Session(BaseModel):
     # 会话绑定的集成 MCP 服务 ID；null 表示普通会话。
     integration_server_id: Optional[str] = Field(
         None, description="所属集成项目（自定义 MCP）的 server_id"
+    )
+    # 会话绑定的 MyAgent 档案 ID；默认会话为 default。
+    agent_id: Optional[str] = Field(
+        None, description="创建会话时选择的 MyAgent ID"
     )
     archived: bool = Field(False, description="是否已归档（软删除）")
     archived_at: Optional[datetime] = Field(None, description="归档时间；未归档为 null")

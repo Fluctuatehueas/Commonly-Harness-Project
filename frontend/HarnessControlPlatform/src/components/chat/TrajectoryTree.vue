@@ -27,13 +27,45 @@ const nodes = computed<TreeNode[]>(() => {
   for (const node of all) {
     if (node.msg.toolCallId) byToolCallId.set(node.msg.toolCallId, node)
   }
+
   const roots: TreeNode[] = []
+  // 记录当前已经出现过的委派节点，用于给缺失 parent 的子 Agent 事件补层级。
+  const delegations: TreeNode[] = []
+
   for (const node of all) {
-    const parentId = node.msg.parentToolCallId
-    const parent = parentId ? byToolCallId.get(parentId) : undefined
-    if (parent) parent.children.push(node)
-    else roots.push(node)
+    const msg = node.msg
+    const isDelegation = msg.kind === 'tool' && msg.category === 'delegation'
+    const explicitParent = msg.parentToolCallId
+      ? byToolCallId.get(msg.parentToolCallId)
+      : undefined
+
+    if (explicitParent && explicitParent !== node) {
+      explicitParent.children.push(node)
+    } else if (isDelegation) {
+      roots.push(node)
+    } else if (msg.source && msg.source !== 'main' && msg.kind !== 'user') {
+      // 后端偶尔拿不到 parent_tool_call_id（并发委派、事件顺序错位）：
+      // 按子 Agent 名称找最近的委派节点，找不到就挂到最近的委派节点下，
+      // 避免子 Agent 的工具和输出全部平铺在根层。
+      const sameAgent = [...delegations]
+        .reverse()
+        .find((item) => item.msg.subagentName === msg.source)
+      const target = sameAgent || delegations[delegations.length - 1]
+      if (target) target.children.push(node)
+      else roots.push(node)
+    } else {
+      roots.push(node)
+    }
+
+    if (isDelegation) delegations.push(node)
   }
+
+  // 到达时间排序：同一节点下的子项保持真实时间顺序。
+  const sortChildren = (list: TreeNode[]) => {
+    list.sort((a, b) => (a.msg.at || 0) - (b.msg.at || 0))
+    for (const item of list) sortChildren(item.children)
+  }
+  sortChildren(roots)
   return roots
 })
 
@@ -52,7 +84,10 @@ const headerLabel = computed(() => {
   return value ? `本轮耗时 ${value}` : '本轮轨迹'
 })
 
-const stepLabel = computed(() => `${props.items.length} 步`)
+// 经验 / 任务流标记只是过程渲染，不计入轨迹步数。
+const stepLabel = computed(
+  () => `${props.items.filter((item) => item.kind !== 'marker').length} 步`,
+)
 </script>
 
 <template>

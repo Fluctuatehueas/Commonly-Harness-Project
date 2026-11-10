@@ -106,32 +106,35 @@ class MCPRuntime:
 
     # ---------- 生命周期 ----------
 
-    async def initialize(self) -> None:
-        """加载配置与 LKG 缓存；建立状态机；不连接任何服务。"""
-        if self._initialized:
+    def ensure_loaded_sync(self) -> None:
+        """同步加载配置与 LKG 缓存。
+
+        每个用户拥有独立的 ``MCPRuntime``；首次访问时同步读取该用户的
+        ``servers.json``，让列表/详情等只读接口无需等待异步初始化。
+        """
+        if self._configured:
             return
         self._configured = True
         try:
-            self._config = await asyncio.to_thread(self.config_store.load)
+            self._config = self.config_store.load()
             self._config_error = ""
         except McpError as error:
             self._config_error = error.message
-            self.observer.record(
-                "mcp.config.write",
-                level="error",
-                message=error.message,
-                config_error=True,
-            )
             logger.error("MCP 配置加载失败，模块以降级状态启动: %s", error)
             self._config = McpConfig(version=2, servers={}, main_servers=[], raw={})
         except Exception as error:  # noqa: BLE001
             self._config_error = str(error)
             logger.exception("MCP 配置加载异常，模块以降级状态启动")
             self._config = McpConfig(version=2, servers={}, main_servers=[], raw={})
-
         self._rebuild_states(load_cache=True)
         self.pool.policy = self.config_store.defaults
         self._structure_key = self._compute_structure_key()
+
+    async def initialize(self) -> None:
+        """加载配置与 LKG 缓存；建立状态机；不连接任何服务。"""
+        if self._initialized:
+            return
+        self.ensure_loaded_sync()
         self.pool.start()
         self._health_task = asyncio.create_task(
             self._health_loop(), name="mcp-health-loop"
@@ -485,16 +488,23 @@ class MCPRuntime:
                 visible.append(server_id)
         return self.registry.tools_for_servers(visible)
 
-    def main_tool_scope(self, integration_server_id: str | None = None) -> list[str]:
+    def main_tool_scope(
+        self,
+        integration_server_id: str | None = None,
+        server_ids: list[str] | None = None,
+    ) -> list[str]:
         """计算主 Agent 可见的 MCP 服务范围。
 
-        非集成 MCP 始终作为公共能力；集成 MCP 只有绑定该后端的会话才可见，
-        避免一个后端会话误调用另一个后端的业务工具。
+        - 非集成 MCP 作为公共能力；集成 MCP 只对绑定该后端的会话可见。
+        - ``server_ids`` 来自 MyAgent 档案的 MCP 绑定；为空表示全部公共 MCP。
         """
+        allowed = {item for item in (server_ids or []) if item}
         scope: list[str] = []
         for server_id in self.main_server_ids():
             config = self._config.servers.get(server_id)
             if config is None or config.integration:
+                continue
+            if allowed and server_id not in allowed:
                 continue
             scope.append(server_id)
         if integration_server_id:
@@ -504,10 +514,12 @@ class MCPRuntime:
         return list(dict.fromkeys(scope))
 
     async def tools_for_main_agent(
-        self, integration_server_id: str | None = None,
+        self,
+        integration_server_id: str | None = None,
+        server_ids: list[str] | None = None,
     ) -> list[Any]:
         return await self.tools_for_servers(
-            self.main_tool_scope(integration_server_id)
+            self.main_tool_scope(integration_server_id, server_ids)
         )
 
     # ---------- 调用 ----------
@@ -657,12 +669,18 @@ class MCPRuntime:
 
     # ---------- 管理操作 ----------
 
+    async def _ensure_initialized(self) -> None:
+        if not self._initialized:
+            await self.initialize()
+
     async def probe(self, server_id: str) -> dict[str, Any]:
+        await self._ensure_initialized()
         result = await self._discover(server_id, force=True, reason="probe")
         detail = self.detail(server_id)
         return {"probe": result, "server": detail}
 
     async def restart(self, server_id: str) -> dict[str, Any]:
+        await self._ensure_initialized()
         config = self._config.servers.get(server_id)
         runtime = self._states.get(server_id)
         if config is None or runtime is None:
@@ -689,6 +707,7 @@ class MCPRuntime:
         return self.detail(server_id) or {}
 
     async def enable(self, server_id: str, enabled: bool) -> dict[str, Any]:
+        await self._ensure_initialized()
         old_config = self._config.servers.get(server_id)
         self._config = await asyncio.to_thread(
             self.config_store.set_enabled, server_id, enabled
@@ -731,6 +750,7 @@ class MCPRuntime:
         return self.detail(server_id) or {}
 
     async def upsert_server(self, server_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        await self._ensure_initialized()
         old_config = self._config.servers.get(server_id)
         old_names = self.registry.exposed_names()
         self._config = await asyncio.to_thread(
@@ -806,6 +826,7 @@ class MCPRuntime:
         """导入一组厂商配置：一次性写入 JSON，并同步运行时状态。"""
         if not entries:
             return []
+        await self._ensure_initialized()
         old_key = self._structure_key
         old_configs = dict(self._config.servers)
         old_names = self.registry.exposed_names()
@@ -870,6 +891,7 @@ class MCPRuntime:
         ]
 
     async def delete_server(self, server_id: str) -> None:
+        await self._ensure_initialized()
         old_config = self._config.servers.get(server_id)
         self._config = await asyncio.to_thread(
             self.config_store.delete_server, server_id
@@ -893,6 +915,7 @@ class MCPRuntime:
 
     async def reload_from_disk(self) -> None:
         """配置文件变化后重新加载；不建立连接。"""
+        await self._ensure_initialized()
         old_key = self._structure_key
         old_configs = self._config.servers
         try:
@@ -1047,4 +1070,63 @@ class MCPRuntime:
             await result
 
 
-mcp_runtime = MCPRuntime()
+# ============================================================
+# 按用户隔离的运行时池
+# ============================================================
+
+_USER_RUNTIMES: dict[str, MCPRuntime] = {}
+_STRUCTURE_HANDLER: Any = None
+
+
+def get_mcp_runtime(user_id: str | None = None) -> MCPRuntime:
+    """返回指定用户的 MCP 运行时；首次访问时读取该用户的独立配置。"""
+    from agent.identity import current_user_id, safe_user_id
+    from agent.user_data import user_mcp_config_path
+
+    uid = safe_user_id(user_id or current_user_id())
+    runtime = _USER_RUNTIMES.get(uid)
+    if runtime is None:
+        runtime = MCPRuntime(config_path=user_mcp_config_path(uid))
+        runtime.ensure_loaded_sync()
+        runtime.set_structure_handler(_STRUCTURE_HANDLER)
+        _USER_RUNTIMES[uid] = runtime
+        logger.info("已创建用户级 MCP 运行时：user=%s", uid)
+    return runtime
+
+
+def set_mcp_structure_handler(handler: Any) -> None:
+    """设置全局结构变更回调，并同步到所有已创建的用户运行时。"""
+    global _STRUCTURE_HANDLER
+    _STRUCTURE_HANDLER = handler
+    for runtime in _USER_RUNTIMES.values():
+        runtime.set_structure_handler(handler)
+
+
+def all_mcp_runtimes() -> list[MCPRuntime]:
+    return list(_USER_RUNTIMES.values())
+
+
+async def shutdown_mcp_runtimes() -> None:
+    """服务停止时关闭所有用户运行时，释放子进程与后台任务。"""
+    for runtime in list(_USER_RUNTIMES.values()):
+        try:
+            await runtime.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.warning("关闭用户级 MCP 运行时失败", exc_info=True)
+    _USER_RUNTIMES.clear()
+
+
+class _MCPRuntimeProxy:
+    """向后兼容的代理：按当前请求身份转发到用户级运行时。"""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_mcp_runtime(), name)
+
+    def set_structure_handler(self, handler: Any) -> None:
+        set_mcp_structure_handler(handler)
+
+    async def get_runtime(self) -> MCPRuntime:
+        return get_mcp_runtime()
+
+
+mcp_runtime = _MCPRuntimeProxy()
