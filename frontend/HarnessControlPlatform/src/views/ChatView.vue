@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 首页：对话测试（顶栏菜单 + 左侧会话栏 + SSE 流式 + 文件预览）
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { InputInstance } from 'element-plus'
 import {
@@ -18,14 +18,21 @@ import {
 } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
+import type { IconName } from '@/components/console/icons'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
 import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
+import {
+  TRAJECTORY_REGISTRY,
+  type TrajectoryRegistry,
+} from '@/components/chat/trajectoryTypes'
 import ExecutionCard from '@/components/taskflow/ExecutionCard.vue'
+import SchedulerPlanCard from '@/components/scheduler/SchedulerPlanCard.vue'
 import RoundLimitToast from '@/components/chat/RoundLimitToast.vue'
+import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import { API_BASE } from '@/api/client'
 import {
   deleteContextFile,
@@ -37,7 +44,12 @@ import {
   type ContextFormats,
 } from '@/api/context'
 import { fetchTrajectory } from '@/api/trajectory'
-import { categoryOf, useChatStore, type ChatMsg } from '@/stores/chat'
+import {
+  categoryOf,
+  useChatStore,
+  type ChatMsg,
+  type TerminateReason,
+} from '@/stores/chat'
 import { USER_ID, useSessionStore } from '@/stores/sessions'
 import { useDisplayStore } from '@/stores/display'
 import { useFileStore } from '@/stores/files'
@@ -52,6 +64,46 @@ const sessions = useSessionStore()
 const files = useFileStore()
 const settings = useSettingsStore()
 const agents = useAgentStore()
+
+// 轨迹节点索引：TrajectoryNode 挂载时登记，顶部粘性折叠条据此定位并代理收起。
+const trajectoryRegistry: TrajectoryRegistry = new Map()
+provide(TRAJECTORY_REGISTRY, trajectoryRegistry)
+
+// 当前 Agent 可用的组；只有组长组能作为会话入口（组员由组长委派）。
+const groupOptions = computed(() =>
+  agents
+    .groupsOf(chat.selectedAgentId)
+    .map((group) => ({
+      value: group.group_id,
+      label: `${group.name}${group.leader_agent_id === chat.selectedAgentId ? ' · 组长' : ' · 组员'}`,
+    })),
+)
+
+// 换 Agent 后只清理失效的组选择；不自动选组，新会话默认以独立 Agent 执行。
+function syncGroupForAgent() {
+  // 组列表还没加载完时不做判断，否则会把会话绑定的组误清空。
+  if (!agents.groupsLoaded) return
+  const available = groupOptions.value
+  if (
+    chat.selectedGroupId &&
+    !available.some((item) => item.value === chat.selectedGroupId)
+  ) {
+    chat.selectedGroupId = ''
+  }
+}
+
+watch(
+  () => chat.selectedAgentId,
+  () => syncGroupForAgent(),
+)
+
+// 组列表异步到达后补一次校验：会话绑定的组可能属于别的 Agent。
+watch(
+  () => agents.groupsLoaded,
+  (loaded) => {
+    if (loaded) syncGroupForAgent()
+  },
+)
 
 // 未配置沙箱时在对话页顶部提示本机执行的安全风险。
 const sandboxNotice = ref('')
@@ -71,6 +123,10 @@ const backendOnline = ref<boolean | null>(null)
 // 用户离开底部后不再强制滚动，改为提供「回到底部」按钮
 const stickToBottom = ref(true)
 const hasOverflow = ref(false)
+// 右侧轮次导航：展开态、当前高亮项；刻度与列表共用同一份数据
+const navActive = ref(0)
+const navOpen = ref(false)
+const navList = ref<HTMLElement | null>(null)
 
 // ---------- 上下文附件 ----------
 const formats = ref<ContextFormats>({
@@ -251,6 +307,7 @@ async function fetchHealthWithRetry(attempts = 20): Promise<Response | null> {
 
 onMounted(async () => {
   void agents.load()
+  void agents.loadGroups()
   const res = await fetchHealthWithRetry()
   backendOnline.value = Boolean(res)
   if (res) {
@@ -420,6 +477,26 @@ interface HistoryMessage {
   source?: string
   tokens?: { input: number; output: number; total: number }
   feedback?: 'like' | 'dislike' | null
+  created_at?: string
+}
+
+/** 历史消息自带 created_at，转成毫秒供气泡底部显示时间。 */
+function messageTime(value?: string): number | undefined {
+  const parsed = Date.parse(value || '')
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/** 气泡底部时间只显示时:分，完整时间放在 title 里。 */
+function clockOf(value?: number): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function timeTitle(value?: number): string {
+  return value ? new Date(value).toLocaleString() : ''
 }
 
 async function selectSession(threadId: string) {
@@ -432,6 +509,9 @@ async function selectSession(threadId: string) {
   // 会话绑定的 Agent 回填到选择器，避免跨会话串用员工。
   const bound = sessions.sessions.find((item) => item.thread_id === threadId)
   chat.selectedAgentId = bound?.agent_id || agents.defaultAgentId || 'default'
+  // 组随会话恢复；该会话没绑定过组就保持「无组」，不自动推断。
+  chat.selectedGroupId = bound?.group_id || ''
+  syncGroupForAgent()
   // 记录切换前的文件基线，下一轮结束时才能准确判断“本轮新增”。
   void files.prime(threadId)
   // 后台仍在运行的会话：保留实时缓冲，不能用 checkpoint 历史覆盖
@@ -455,13 +535,15 @@ async function selectSession(threadId: string) {
         }
       }
       const msgs: ChatMsg[] = data.messages.map((m, i) => {
-        if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content }
+        const at = messageTime(m.created_at)
+        if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content, at }
         if (m.role === 'reasoning') {
           return {
             id: m.id || `h-r-${i}`,
             kind: 'reasoning',
             content: m.content,
             source: m.source || 'main',
+            at,
           }
         }
         if (m.role === 'assistant') {
@@ -471,6 +553,7 @@ async function selectSession(threadId: string) {
             content: m.content,
             tokens: m.tokens,
             feedback: m.feedback,
+            at,
           }
         }
         const name = m.tool_name || 'tool'
@@ -547,10 +630,13 @@ async function createSession() {
   stashCurrentDraft()
   draftLocked = true
   resetInput()
+  // 新会话默认不选组：组只在用户显式选择后才写回该会话。
+  chat.selectedGroupId = ''
   const id = await sessions.createSession(
     undefined,
     undefined,
     chat.selectedAgentId || agents.defaultAgentId,
+    undefined,
   )
   if (!id) {
     sessions.activeThreadId = null
@@ -718,9 +804,14 @@ interface TurnView {
   user: ChatMsg | null
   process: ChatMsg[]
   taskflow: ChatMsg | null
+  // 执行中的任务规划卡固定在顶部；结束后的卡片归档到本轮轨迹底部
+  scheduler: ChatMsg | null
+  schedulers: ChatMsg[]
   final: ChatMsg | null
   interrupt: ChatMsg | null
   notes: ChatMsg[]
+  // 本轮终止原因提示，固定在最终回答下方
+  terminated: ChatMsg | null
   live: boolean
 }
 
@@ -766,9 +857,12 @@ const turns = computed<TurnView[]>(() => {
         user: msg,
         process: [],
         taskflow: null,
+        scheduler: null,
+        schedulers: [],
         final: null,
         interrupt: null,
         notes: [],
+        terminated: null,
         live: false,
       }
       continue
@@ -779,14 +873,27 @@ const turns = computed<TurnView[]>(() => {
         user: null,
         process: [],
         taskflow: null,
+        scheduler: null,
+        schedulers: [],
         final: null,
         interrupt: null,
         notes: [],
+        terminated: null,
         live: false,
       }
     }
+    if (msg.kind === 'terminated') {
+      current.terminated = msg
+      continue
+    }
     if (msg.kind === 'taskflow') {
       current.taskflow = msg
+      continue
+    }
+    if (msg.kind === 'scheduler') {
+      // 运行中固定在顶部；完成/中断后归档到本轮轨迹最底部。
+      if (msg.schedStatus === 'running') current.scheduler = msg
+      else current.schedulers.push(msg)
       continue
     }
     if (msg.kind === 'interrupt') {
@@ -821,6 +928,137 @@ function turnDuration(turn: TurnView): number | undefined {
   if (!turn.user) return undefined
   return chat.turnDurations[turn.user.id]
 }
+
+// ---------- 终止原因提示 ----------
+const TERMINATE_TEXT: Record<TerminateReason, string> = {
+  user: '你已手动终止本次回答',
+  network: '连接中断，回答未完成',
+  server: '服务端出错，回答已终止',
+  limit: '达到模型调用上限，回答提前结束',
+}
+
+const TERMINATE_ICON: Record<TerminateReason, IconName> = {
+  user: 'stop',
+  network: 'globe',
+  server: 'server',
+  limit: 'timer',
+}
+
+function terminateText(msg: ChatMsg): string {
+  const reason = msg.termReason || 'server'
+  const base = TERMINATE_TEXT[reason]
+  // 手动终止不需要附加细节；其余原因把具体错误并进同一行，避免再插一条提示。
+  return msg.termDetail && reason !== 'user' ? `${base}：${msg.termDetail}` : base
+}
+
+function terminateIcon(msg: ChatMsg): IconName {
+  return TERMINATE_ICON[msg.termReason || 'server']
+}
+
+// ---------- 任务流进度卡片 ----------
+// 只认「最后一条任务流消息且仍在运行」：本轮一结束（完成/失败/中断）就收起，
+// 撤回后由 store 的快照把未完成的卡片重新挂回来。
+const activeFlow = computed<ChatMsg | null>(() => {
+  const list = chat.messages
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index]
+    if (message?.kind !== 'taskflow') continue
+    return message.flowStatus === 'running' ? message : null
+  }
+  return null
+})
+
+// 任务规划卡片与任务流一致：只认最后一条规划消息且仍在执行。
+// 中断/完成后自动离开顶部，归档进本轮轨迹；恢复执行时重新回到顶部。
+const activeScheduler = computed<ChatMsg | null>(() => {
+  const list = chat.messages
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index]
+    if (message?.kind !== 'scheduler') continue
+    return message.schedStatus === 'running' ? message : null
+  }
+  return null
+})
+
+// ---------- 右侧轮次导航 ----------
+// 只给包含用户消息的轮次生成刻度：点击跳转，悬停预览该轮提问。
+interface TurnNavItem {
+  key: string
+  label: string
+}
+
+const turnNav = computed<TurnNavItem[]>(() =>
+  turns.value
+    .filter((turn) => Boolean(turn.user))
+    .map((turn) => ({
+      key: turn.key,
+      label: (turn.user?.content || '').replace(/\s+/g, ' ').trim() || '（附件消息）',
+    })),
+)
+
+function navAnchor(key: string): string {
+  return `data-turn-id="${String(key).replace(/"/g, '')}"`
+}
+
+/** 高亮当前视口顶部所在的轮次；与刻度共用一个索引空间。 */
+function updateNavActive() {
+  const el = scroller.value
+  if (!el) return
+  const items = turnNav.value
+  if (!items.length) {
+    navActive.value = 0
+    return
+  }
+  const indexByKey = new Map(items.map((item, index) => [item.key, index]))
+  const base = el.getBoundingClientRect().top
+  let active = 0
+  for (const node of el.querySelectorAll<HTMLElement>('[data-turn-id]')) {
+    const index = indexByKey.get(node.dataset.turnId || '')
+    if (index === undefined) continue
+    // 顶部留 48px 容差：轮次标题刚滚到视口上沿时就算已切入该轮。
+    if (node.getBoundingClientRect().top - base <= 48) active = index
+  }
+  navActive.value = active
+}
+
+/** 跳转到第 index 个轮次；保持用户阅读位置，不触发自动跟随到底部。 */
+function jumpToTurn(index: number) {
+  const el = scroller.value
+  const item = turnNav.value[index]
+  if (!el || !item) return
+  const node = el.querySelector<HTMLElement>(`[${navAnchor(item.key)}]`)
+  if (!node) return
+  const top =
+    node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop - 12
+  stickToBottom.value = false
+  navActive.value = index
+  el.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+}
+
+/** 指针停在导航条上滚轮时，把滚动转交给消息区；展开态下让面板自己滚。 */
+function onNavWheel(event: WheelEvent) {
+  if (navOpen.value) return
+  const el = scroller.value
+  if (!el) return
+  event.preventDefault()
+  el.scrollTop += event.deltaY
+}
+
+/** 展开后把当前轮次滚进面板可视区，避免长会话里看不到高亮项。 */
+async function onNavOpenChange(open: boolean) {
+  if (!open) return
+  await nextTick()
+  const list = navList.value
+  if (!list) return
+  const row = list.querySelector<HTMLElement>(`[data-nav-index="${navActive.value}"]`)
+  if (!row) return
+  const listRect = list.getBoundingClientRect()
+  const rowRect = row.getBoundingClientRect()
+  if (rowRect.top < listRect.top) list.scrollTop -= listRect.top - rowRect.top + 8
+  else if (rowRect.bottom > listRect.bottom) list.scrollTop += rowRect.bottom - listRect.bottom + 8
+}
+
+watch(navOpen, (open) => void onNavOpenChange(open))
 
 // 已回复的 HITL 在轨迹树里显示成一条可展开的结论行。
 function interruptSummary(msg: ChatMsg): string {
@@ -877,6 +1115,8 @@ async function withdrawLatest(turn: TurnView, index: number) {
     const result = await withdrawLatestMessage(threadId, USER_ID, '控制台用户')
     // 重新拉取历史，确保消息、中断与用量都以后端 head 为准。
     await selectSession(threadId)
+    // 撤回后如果上一轮的任务流还没走完，把进度卡片重新挂回消息流。
+    chat.restoreFlowCard(threadId)
     sessionUsageOverride.value = null
     void hydrateSessionUsage(threadId)
     const withdrawn = result.content || turn.user.content || ''
@@ -985,6 +1225,7 @@ async function scrollBottom() {
   el.scrollTop = el.scrollHeight
   stickToBottom.value = true
   updateOverflow()
+  updateNavActive()
 }
 
 function updateOverflow() {
@@ -993,12 +1234,68 @@ function updateOverflow() {
 }
 
 // 用户一旦向上滚动，就停止自动跟随；是否回到底部由按钮决定。
+/** 视口顶部正在阅读的轨迹节点；滚动跨过节点边界时自动切换。 */
+const pinnedTraj = ref<{ id: string; level: number; label: string; open: boolean } | null>(
+  null,
+)
+
+let pinFrame = 0
+
+function schedulePinnedTrajUpdate() {
+  if (pinFrame) return
+  pinFrame = requestAnimationFrame(() => {
+    pinFrame = 0
+    updatePinnedTrajectory()
+  })
+}
+
+/**
+ * 找出滚动视口内最顶部的轨迹节点行。
+ * 子节点在 DOM 中紧随父节点，因此顺流行遍历后「最后一个越过顶部」的行
+ * 就是当前正在看的节点块；父 / 子节点滚到顶部时会自然切换。
+ */
+function updatePinnedTrajectory() {
+  const el = scroller.value
+  if (!el) {
+    pinnedTraj.value = null
+    return
+  }
+  const top = el.getBoundingClientRect().top
+  let currentId = ''
+  for (const row of el.querySelectorAll<HTMLElement>('[data-traj-row]')) {
+    const rect = row.getBoundingClientRect()
+    if (rect.bottom <= top + 1) continue
+    if (rect.top <= top + 2) currentId = row.dataset.trajRow || ''
+  }
+  const entry = currentId ? trajectoryRegistry.get(currentId) : undefined
+  // 只粘可折叠节点：收起操作才有意义。
+  if (!entry || !entry.collapsible()) {
+    pinnedTraj.value = null
+    return
+  }
+  pinnedTraj.value = {
+    id: currentId,
+    level: entry.level(),
+    label: entry.label(),
+    open: entry.open(),
+  }
+}
+
+function togglePinnedTraj() {
+  const target = pinnedTraj.value
+  if (!target) return
+  trajectoryRegistry.get(target.id)?.toggle()
+  void nextTick(updatePinnedTrajectory)
+}
+
 function onMessagesScroll() {
   const el = scroller.value
   if (!el) return
   updateOverflow()
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight
   stickToBottom.value = distance < 48
+  updateNavActive()
+  schedulePinnedTrajUpdate()
 }
 
 function jumpToBottom() {
@@ -1013,6 +1310,23 @@ watch(
     draftTimer = window.setTimeout(persistDraftNow, DRAFT_SAVE_DELAY)
   },
   { deep: true },
+)
+
+// 轮次数量或内容变化后重算导航高亮，避免新增消息后刻度索引与视口错位。
+watch(
+  () => turnNav.value.length,
+  () => {
+    void nextTick(updateNavActive)
+  },
+)
+
+// 会话切换或轨迹节点增删后刷新粘性折叠条，避免残留上一个会话的节点。
+watch(
+  () => [chat.threadId, chat.messages.length] as const,
+  () => {
+    pinnedTraj.value = null
+    void nextTick(updatePinnedTrajectory)
+  },
 )
 
 // 记住最后打开的会话，供下次启动恢复。
@@ -1045,6 +1359,7 @@ onBeforeUnmount(() => {
   flushDraft()
   window.removeEventListener('beforeunload', flushDraft)
   document.removeEventListener('visibilitychange', onVisibilityChange)
+  if (pinFrame) cancelAnimationFrame(pinFrame)
 })
 
 // ---------- 后端运行参数（思考 / 联网搜索） ----------
@@ -1068,7 +1383,17 @@ function toggleWebSearch(value: boolean) {
 
 // ---------- 上下文窗口圆环 ----------
 const DONUT_CIRC = 2 * Math.PI * 15.5
-const ctxWindow = computed(() => sessionUsage.value?.contextWindow || 0)
+// 分母跟随当前选择的 Agent 模型配置；Agent 未配置时回退到会话用量里的窗口值。
+const agentContextLimit = computed(() =>
+  Number(agents.byId(chat.selectedAgentId)?.model?.context_limit || 0),
+)
+const ctxWindow = computed(() => {
+  if (agentContextLimit.value > 0) return agentContextLimit.value
+  return sessionUsage.value?.contextWindow || 0
+})
+const ctxModelName = computed(
+  () => agents.byId(chat.selectedAgentId)?.model?.model_name || '',
+)
 const ctxUsed = computed(
   () => sessionUsage.value?.contextUsed ?? sessionUsage.value?.input ?? 0,
 )
@@ -1184,7 +1509,7 @@ watch(
       return
     }
     if (sending || noticeShownFor.value === tid) return
-    if (rounds >= chat.roundLimit) {
+    if (chat.roundLimit > 0 && rounds >= chat.roundLimit) {
       roundNotice.value = true
       noticeShownFor.value = tid
       // 15 秒后自动渐隐，用户也可以手动关闭或新开会话
@@ -1223,13 +1548,27 @@ watch(
   },
 )
 
+/** 空状态快捷提问：复用 submit，保证建会话/绑定/清草稿逻辑一致。 */
+function sendSuggestion(text: string) {
+  draft.value = text
+  void submit()
+}
+
 async function submit() {
   if (archivedActive.value) return
+  // 流式期间输入框已禁用，这里再兜一层，避免重复 Enter 造成重复入队。
+  if (chat.sending) return
   if (!draft.value.trim() && pendingFiles.value.length === 0) return
   const previousThread = chat.threadId
   // 没有会话时先建一个，确保 SSE 请求始终带着确定的 thread_id
   if (!chat.threadId && !chat.demoMode) {
-    const id = await sessions.createSession()
+    // 新会话默认不绑定组；Agent 跟随当前选择，避免首轮落到默认 Agent。
+    const id = await sessions.createSession(
+      undefined,
+      undefined,
+      chat.selectedAgentId || agents.defaultAgentId,
+      undefined,
+    )
     if (!id) {
       ElMessage.error('无法创建会话，请检查后端连接')
       return
@@ -1237,8 +1576,9 @@ async function submit() {
     sessions.activeThreadId = id
     chat.activateThread(id)
   }
-  const files = pendingFiles.value
-  chat.send(draft.value, files)
+  // 先快照再清空：清空必须发生在发送之前，任何后续异常都不能让草稿残留。
+  const text = draft.value
+  const files = [...pendingFiles.value]
   // 已发送的草稿立即作废；之前没有会话时，同时清掉“未归属”草稿。
   clearDraft(chat.threadId)
   if (!previousThread) clearDraft(null)
@@ -1246,6 +1586,16 @@ async function submit() {
   // 已发送的附件不再重复引用；预览 URL 保留给消息气泡显示。
   pendingFiles.value = []
   uploadError.value = ''
+  chat.send(text, files)
+  // 把本轮选择同步到本地会话索引，切走再切回时能恢复同一个 Agent / 组。
+  // 这只是内存副本，失败不影响本轮发送（后端已持久化绑定）。
+  try {
+    if (chat.threadId) {
+      sessions.bindRouting(chat.threadId, chat.selectedAgentId, chat.selectedGroupId)
+    }
+  } catch {
+    // 忽略本地索引同步异常
+  }
   stickToBottom.value = true
   void nextTick(() => {
     void scrollBottom()
@@ -1268,7 +1618,7 @@ async function submit() {
       <div v-if="roundNotice" class="toast-slot">
         <RoundLimitToast
           :rounds="userRounds"
-          :limit="chat.roundLimit"
+          :limit="chat.roundLimit > 0 ? chat.roundLimit : 0"
           @new-chat="newChatFromNotice"
           @close="dismissRoundNotice"
         />
@@ -1300,7 +1650,8 @@ async function submit() {
           <div class="controls">
             <el-select
               v-model="chat.selectedAgentId"
-              class="agent-select"
+              class="agent-select holo-select holo-select--agent"
+              popper-class="holo-popper"
               size="small"
               placeholder="选择 Agent"
               :disabled="archivedActive"
@@ -1314,6 +1665,23 @@ async function submit() {
                 <span>{{ opt.label }}</span>
                 <small class="agent-option-role">{{ opt.role }}</small>
               </el-option>
+            </el-select>
+            <el-select
+              v-if="groupOptions.length"
+              v-model="chat.selectedGroupId"
+              class="agent-select holo-select holo-select--group"
+              popper-class="holo-popper"
+              size="small"
+              placeholder="独立执行（不使用组）"
+              :disabled="archivedActive"
+            >
+              <el-option label="独立执行（不使用组）" value="" />
+              <el-option
+                v-for="opt in groupOptions"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
             </el-select>
             <span v-if="archivedActive" class="chip archived-chip">归档只读</span>
             <span v-if="chat.threadId" class="chip">thread {{ chat.threadId.slice(0, 8) }}…</span>
@@ -1355,7 +1723,55 @@ async function submit() {
         </div>
 
         <div class="messages-wrap">
-          <div ref="scroller" class="messages" @scroll.passive="onMessagesScroll">
+          <!-- 任务规划：执行中固定在滚动区顶部，逐条流式展开；结束后归档进轨迹 -->
+          <div v-if="activeScheduler" class="flow-dock">
+            <SchedulerPlanCard
+              :goal="activeScheduler.schedGoal || ''"
+              :tier="activeScheduler.schedTier || ''"
+              :mode="activeScheduler.schedMode || ''"
+              :status="activeScheduler.schedStatus || 'running'"
+              :items="activeScheduler.schedItems || []"
+              :plan-version="activeScheduler.schedPlanVersion || 1"
+              :summary="activeScheduler.schedSummary || ''"
+              :note="activeScheduler.schedNote || ''"
+              collapsible
+            />
+          </div>
+          <!-- 任务流进度：固定在滚动区顶部，只显示当前运行中的那一条；本轮结束即消失 -->
+          <div v-if="activeFlow" class="flow-dock">
+            <ExecutionCard
+              :flow-name="activeFlow.flowName || '任务流'"
+              :status="activeFlow.flowStatus || 'running'"
+              :current-step="activeFlow.flowCurrentStep || ''"
+              :steps="activeFlow.flowSteps || []"
+              :traces="activeFlow.flowTraces || []"
+              collapsible
+            />
+          </div>
+          <!-- 轨迹粘性折叠条：整条可点，箭头指示当前节点的展开状态 -->
+          <button
+            v-if="pinnedTraj"
+            class="traj-pin"
+            type="button"
+            :style="{ paddingLeft: `${8 + Math.min(pinnedTraj.level - 1, 6) * 10}px` }"
+            :title="pinnedTraj.open ? '收起该节点' : '展开该节点'"
+            @click="togglePinnedTraj"
+          >
+            <span class="traj-pin-level">L{{ pinnedTraj.level }}</span>
+            <span class="traj-pin-label">{{ pinnedTraj.label }}</span>
+            <AppIcon
+              name="chevronRight"
+              :size="11"
+              class="traj-pin-chev"
+              :class="{ open: pinnedTraj.open }"
+            />
+          </button>
+          <div
+            ref="scroller"
+            class="messages"
+            :class="{ 'with-nav': turnNav.length > 1 }"
+            @scroll.passive="onMessagesScroll"
+          >
             <el-empty v-if="shown.length === 0" class="chat-empty">
               <template #image>
                 <div class="empty-orb"><AppIcon name="sparkles" :size="26" /></div>
@@ -1371,7 +1787,7 @@ async function submit() {
                   v-for="s in SUGGESTIONS"
                   :key="s"
                   size="small"
-                  @click="chat.send(s)"
+                  @click="sendSuggestion(s)"
                 >
                   {{ s }}
                 </el-button>
@@ -1379,7 +1795,7 @@ async function submit() {
             </el-empty>
 
             <template v-for="(turn, turnIndex) in turns" :key="turn.key">
-              <div v-if="turn.user" class="row user">
+              <div v-if="turn.user" class="row user" :data-turn-id="turn.key">
                 <div class="msg-col user">
                   <div class="bubble user-bubble">
                     <div v-if="turn.user.attachments?.length" class="bubble-atts">
@@ -1395,6 +1811,13 @@ async function submit() {
                     v-if="turn.user.content || canWithdraw(turn, turnIndex)"
                     class="msg-meta user"
                   >
+                    <span
+                      v-if="clockOf(turn.user.at)"
+                      class="msg-time"
+                      :title="timeTitle(turn.user.at)"
+                    >
+                      {{ clockOf(turn.user.at) }}
+                    </span>
                     <el-button
                       v-if="turn.user.content"
                       class="copy-mini"
@@ -1420,18 +1843,7 @@ async function submit() {
                 </div>
               </div>
 
-              <!-- 任务流执行卡片：步骤进度、实时 token 与回放轨迹 -->
-              <div v-if="turn.taskflow" class="row indent flow-row">
-                <div class="tree-col">
-                  <ExecutionCard
-                    :flow-name="turn.taskflow.flowName || '任务流'"
-                    :status="turn.taskflow.flowStatus || 'running'"
-                    :current-step="turn.taskflow.flowCurrentStep || ''"
-                    :steps="turn.taskflow.flowSteps || []"
-                    :traces="turn.taskflow.flowTraces || []"
-                  />
-                </div>
-              </div>
+              <!-- 任务流执行卡片已移到滚动区顶部常驻，这里不再内联渲染 -->
 
               <!-- 轨迹永远在正式回答之上：树状展开，结束后自动折叠 -->
               <div v-if="turn.process.length || turn.live" class="row indent tree-row">
@@ -1440,6 +1852,27 @@ async function submit() {
                     :items="turn.process"
                     :live="turn.live"
                     :duration-ms="turnDuration(turn)"
+                  />
+                </div>
+              </div>
+
+              <!-- 已归档的任务规划卡：固定在本轮轨迹最底部，恢复执行时回到顶部 -->
+              <div
+                v-for="card in turn.schedulers"
+                :key="card.id"
+                class="row indent tree-row"
+              >
+                <div class="tree-col">
+                  <SchedulerPlanCard
+                    :goal="card.schedGoal || ''"
+                    :tier="card.schedTier || ''"
+                    :mode="card.schedMode || ''"
+                    :status="card.schedStatus || 'done'"
+                    :items="card.schedItems || []"
+                    :plan-version="card.schedPlanVersion || 1"
+                    :summary="card.schedSummary || ''"
+                    :note="card.schedNote || ''"
+                    archived
                   />
                 </div>
               </div>
@@ -1457,6 +1890,13 @@ async function submit() {
                     <span v-if="turn.final.streaming" class="cursor"></span>
                   </div>
                   <div v-if="turn.final.content && !turn.final.streaming" class="msg-meta ai">
+                    <span
+                      v-if="clockOf(turn.final.at)"
+                      class="msg-time"
+                      :title="timeTitle(turn.final.at)"
+                    >
+                      {{ clockOf(turn.final.at) }}
+                    </span>
                     <button
                       class="meta-icon"
                       :class="{ active: copiedId === turn.final.id }"
@@ -1503,6 +1943,16 @@ async function submit() {
                 </div>
               </div>
 
+              <!-- 终止原因：贴在 AI 回答最底部的一行状态条 -->
+              <div v-if="turn.terminated" class="row terminate-row">
+                <div class="msg-col ai">
+                  <div class="terminate-bar" :class="turn.terminated.termReason || 'server'">
+                    <AppIcon :name="terminateIcon(turn.terminated)" :size="12" />
+                    <span>{{ terminateText(turn.terminated) }}</span>
+                  </div>
+                </div>
+              </div>
+
               <div v-if="turn.interrupt" class="row indent">
                 <InterruptCard :msg="turn.interrupt" :readonly="archivedActive" />
               </div>
@@ -1511,6 +1961,33 @@ async function submit() {
                 <span class="system-note">{{ note.content }}</span>
               </div>
             </template>
+          </div>
+
+          <!-- 右侧轮次导航：收起时是一列刻度，悬停展开为可读的轮次列表 -->
+          <div
+            v-if="turnNav.length > 1"
+            class="turn-nav"
+            :class="{ open: navOpen }"
+            @mouseenter="navOpen = true"
+            @mouseleave="navOpen = false"
+            @wheel="onNavWheel"
+          >
+            <div ref="navList" class="turn-nav-list">
+              <button
+                v-for="(item, i) in turnNav"
+                :key="item.key"
+                type="button"
+                class="turn-nav-row"
+                :class="{ active: navActive === i }"
+                :data-nav-index="i"
+                :aria-label="`第 ${i + 1} 轮：${item.label}`"
+                :aria-current="navActive === i ? 'true' : undefined"
+                @click="jumpToTurn(i)"
+              >
+                <span class="turn-nav-label">{{ item.label }}</span>
+                <span class="turn-nav-bar"></span>
+              </button>
+            </div>
           </div>
 
           <!-- 用户向上翻阅时，不再强制滚到底，只在视口底部提供一个回底按钮 -->
@@ -1722,24 +2199,34 @@ async function submit() {
             </div>
 
             <div class="ctx-wrap">
-              <div
+              <HoloTooltip
                 v-if="ctxWindow > 0"
-                class="ctx-donut"
-                :class="ctxTone"
-                :title="`上下文窗口占用 ${formatExact(ctxUsed)} / ${formatExact(ctxWindow)} tok（${ctxPct}%）`"
+                title="上下文窗口"
+                :code="ctxModelName"
+                :content="`已占用 ${formatExact(ctxUsed)} tok，上限 ${formatExact(ctxWindow)} tok（${ctxPct}%）。`"
+                :footer="
+                  ctxTone === 'danger'
+                    ? '接近上限，建议压缩'
+                    : ctxTone === 'warn'
+                      ? '注意用量，接近水位'
+                      : '余量充足'
+                "
+                placement="top"
               >
-                <svg viewBox="0 0 36 36" aria-hidden="true">
-                  <circle class="donut-track" cx="18" cy="18" r="15.5" />
-                  <circle
-                    class="donut-bar"
-                    cx="18"
-                    cy="18"
-                    r="15.5"
-                    :stroke-dasharray="ctxDash"
-                  />
-                </svg>
-                <span class="donut-label">{{ ctxPct }}%</span>
-              </div>
+                <div class="ctx-donut" :class="ctxTone">
+                  <svg viewBox="0 0 36 36" aria-hidden="true">
+                    <circle class="donut-track" cx="18" cy="18" r="15.5" />
+                    <circle
+                      class="donut-bar"
+                      cx="18"
+                      cy="18"
+                      r="15.5"
+                      :stroke-dasharray="ctxDash"
+                    />
+                  </svg>
+                  <span class="donut-label">{{ ctxPct }}%</span>
+                </div>
+              </HoloTooltip>
             </div>
           </div>
         </footer>
@@ -1844,6 +2331,162 @@ async function submit() {
   width: 168px;
 }
 
+/* ---------- 全息选择器 ----------
+   与青色 HOLO ARCHIVE 面板区分：紫 / 品红棱镜描边、斜向扫描纹、
+   缓慢掠过的高光带，以及单侧斜切的玻璃底。 */
+.holo-select {
+  --holo-a: rgba(167, 139, 250, 0.9);
+  --holo-b: rgba(244, 114, 182, 0.7);
+  --holo-c: rgba(96, 165, 250, 0.55);
+}
+
+.holo-select :deep(.el-select__wrapper) {
+  position: relative;
+  overflow: hidden;
+  min-height: 30px;
+  padding: 0 26px 0 11px;
+  border: 1px solid transparent;
+  border-radius: 7px 2px 7px 2px;
+  background:
+    linear-gradient(135deg, rgba(31, 18, 56, 0.9), rgba(11, 9, 26, 0.94)) padding-box,
+    linear-gradient(118deg, var(--holo-a), var(--holo-b) 46%, var(--holo-c)) border-box;
+  box-shadow:
+    inset 0 0 18px rgba(167, 139, 250, 0.14),
+    0 0 0 1px rgba(6, 5, 16, 0.55);
+  backdrop-filter: blur(12px);
+  transition: box-shadow 0.24s ease;
+}
+
+.holo-select :deep(.el-select__wrapper)::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    116deg,
+    rgba(226, 214, 255, 0.055) 0 1px,
+    transparent 1px 6px
+  );
+  pointer-events: none;
+}
+
+.holo-select :deep(.el-select__wrapper)::after {
+  content: '';
+  position: absolute;
+  top: -70%;
+  left: -45%;
+  width: 38%;
+  height: 240%;
+  background: linear-gradient(90deg, transparent, rgba(244, 114, 182, 0.26), transparent);
+  transform: rotate(14deg);
+  animation: holo-sheen 5.2s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes holo-sheen {
+  0%,
+  100% {
+    left: -45%;
+    opacity: 0;
+  }
+  18% {
+    opacity: 1;
+  }
+  60% {
+    left: 105%;
+    opacity: 1;
+  }
+  78% {
+    opacity: 0;
+  }
+}
+
+.holo-select :deep(.el-select__wrapper.is-hovering),
+.holo-select :deep(.el-select__wrapper.is-focused) {
+  box-shadow:
+    inset 0 0 26px rgba(244, 114, 182, 0.2),
+    0 0 16px rgba(167, 139, 250, 0.34);
+}
+
+.holo-select :deep(.el-select__selection),
+.holo-select :deep(.el-select__suffix) {
+  position: relative;
+  z-index: 1;
+}
+
+.holo-select :deep(.el-select__placeholder),
+.holo-select :deep(.el-select__selected-item) {
+  color: #ece6ff;
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+.holo-select :deep(.el-select__placeholder.is-transparent) {
+  color: rgba(196, 181, 253, 0.62);
+}
+
+.holo-select :deep(.el-select__caret) {
+  color: #c4b5fd;
+  transition: transform 0.24s ease;
+}
+
+.holo-select :deep(.el-select__wrapper.is-focused) .el-select__caret {
+  transform: rotate(180deg);
+}
+
+/* 组选择器走暖调：琥珀 → 品红，和冷紫的 Agent 选择器区分。 */
+.holo-select--group {
+  --holo-a: rgba(251, 191, 36, 0.85);
+  --holo-b: rgba(244, 114, 182, 0.8);
+  --holo-c: rgba(167, 139, 250, 0.5);
+}
+
+.holo-select--group :deep(.el-select__wrapper) {
+  background:
+    linear-gradient(135deg, rgba(54, 28, 42, 0.9), rgba(14, 9, 24, 0.94)) padding-box,
+    linear-gradient(118deg, var(--holo-a), var(--holo-b) 46%, var(--holo-c)) border-box;
+  box-shadow:
+    inset 0 0 18px rgba(251, 191, 36, 0.12),
+    0 0 0 1px rgba(6, 5, 16, 0.55);
+}
+
+/* 下拉层 teleport 到 body，必须用全局选择器命中 popper-class。 */
+:global(.holo-popper) {
+  overflow: hidden;
+  border: 1px solid rgba(167, 139, 250, 0.42);
+  border-radius: 8px 2px 8px 2px;
+  background:
+    repeating-linear-gradient(
+      116deg,
+      rgba(226, 214, 255, 0.04) 0 1px,
+      transparent 1px 6px
+    ),
+    linear-gradient(160deg, rgba(24, 15, 44, 0.98), rgba(9, 8, 20, 0.98));
+  box-shadow:
+    0 18px 46px rgba(0, 0, 0, 0.62),
+    0 0 26px rgba(167, 139, 250, 0.2);
+  backdrop-filter: blur(14px);
+}
+
+:global(.holo-popper .el-select-dropdown__item) {
+  color: #cfc7ea;
+  font-size: 11.5px;
+}
+
+:global(.holo-popper .el-select-dropdown__item.is-hovering) {
+  background: linear-gradient(90deg, rgba(167, 139, 250, 0.16), rgba(244, 114, 182, 0.1));
+  color: #f5efff;
+}
+
+:global(.holo-popper .el-select-dropdown__item.is-selected) {
+  color: #f0abfc;
+  font-weight: 500;
+}
+
+:global(.holo-popper .el-popper__arrow::before) {
+  border-color: rgba(167, 139, 250, 0.42);
+  background: rgba(24, 15, 44, 0.98);
+}
+
 .agent-option-role {
   margin-left: 8px;
   font-size: 10px;
@@ -1921,6 +2564,72 @@ async function submit() {
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: column;
+}
+
+/* 任务流进度常驻在滚动区顶部：不随消息滚动，折叠后只占一行左右的高度 */
+.flow-dock {
+  flex: none;
+  padding: 10px 20px 0;
+}
+
+/* 轨迹粘性折叠条：整条点击切换，层级用 L1/L2 标记 + 缩进表达 */
+.traj-pin {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 20px 0;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--text-2);
+  text-align: left;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-left: 2px solid rgba(53, 224, 255, 0.45);
+  border-radius: 7px;
+  background: rgba(9, 16, 29, 0.94);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
+  transition: border-color 0.16s, background 0.16s;
+}
+
+.traj-pin:hover {
+  border-color: rgba(53, 224, 255, 0.45);
+  background: rgba(12, 22, 38, 0.96);
+}
+
+.traj-pin-level {
+  flex: none;
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 15px;
+  color: var(--accent-cyan);
+  border: 1px solid rgba(53, 224, 255, 0.32);
+  border-radius: 4px;
+}
+
+.traj-pin-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.traj-pin-chev {
+  flex: none;
+  color: var(--text-3);
+  transition: color 0.16s, transform 0.18s;
+}
+
+.traj-pin-chev.open {
+  transform: rotate(90deg);
+}
+
+.traj-pin:hover .traj-pin-chev {
+  color: var(--accent-cyan);
 }
 
 /* 未配置沙箱时的本机执行安全提示 */
@@ -1964,6 +2673,143 @@ async function submit() {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* 右侧出现轮次导航时，给气泡留出安全距离，避免与刻度重叠 */
+.messages.with-nav {
+  padding-right: 34px;
+}
+
+/* 右侧轮次导航：收起时是一组紧凑刻度，整体垂直居中；悬停向右浮出列表 */
+.turn-nav {
+  position: absolute;
+  top: 50%;
+  right: 15px;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 16px;
+  max-height: calc(100% - 20px);
+  z-index: 11;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  transition: width 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+}
+
+.turn-nav-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+
+.turn-nav-list::-webkit-scrollbar {
+  display: none;
+}
+
+.turn-nav-row {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 16px;
+  height: 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.turn-nav-bar {
+  flex: none;
+  display: block;
+  width: 9px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--line-strong);
+  transition: width 0.15s ease, background 0.15s ease;
+}
+
+.turn-nav-row:hover .turn-nav-bar {
+  width: 13px;
+  background: var(--text-2);
+}
+
+.turn-nav-row.active .turn-nav-bar {
+  width: 13px;
+  background: var(--accent);
+}
+
+.turn-nav-label {
+  display: none;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+  text-align: right;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 展开态：面板以刻度组为中心向两侧撑开，覆盖在消息区右侧 */
+.turn-nav.open {
+  right: 8px;
+  width: 268px;
+  max-height: calc(100% - 20px);
+  padding: 7px 5px 7px 6px;
+  border-color: var(--line);
+  background: var(--bg-elevated);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.turn-nav.open .turn-nav-list {
+  width: 100%;
+  align-items: stretch;
+  gap: 2px;
+  scrollbar-width: thin;
+}
+
+.turn-nav.open .turn-nav-list::-webkit-scrollbar {
+  display: block;
+  width: 4px;
+}
+
+.turn-nav.open .turn-nav-list::-webkit-scrollbar-thumb {
+  border-radius: 2px;
+  background: var(--line-strong);
+}
+
+.turn-nav.open .turn-nav-row {
+  width: 100%;
+  height: auto;
+  min-height: 28px;
+  gap: 10px;
+  padding: 4px 2px 4px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.turn-nav.open .turn-nav-row:hover {
+  background: var(--bg-hover);
+}
+
+.turn-nav.open .turn-nav-label {
+  display: block;
+}
+
+.turn-nav.open .turn-nav-row:hover .turn-nav-label {
+  color: var(--text-1);
+}
+
+.turn-nav.open .turn-nav-row.active .turn-nav-label {
+  color: var(--accent);
 }
 
 /* 轨迹树容器：占满宽度，后面可跟「完整轨迹」入口 */
@@ -2125,6 +2971,15 @@ async function submit() {
   margin-top: 4px;
 }
 
+/* 气泡底部的时间戳：只做弱提示，不和操作按钮抢注意力 */
+.msg-time {
+  font-size: 10px;
+  line-height: 22px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
 .copy-mini.el-button {
   height: 22px;
   padding: 2px 7px;
@@ -2245,6 +3100,7 @@ async function submit() {
   width: 34px;
   height: 34px;
   flex: none;
+  cursor: help;
 }
 
 .ctx-donut svg {
@@ -2322,6 +3178,44 @@ async function submit() {
 .system-note {
   font-size: 11.5px;
   color: var(--text-3);
+}
+
+/* 终止原因：与 AI 气泡左边缘对齐的一行状态条 */
+.terminate-row {
+  padding-left: 38px;
+}
+
+.terminate-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+  word-break: break-word;
+  animation: fadein 0.2s ease;
+}
+
+.terminate-bar.user {
+  color: var(--text-3);
+}
+
+.terminate-bar.network,
+.terminate-bar.limit {
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+  background: color-mix(in srgb, var(--amber) 7%, transparent);
+  color: var(--amber);
+}
+
+.terminate-bar.server {
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+  background: color-mix(in srgb, var(--danger) 7%, transparent);
+  color: var(--danger);
 }
 
 .input-bar {

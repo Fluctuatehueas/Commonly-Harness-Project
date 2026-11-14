@@ -46,6 +46,7 @@ def _risk_tier_for_event(event_type: str, tool_name: str) -> RiskTier:
         "host_execute",
         "publish_to_project",
         "run_in_sandbox",
+        "compile_project",
     }
     if tool_name in high_risk_tools:
         return RiskTier.T2

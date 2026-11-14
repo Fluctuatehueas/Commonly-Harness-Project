@@ -1,20 +1,27 @@
 <script setup lang="ts">
-// MyAgent：招募/编辑多个主 Agent，并为每个 Agent 绑定提示词、模型与 MCP 服务。
+// MyAgent：Agent 模式编辑提示词/模型/MCP；组模式管理团队组与成员。
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, Plus, Refresh, UserFilled } from '@element-plus/icons-vue'
+import { Check, Connection, Plus, Refresh, Setting, UserFilled } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
+import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import { fetchMcpServers, type McpServerItem } from '@/api/mcp'
-import { MODEL_CATALOG, formatContext } from '@/stores/models'
 import { useAgentStore } from '@/stores/agents'
+import AgentGroupsDrawer from '@/components/myagent/AgentGroupsDrawer.vue'
+import AgentListRow from '@/components/myagent/AgentListRow.vue'
+import AgentModelDrawer from '@/components/myagent/AgentModelDrawer.vue'
+import GroupWorkspace from '@/components/myagent/GroupWorkspace.vue'
 import type { AgentProfile } from '@/api/agents'
 
 const agents = useAgentStore()
+const viewMode = ref<'agent' | 'group'>('agent')
 const selectedId = ref('default')
 const mcpServers = ref<McpServerItem[]>([])
 const mcpLoading = ref(false)
 const recruitOpen = ref(false)
+const modelOpen = ref(false)
+const groupsOpen = ref(false)
 const recruitForm = reactive({
   name: '',
   role_title: '',
@@ -39,14 +46,6 @@ const form = reactive({
 
 const current = computed(() => agents.byId(selectedId.value))
 const isDefault = computed(() => Boolean(current.value?.is_default))
-const modelOptions = computed(() =>
-  MODEL_CATALOG.map((item) => ({
-    value: item.id,
-    label: `${item.name} · ${item.provider}`,
-    context: item.defaultContext,
-    baseUrl: item.baseUrl,
-  })),
-)
 const mcpOptions = computed(() =>
   mcpServers.value.map((item) => ({
     value: item.server_id,
@@ -76,6 +75,7 @@ watch(current, (profile) => resetForm(profile))
 
 async function load() {
   await agents.load(true)
+  await agents.loadGroups(true)
   const first = agents.items.find((item) => item.id === selectedId.value) || agents.items[0]
   if (first) selectedId.value = first.id
   resetForm(first)
@@ -93,22 +93,25 @@ async function loadMcp() {
   }
 }
 
-function onPickModel(modelId: string) {
-  const spec = MODEL_CATALOG.find((item) => item.id === modelId)
-  if (!spec) return
-  form.model_name = spec.id
-  form.base_url = spec.baseUrl
-  form.context_limit = spec.defaultContext
-  form.useCustomModel = true
+function refresh() {
+  void Promise.all([load(), loadMcp()])
 }
 
-function useGlobalModel() {
-  form.model_name = ''
-  form.base_url = ''
-  form.api_key = ''
-  form.thinking_enabled = false
-  form.context_limit = 128000
-  form.useCustomModel = false
+function applyModel(payload: {
+  useCustom: boolean
+  modelName: string
+  baseUrl: string
+  apiKey: string
+  thinkingEnabled: boolean
+  contextLimit: number
+}) {
+  form.useCustomModel = payload.useCustom
+  form.model_name = payload.useCustom ? payload.modelName : ''
+  form.base_url = payload.useCustom ? payload.baseUrl : ''
+  form.api_key = payload.apiKey
+  form.thinking_enabled = payload.useCustom ? payload.thinkingEnabled : false
+  form.context_limit = payload.useCustom ? payload.contextLimit : 128000
+  ElMessage.success('模型配置已应用，保存 Agent 后生效')
 }
 
 async function save() {
@@ -133,7 +136,8 @@ async function save() {
       model,
     })
     ElMessage.success('已保存，下一轮对话按新配置生效')
-    if (agents.byId(selectedId.value)) resetForm(agents.byId(selectedId.value))
+    const profile = agents.byId(selectedId.value)
+    if (profile) resetForm(profile)
   } catch (error) {
     ElMessage.error(`保存失败：${(error as Error).message}`)
   }
@@ -176,7 +180,7 @@ async function recruit() {
     recruitForm.system_prompt = ''
     selectedId.value = profile.id
     resetForm(profile)
-    ElMessage.success('招募成功，可在右侧继续配置')
+    ElMessage.success('招募成功，可继续配置')
   } catch (error) {
     ElMessage.error(`招募失败：${(error as Error).message}`)
   }
@@ -196,232 +200,215 @@ onMounted(async () => {
           <span class="head-icon"><AppIcon name="cube" :size="16" /></span>
           <div>
             <h1>MyAgent</h1>
-            <p>招募你的主 Agent：每个 Agent 可以有自己的系统提示词、模型与 MCP 工具集。</p>
+            <p v-if="viewMode === 'agent'">
+              招募你的主 Agent：每个 Agent 可以有自己的系统提示词、模型与 MCP 工具集。
+            </p>
+            <p v-else>定义组、组模型与成员：队长统筹任务，组员负责具体执行。</p>
           </div>
         </div>
         <div class="head-actions">
-          <el-button :icon="Refresh" size="small" :loading="agents.loading" @click="load">
-            刷新
-          </el-button>
-          <el-button type="primary" size="small" :icon="Plus" @click="recruitOpen = true">
-            招募 Agent
-          </el-button>
+          <div class="mode-split">
+           <button
+              type="button"
+              :class="{ active: viewMode === 'group' }"
+              @click="viewMode = 'group'"
+            >
+              组
+            </button>
+            <button
+              type="button"
+              :class="{ active: viewMode === 'agent' }"
+              @click="viewMode = 'agent'"
+            >
+              Agent
+            </button>
+           
+          </div>
+          <el-button
+            :icon="Refresh"
+            circle
+            size="small"
+            title="刷新"
+            :loading="agents.loading"
+            @click="refresh"
+          />
         </div>
       </header>
 
-      <div class="columns">
-        <aside class="panel roster">
-          <div class="panel-head">
-            <span class="panel-title">我的Agent</span>
-            <el-tag size="small" effect="plain">{{ agents.items.length }} 位</el-tag>
-          </div>
-          <button
-            v-for="agent in agents.items"
-            :key="agent.id"
-            type="button"
-            class="agent-card"
-            :class="{ active: agent.id === selectedId, disabled: !agent.enabled }"
-            @click="selectedId = agent.id"
-          >
-            <span class="agent-avatar">{{ agent.avatar || agent.name.slice(0, 1) }}</span>
-            <span class="agent-meta">
-              <strong>{{ agent.name }}</strong>
-              <small>{{ agent.role_title || '自定义员工' }}</small>
-            </span>
-            <span v-if="agent.is_default" class="agent-badge">默认</span>
-            <span v-else-if="!agent.enabled" class="agent-badge muted">停用</span>
-          </button>
-          <el-empty
-            v-if="!agents.loading && agents.items.length === 0"
-            description="还没有 Agent，点击右上方招募"
-            :image-size="60"
-          />
-          <p v-if="agents.error" class="agent-error">{{ agents.error }}</p>
-        </aside>
-
-        <section v-if="current" class="panel editor">
-          <div class="panel-head">
-            <span class="panel-title">
-              <el-icon><UserFilled /></el-icon>
-              {{ current.name }}
-              <el-tag v-if="isDefault" size="small" effect="plain">系统默认 Agent</el-tag>
-              <el-tag v-else size="small" type="success" effect="plain">已招募</el-tag>
-            </span>
-            <div class="editor-actions">
-              <el-button
-                v-if="!isDefault"
-                size="small"
-                type="danger"
-                plain
-                @click="removeAgent"
-              >
-                删除
-              </el-button>
-              <el-button
-                size="small"
-                type="primary"
-                :icon="Check"
-                :loading="agents.saving"
-                @click="save"
-              >
-                保存
-              </el-button>
+      <div class="mode-stage">
+        <div class="mode-pane agent-pane" :class="{ off: viewMode === 'group' }">
+          <aside class="list-pane">
+            <div class="list-head">
+              <span>我的Agent</span>
+              <small>{{ agents.items.length }}</small>
             </div>
-          </div>
-
-          <div class="editor-body">
-            <section class="block">
-              <h3>基本资料</h3>
-              <div class="grid-2">
-                <label>
-                  <span>Agent 名称</span>
-                  <el-input v-model="form.name" placeholder="如：代码审查员" />
-                </label>
-                <label>
-                  <span>职位 / 角色标签</span>
-                  <el-input v-model="form.role_title" placeholder="如：后端工程师" />
-                </label>
-                <label>
-                  <span>头像字符</span>
-                  <el-input v-model="form.avatar" maxlength="2" placeholder="如：A" />
-                </label>
-                <label>
-                  <span>启用状态</span>
-                  <el-switch
-                    :model-value="current.enabled"
-                    @update:model-value="(v: string | number | boolean | undefined) => agents.save(current!.id, { enabled: Boolean(v) })"
-                  />
-                </label>
-              </div>
-              <label class="full">
-                <span>一句话简介</span>
-                <el-input v-model="form.description" placeholder="这个 Agent 擅长什么" />
-              </label>
-            </section>
-
-            <section class="block">
-              <h3>
-                系统提示词
-                <small>与 Harness 固定的执行/安全策略叠加生效</small>
-              </h3>
-              <el-input
-                v-model="form.system_prompt"
-                type="textarea"
-                :rows="14"
-                resize="vertical"
-                placeholder="描述这个 Agent 的身份、风格、工作方法与输出要求"
+            <div class="list-scroll">
+              <AgentListRow
+                v-for="agent in agents.items"
+                :key="agent.id"
+                :agent="agent"
+                :active="agent.id === selectedId"
+                :muted="!agent.enabled"
+                @click="selectedId = agent.id"
+              >
+                <span v-if="agent.is_default" class="row-badge">默认</span>
+                <span v-else-if="!agent.enabled" class="row-badge muted">停用</span>
+              </AgentListRow>
+              <el-empty
+                v-if="!agents.loading && agents.items.length === 0"
+                description="还没有 Agent，点击招募"
+                :image-size="50"
               />
-              <p class="hint">
-                默认 Agent 的提示词来自系统内置模板，可自由修改；招募的 Agent 可以写完全不同的风格。
-              </p>
-            </section>
+              <p v-if="agents.error" class="agent-error">{{ agents.error }}</p>
+            </div>
+          </aside>
 
-            <section class="block">
-              <h3>
-                模型配置
-                <small>不填写则继承当前用户的默认模型</small>
-              </h3>
-              <div class="model-head">
-                <el-radio-group
-                  :model-value="form.useCustomModel ? 'custom' : 'inherit'"
-                  size="small"
-                  @update:model-value="(v: string | number | boolean | undefined) => {
-                    if (v === 'inherit') useGlobalModel()
-                    else form.useCustomModel = true
-                  }"
-                >
-                  <el-radio-button value="inherit">沿用全局</el-radio-button>
-                  <el-radio-button value="custom">独立配置</el-radio-button>
-                </el-radio-group>
+          <section v-if="current" class="form-pane">
+            <header class="form-head">
+              <div class="form-title">
+                <el-icon><UserFilled /></el-icon>
+                <strong>{{ current.name }}</strong>
+                <el-tag v-if="isDefault" size="small" effect="plain">默认</el-tag>
+                <el-tag v-else size="small" type="success" effect="plain">已招募</el-tag>
               </div>
-              <template v-if="form.useCustomModel">
+              <div class="form-actions">
+                <el-button size="small" :icon="Plus" @click="recruitOpen = true">
+                  招募 Agent
+                </el-button>
+                <el-button
+                  size="small"
+                  type="primary"
+                  :icon="Check"
+                  :loading="agents.saving"
+                  @click="save"
+                >
+                  保存
+                </el-button>
+                <el-button
+                  v-if="!isDefault"
+                  size="small"
+                  text
+                  type="danger"
+                  @click="removeAgent"
+                >
+                  删除
+                </el-button>
+                <span class="action-divider"></span>
+                <div class="drawer-dock">
+                  <HoloTooltip
+                    title="模型配置"
+                    code="DRAWER // MODEL"
+                    content="为该 Agent 单独指定模型、上下文窗口与思考能力。留空的字段会先继承组模型，再回落到用户默认模型。"
+                    footer="点击打开右侧抽屉"
+                  >
+                    <button type="button" class="dock-btn" @click="modelOpen = true">
+                      <el-icon><Setting /></el-icon>
+                      <span>模型配置</span>
+                    </button>
+                  </HoloTooltip>
+                  <HoloTooltip
+                    title="组管理"
+                    code="DRAWER // GROUPS"
+                    content="查看该 Agent 已加入的团队组，并决定它在哪些组里承担职责。队长身份决定它能否统筹并委派组员。"
+                    footer="点击打开右侧抽屉"
+                  >
+                    <button type="button" class="dock-btn" @click="groupsOpen = true">
+                      <el-icon><Connection /></el-icon>
+                      <span>组管理</span>
+                    </button>
+                  </HoloTooltip>
+                </div>
+              </div>
+            </header>
+
+            <div class="form-scroll">
+              <section class="form-block">
+                <h3>基本资料</h3>
                 <div class="grid-2">
                   <label>
-                    <span>模型</span>
-                    <el-select
-                      :model-value="form.model_name"
-                      filterable
-                      placeholder="选择模型"
-                      @update:model-value="(v: string) => onPickModel(v)"
-                    >
-                      <el-option
-                        v-for="item in modelOptions"
-                        :key="item.value"
-                        :label="item.label"
-                        :value="item.value"
-                      />
-                    </el-select>
+                    <span>Agent 名称</span>
+                    <el-input v-model="form.name" placeholder="如：代码审查员" />
                   </label>
                   <label>
-                    <span>上下文窗口</span>
-                    <el-select v-model="form.context_limit" placeholder="窗口">
-                      <el-option :value="128000" label="128K" />
-                      <el-option :value="200000" label="200K" />
-                      <el-option :value="256000" label="256K" />
-                      <el-option :value="1000000" label="1M" />
-                    </el-select>
+                    <span>职位 / 角色标签</span>
+                    <el-input v-model="form.role_title" placeholder="如：后端工程师" />
                   </label>
                   <label>
-                    <span>Base URL</span>
-                    <el-input v-model="form.base_url" placeholder="https://api.deepseek.com" />
+                    <span>头像字符</span>
+                    <el-input v-model="form.avatar" maxlength="2" placeholder="如：A" />
                   </label>
-                  <label>
-                    <span>API Key</span>
-                    <el-input
-                      v-model="form.api_key"
-                      type="password"
-                      show-password
-                      autocomplete="off"
-                      :placeholder="current.model?.has_api_key ? '留空保持不变' : '未配置'"
+                  <div class="inline-field">
+                    <span>启用状态</span>
+                    <el-switch
+                      :model-value="Boolean(current?.enabled)"
+                      @update:model-value="(v: string | number | boolean | undefined) => agents.save(current!.id, { enabled: Boolean(v) })"
                     />
-                  </label>
+                  </div>
                 </div>
-                <div class="switch-row">
-                  <span>思考能力</span>
-                  <el-switch v-model="form.thinking_enabled" />
-                </div>
-                <p class="hint">
-                  上下文窗口用于压缩阈值与占用展示；当前值 {{ formatContext(form.context_limit) }}。
-                </p>
-              </template>
-            </section>
+                <label>
+                  <span>一句话简介</span>
+                  <el-input v-model="form.description" placeholder="这个 Agent 擅长什么" />
+                </label>
+              </section>
 
-            <section class="block">
-              <h3>
-                MCP 服务
-                <small>空选表示允许全部公共 MCP；集成后端只随会话绑定</small>
-              </h3>
-              <el-select
-                v-model="form.mcp_server_ids"
-                multiple
-                filterable
-                collapse-tags
-                collapse-tags-tooltip
-                :loading="mcpLoading"
-                placeholder="选择该 Agent 可连接的 MCP 服务"
-                class="mcp-select"
-              >
-                <el-option
-                  v-for="item in mcpOptions"
-                  :key="item.value"
-                  :label="item.label"
-                  :value="item.value"
-                  :disabled="!item.enabled"
+              <section class="form-block">
+                <h3>
+                  系统提示词
+                  <small>与 Harness 固定的执行/安全策略叠加生效</small>
+                </h3>
+                <el-input
+                  v-model="form.system_prompt"
+                  type="textarea"
+                  :rows="16"
+                  resize="vertical"
+                  placeholder="描述这个 Agent 的身份、风格、工作方法与输出要求"
+                />
+              </section>
+
+              <section class="form-block">
+                <h3>
+                  MCP 服务
+                  <small>空选表示允许全部公共 MCP；集成后端只随会话绑定</small>
+                </h3>
+                <el-select
+                  v-model="form.mcp_server_ids"
+                  multiple
+                  filterable
+                  collapse-tags
+                  collapse-tags-tooltip
+                  :loading="mcpLoading"
+                  placeholder="选择该 Agent 可连接的 MCP 服务"
+                  class="mcp-select"
                 >
-                  <span>{{ item.label }}</span>
-                  <el-tag v-if="item.integration" size="small" effect="plain">集成</el-tag>
-                </el-option>
-              </el-select>
-              <p class="hint">
-                未选任何服务时，主 Agent 会加载全部已启用的公共 MCP；选择后只暴露勾选的服务。
-              </p>
-            </section>
-          </div>
-        </section>
+                  <el-option
+                    v-for="item in mcpOptions"
+                    :key="item.value"
+                    :label="item.label"
+                    :value="item.value"
+                    :disabled="!item.enabled"
+                  >
+                    <span>{{ item.label }}</span>
+                    <el-tag v-if="item.integration" size="small" effect="plain">集成</el-tag>
+                  </el-option>
+                </el-select>
+                <p class="hint">
+                  未选任何服务时，主 Agent 会加载全部已启用的公共 MCP；选择后只暴露勾选的服务。
+                </p>
+              </section>
+            </div>
+          </section>
+          <section v-else class="form-pane empty-pane">
+            <el-empty description="选择或招募一个 Agent" :image-size="70" />
+          </section>
+        </div>
+
+        <div class="mode-pane group-pane" :class="{ off: viewMode === 'agent' }">
+          <GroupWorkspace />
+        </div>
       </div>
     </div>
 
-    <el-dialog v-model="recruitOpen" title="招募 Agent" width="520px">
+    <el-dialog v-model="recruitOpen" title="招募 Agent" width="500px">
       <div class="recruit-form">
         <label>
           <span>名称 <em>*</em></span>
@@ -447,11 +434,24 @@ onMounted(async () => {
       </div>
       <template #footer>
         <el-button @click="recruitOpen = false">取消</el-button>
-        <el-button type="primary" :loading="agents.saving" @click="recruit">
-          确认招募
-        </el-button>
+        <el-button type="primary" :loading="agents.saving" @click="recruit">确认招募</el-button>
       </template>
     </el-dialog>
+
+    <AgentModelDrawer
+      v-model="modelOpen"
+      :model-name="form.model_name"
+      :base-url="form.base_url"
+      :has-api-key="Boolean(current?.model?.has_api_key)"
+      :thinking-enabled="form.thinking_enabled"
+      :context-limit="form.context_limit"
+      @apply="applyModel"
+    />
+    <AgentGroupsDrawer
+      v-if="current"
+      v-model="groupsOpen"
+      :agent-id="current.id"
+    />
   </div>
 </template>
 
@@ -461,7 +461,11 @@ onMounted(async () => {
 }
 
 .page {
-  padding: 18px 22px 28px;
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - var(--topbar-h));
+  padding: 0;
+  overflow: hidden;
 }
 
 .page-head {
@@ -469,7 +473,8 @@ onMounted(async () => {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 14px;
+  padding: 16px 22px 12px;
+  flex: none;
 }
 
 .head-text {
@@ -503,109 +508,117 @@ onMounted(async () => {
 
 .head-actions {
   display: flex;
-  gap: 8px;
-}
-
-.columns {
-  display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
-  gap: 14px;
-  align-items: start;
-}
-
-.panel {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: rgba(8, 14, 27, 0.55);
-  backdrop-filter: blur(8px);
-}
-
-.roster {
-  padding: 12px;
-  position: sticky;
-  top: calc(var(--topbar-h) + 16px);
-}
-
-.panel-head {
-  display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
-  padding-bottom: 10px;
 }
 
-.panel-title {
+/* SplitButton：两个按钮共享边框，中间一条分隔线 */
+.mode-split {
   display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-1);
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
 }
 
-.agent-card {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  padding: 9px 10px;
-  margin-bottom: 6px;
-  text-align: left;
-  color: var(--text-1);
-  border: 1px solid transparent;
-  border-radius: 9px;
-  background: rgba(10, 18, 34, 0.5);
-  transition: border-color 0.16s, background 0.16s;
+.mode-split button {
+  min-width: 62px;
+  padding: 5px 12px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  transition: color 0.16s, background 0.16s;
 }
 
-.agent-card:hover {
-  border-color: var(--line-strong);
+.mode-split button + button {
+  border-left: 1px solid var(--line-strong);
+}
+
+.mode-split button:hover {
+  color: var(--text-1);
   background: var(--bg-hover);
 }
 
-.agent-card.active {
-  border-color: rgba(55, 208, 196, 0.6);
-  background: rgba(55, 208, 196, 0.08);
-}
-
-.agent-card.disabled {
-  opacity: 0.55;
-}
-
-.agent-avatar {
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  flex: none;
-  font-size: 13px;
-  font-weight: 700;
+.mode-split button.active {
+  font-weight: 600;
   color: #041018;
-  border-radius: 9px;
   background: linear-gradient(135deg, var(--accent-cyan), var(--accent));
 }
 
-.agent-meta {
+.mode-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.mode-pane {
+  position: absolute;
+  inset: 0;
+  transition:
+    transform 0.42s cubic-bezier(0.22, 0.61, 0.36, 1),
+    opacity 0.28s ease;
+  will-change: transform;
+}
+
+.mode-pane.off {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.agent-pane {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+}
+
+.agent-pane.off {
+  transform: translateX(64%);
+}
+
+.group-pane {
+  display: grid;
+}
+
+.group-pane.off {
+  transform: translateX(-26%);
+}
+
+.list-pane {
   display: flex;
   flex-direction: column;
-  min-width: 0;
-  flex: 1;
-  line-height: 1.25;
+  min-height: 0;
+  padding: 0 8px;
+  border-right: 1px solid var(--line);
 }
 
-.agent-meta strong {
-  font-size: 12.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 40px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  flex: none;
 }
 
-.agent-meta small {
+.list-head small {
   font-size: 10px;
+  font-weight: 400;
   color: var(--text-3);
 }
 
-.agent-badge {
+.list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 12px;
+}
+
+.row-badge {
   flex: none;
   padding: 1px 6px;
   font-size: 9px;
@@ -614,50 +627,117 @@ onMounted(async () => {
   border-radius: 999px;
 }
 
-.agent-badge.muted {
+.row-badge.muted {
   color: var(--text-3);
   border-color: var(--line);
 }
 
 .agent-error {
-  margin: 8px 0 0;
+  margin: 8px;
   font-size: 10.5px;
   color: var(--danger);
 }
 
-.editor {
-  min-height: 520px;
-  padding: 14px 16px 18px;
+.form-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
 }
 
-.editor-actions {
+.form-head {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 56px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+  flex: none;
+}
+
+.form-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-1);
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
   gap: 8px;
 }
 
-.editor-body {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.action-divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--line);
 }
 
-.block {
+/* 两个抽屉入口：带文字的发光按钮，比圆形图标更容易被注意到 */
+.drawer-dock {
   display: flex;
-  flex-direction: column;
-  gap: 9px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(5, 11, 22, 0.42);
+  align-items: center;
+  gap: 6px;
 }
 
-.block h3 {
+.dock-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11.5px;
+  color: var(--accent-cyan);
+  border: 1px solid rgba(55, 208, 196, 0.42);
+  border-radius: 6px;
+  background: linear-gradient(135deg, rgba(55, 208, 196, 0.14), rgba(47, 124, 246, 0.1));
+  box-shadow: inset 0 0 14px rgba(55, 208, 196, 0.08);
+  cursor: pointer;
+  transition: color 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.dock-btn:hover {
+  color: #dffaff;
+  border-color: rgba(160, 240, 255, 0.8);
+  box-shadow:
+    0 0 0 1px rgba(55, 208, 196, 0.2),
+    0 0 16px rgba(55, 208, 196, 0.28);
+}
+
+.dock-btn .el-icon {
+  font-size: 13px;
+}
+
+.form-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 20px 28px;
+}
+
+.form-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.form-block:last-child {
+  border-bottom: 0;
+}
+
+.form-block h3 {
   margin: 0;
   font-size: 12.5px;
   color: var(--text-1);
 }
 
-.block h3 small {
+.form-block h3 small {
   margin-left: 8px;
   font-size: 10px;
   font-weight: 400;
@@ -667,19 +747,15 @@ onMounted(async () => {
 .grid-2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 
 label {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
   font-size: 11px;
   color: var(--text-2);
-}
-
-label.full {
-  width: 100%;
 }
 
 label em {
@@ -687,18 +763,17 @@ label em {
   color: var(--danger);
 }
 
-.model-head {
+.inline-field {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-}
-
-.switch-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  gap: 12px;
   font-size: 11.5px;
   color: var(--text-2);
+}
+
+.empty-pane {
+  align-items: center;
+  justify-content: center;
 }
 
 .mcp-select {
@@ -715,15 +790,12 @@ label em {
 .recruit-form {
   display: flex;
   flex-direction: column;
-  gap: 11px;
+  gap: 12px;
 }
 
 @media (max-width: 1080px) {
-  .columns {
-    grid-template-columns: 1fr;
-  }
-  .roster {
-    position: static;
+  .agent-pane {
+    grid-template-columns: 200px minmax(0, 1fr);
   }
 }
 </style>

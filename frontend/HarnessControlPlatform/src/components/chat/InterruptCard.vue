@@ -42,6 +42,8 @@ interface HostApproval {
   summary: string
   reason: string
   args: Record<string, unknown>
+  scope?: string
+  options?: HitlOption[]
 }
 
 const props = withDefaults(defineProps<{ msg: ChatMsg; readonly?: boolean }>(), {
@@ -215,12 +217,14 @@ function rejectAll() {
 }
 
 // ---------- 宿主能力审批 ----------
-function approveHost(scope: 'once' | 'thread') {
-  chat.resume(
-    props.msg,
-    { decision: scope === 'thread' ? 'approve_thread' : 'approve' },
-    'approved',
-  )
+function approveHost(scope: 'once' | 'project' | 'thread') {
+  const decision =
+    scope === 'thread'
+      ? 'approve_thread'
+      : scope === 'project'
+        ? 'approve_project'
+        : 'approve'
+  chat.resume(props.msg, { decision }, 'approved')
 }
 
 function rejectHost() {
@@ -245,7 +249,7 @@ function rejectHost() {
       <span v-else class="tag-wait"><i class="dot"></i>等待处理</span>
     </div>
 
-    <!-- 宿主能力审批：批准一次 / 仅本会话允许 / 拒绝 -->
+    <!-- 宿主能力审批：允许本次 / 本项目内允许 / 仅本会话允许 / 拒绝 -->
     <template v-if="isHostApproval && hostApproval">
       <p class="question">{{ hostApproval.summary }}</p>
       <p v-if="hostApproval.reason" class="context">原因：{{ hostApproval.reason }}</p>
@@ -259,7 +263,15 @@ function rejectHost() {
         <input v-model="rejectReason" placeholder="拒绝理由（可选）" />
         <div class="actions">
           <button class="primary" type="button" @click="approveHost('once')">
-            <AppIcon name="check" :size="13" /> 批准一次
+            <AppIcon name="check" :size="13" /> 允许本次
+          </button>
+          <button
+            v-if="hostApproval.scope === 'project' || hostApproval.options?.some((item) => item.value === 'approve_project')"
+            class="ghost-btn"
+            type="button"
+            @click="approveHost('project')"
+          >
+            <AppIcon name="shield" :size="13" /> 本项目内允许
           </button>
           <button class="ghost-btn" type="button" @click="approveHost('thread')">
             <AppIcon name="shield" :size="13" /> 仅本会话允许

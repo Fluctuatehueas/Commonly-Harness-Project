@@ -17,6 +17,8 @@ export interface SessionItem {
   integration_server_id: string | null
   /** 会话绑定的 MyAgent 档案 ID。 */
   agent_id?: string | null
+  /** 会话绑定的 AgentTeam 组；普通会话为 null。 */
+  group_id?: string | null
   /** 是否已归档：归档后从侧边栏隐藏，仅可在归档管理中查看/恢复/删除。 */
   archived: boolean
   archived_at: string | null
@@ -43,6 +45,7 @@ export const useSessionStore = defineStore('sessions', () => {
       project_id: item.project_id ?? null,
       integration_server_id: item.integration_server_id ?? null,
       agent_id: item.agent_id ?? null,
+      group_id: item.group_id ?? null,
       archived: Boolean(item.archived),
       archived_at: item.archived_at ?? null,
     }
@@ -135,6 +138,7 @@ export const useSessionStore = defineStore('sessions', () => {
     projectId?: string | null,
     integrationServerId?: string | null,
     agentId?: string | null,
+    groupId?: string | null,
   ): Promise<string | null> {
     try {
       const query = new URLSearchParams({ user_id: USER_ID })
@@ -143,6 +147,7 @@ export const useSessionStore = defineStore('sessions', () => {
         query.set('integration_server_id', integrationServerId)
       }
       if (agentId) query.set('agent_id', agentId)
+      if (groupId) query.set('group_id', groupId)
       const res = await fetch(`${API_BASE}/history?${query.toString()}`, { method: 'POST' })
       if (!res.ok) return null
       const session = normalize((await res.json()) as SessionItem)
@@ -251,6 +256,19 @@ export const useSessionStore = defineStore('sessions', () => {
     }
   }
 
+  /**
+   * 把本轮实际使用的 Agent / 组回写到本地会话索引。
+   *
+   * 后端在每轮消息里已经持久化绑定，这里只同步内存副本，避免用户切走再
+   * 切回时用到旧值（此时不会重新拉取会话列表）。
+   */
+  function bindRouting(threadId: string, agentId: string, groupId: string) {
+    const target = sessions.value.find((item) => item.thread_id === threadId)
+    if (!target) return
+    target.agent_id = agentId || null
+    target.group_id = groupId || null
+  }
+
   return {
     sessions,
     archivedSessions,
@@ -271,5 +289,6 @@ export const useSessionStore = defineStore('sessions', () => {
     isArchived,
     markRunning,
     markWaiting,
+    bindRouting,
   }
 })

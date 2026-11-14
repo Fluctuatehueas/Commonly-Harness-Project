@@ -41,6 +41,22 @@ class HarnessContext:
     evolution_verification_failed: bool = False
     evolution_verification_reason: str = ""
     evolution_risk_tier: str = ""
+    # PDCA 闭环：同一轮内的计划、检查轮次与反馈。进程内上下文，不落库。
+    pdc_plan: str = ""
+    pdc_round: int = 0
+    pdc_max_rounds: int = 2
+    pdc_feedback: str = ""
+    pdc_outcome: str = ""
+    # L2 确定性验证配置；由 API 层从请求透传，未配置时对应验证器不启用。
+    evolution_output_schema: dict[str, Any] | None = None
+    evolution_numeric_ranges: dict[str, Any] | None = None
+    # AgentTeam 运行期身份：入口 Agent（用户直接对话的那个）与生效组。
+    # 子 Agent 与父图共享同一份 context，因此子 Agent 身份由中间件固化。
+    agent_id: str = "default"
+    group_id: str = ""
+    group_role: str = ""
+    team_depth: int = 0
+    delegation_chain: tuple[str, ...] = ()
 
 
 @dataclass
@@ -86,6 +102,17 @@ class ChatRequest(BaseModel):
     user_state: str = Field("", description="中途接管时用户已完成部分的产出描述")
     # 用户选择的 MyAgent 档案；为空时沿用会话绑定，再回退默认 Agent。
     agent_id: Optional[str] = Field(None, description="执行本轮任务的 MyAgent ID")
+    # 生效组；为空时沿用会话绑定。多组组长必须显式指定。
+    group_id: Optional[str] = Field(None, description="执行本轮任务的 AgentTeam 组 ID")
+    # PDCA 的 L2 确定性验证：可选，提供后最终回答会被强制校验。
+    output_schema: Optional[Dict[str, Any]] = Field(
+        None,
+        description="可选：最终回答必须满足的 JSON Schema（含 required 字段）",
+    )
+    numeric_ranges: Optional[Dict[str, Any]] = Field(
+        None,
+        description='可选：数值断言，如 {"total": {"value": 120, "min": 0, "max": 200}}',
+    )
 
     @model_validator(mode="after")
     def set_username(self) -> "ChatRequest":
@@ -204,7 +231,8 @@ class Message(BaseModel):
     id: str = Field(..., description="消息唯一标识")
     role: str = Field(..., description="消息角色: user/assistant/tool/delegation")
     content: str = Field("", description="消息内容")
-    created_at: datetime = Field(default_factory=datetime.now, description="创建时间")
+    # 消息自身的时间戳；旧 checkpoint 没有记录时为 None，前端不展示时间。
+    created_at: Optional[datetime] = Field(None, description="创建时间")
     tool_calls: Optional[List[Dict[str, Any]]] = Field(None, description="工具调用信息")
     tool_call_id: Optional[str] = Field(None, description="工具调用 ID")
     source: Optional[str] = Field(None, description="消息来源: main 或子 Agent 名称")
@@ -238,6 +266,10 @@ class Session(BaseModel):
     # 会话绑定的 MyAgent 档案 ID；默认会话为 default。
     agent_id: Optional[str] = Field(
         None, description="创建会话时选择的 MyAgent ID"
+    )
+    # 会话绑定的 AgentTeam 组；为空表示普通会话（没有组上下文）。
+    group_id: Optional[str] = Field(
+        None, description="创建会话时选择的 AgentTeam 组 ID"
     )
     archived: bool = Field(False, description="是否已归档（软删除）")
     archived_at: Optional[datetime] = Field(None, description="归档时间；未归档为 null")

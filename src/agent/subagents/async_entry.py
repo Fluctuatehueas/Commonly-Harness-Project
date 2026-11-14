@@ -35,7 +35,9 @@ from agent.config import (
     get_summary_model,
 )
 from agent.middlewares.agent_protection import build_agent_protection_middleware
+from agent.middlewares.model_concurrency import ModelConcurrencyMiddleware
 from agent.middlewares.skills_sync import SandboxSkillsMiddleware
+from agent.middlewares.time_awareness import TimeAwarenessMiddleware
 from agent.subagents.async_registry import (
     ASYNC_SUBAGENT_GRAPH_ID,
     get_async_subagent_registration,
@@ -88,6 +90,8 @@ def build_async_subagent_graph(
         skills=skills,
         backend=backend,
         middleware=[
+            # 远程图与主进程共享同一个模型调用闸门，避免并发打满并破坏缓存预热。
+            ModelConcurrencyMiddleware(),
             # 远程图共享用户沙箱，必须先同步技能再读取 YAML 指定的技能目录。
             SandboxSkillsMiddleware(
                 backend=backend,
@@ -100,6 +104,9 @@ def build_async_subagent_graph(
                 model_run_limit=ASYNC_SUBAGENT_MODEL_RUN_LIMIT,
                 tool_run_limit=ASYNC_SUBAGENT_TOOL_RUN_LIMIT,
             ),
+            # 远程图同样需要时间属性：入口委派消息补时，模型/工具消息渲染时间。
+            # 放在最内层，确保压缩重写消息列表后依然渲染时间前缀。
+            TimeAwarenessMiddleware(stamp_missing_human=True),
         ],
         interrupt_on=subagent_config.get("interrupt_on"),
         checkpointer=None,

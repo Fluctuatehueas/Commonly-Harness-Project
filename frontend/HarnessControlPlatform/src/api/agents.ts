@@ -10,6 +10,12 @@ export interface AgentModelConfig {
   context_limit?: number
 }
 
+export interface AgentGroupRef {
+  group_id: string
+  name: string
+  role: 'leader' | 'member'
+}
+
 export interface AgentProfile {
   id: string
   name: string
@@ -19,6 +25,7 @@ export interface AgentProfile {
   system_prompt: string
   model: AgentModelConfig
   mcp_server_ids: string[]
+  groups?: AgentGroupRef[]
   enabled: boolean
   is_default: boolean
   created_at: string
@@ -33,6 +40,7 @@ export interface AgentPayload {
   system_prompt?: string
   model?: AgentModelConfig
   mcp_server_ids?: string[]
+  group_ids?: string[]
   enabled?: boolean
 }
 

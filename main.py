@@ -6,6 +6,7 @@
 环境变量：
     HARNESS_API_HOST  默认 127.0.0.1
     HARNESS_API_PORT  默认 8000
+    HARNESS_LOG_DIR   默认 ./logs；HARNESS_LOG_LEVEL 默认 INFO
 """
 
 from __future__ import annotations
@@ -27,32 +28,33 @@ if str(SRC_DIR) not in sys.path:
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Agent 侧的观测日志（上下文监控 / 轨迹）默认走 INFO；
-# 根 logger 已有 handler 时 basicConfig 不会重复配置。
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
 import uvicorn  # noqa: E402
 
 from api.chat import app  # noqa: E402
 from utils.integrity import integrity_hint, process_integrity  # noqa: E402
+from utils.logging_setup import configure_logging, stop_logging  # noqa: E402
 
 
 def main() -> None:
     """以单进程模式启动 FastAPI 服务。"""
+    # 结构化日志：控制台人类可读 + 文件 JSON Lines + 异步队列（不阻塞事件循环）。
+    listener = configure_logging()
     host = os.getenv("HARNESS_API_HOST", "127.0.0.1")
     port = int(os.getenv("HARNESS_API_PORT", "8000"))
-    level = process_integrity()
-    hint = integrity_hint()
-    if hint:
-        logging.getLogger(__name__).warning("进程完整性=%s；%s", level, hint)
-    else:
-        logging.getLogger(__name__).info("进程完整性=%s", level)
-    # loop="none" 表示沿用上面已设置的 Selector 事件循环策略。
-    uvicorn.run(app, host=host, port=port, loop="none")
-    
+    log = logging.getLogger(__name__)
+    try:
+        level = process_integrity()
+        hint = integrity_hint()
+        if hint:
+            log.warning("进程完整性=%s；%s", level, hint)
+        else:
+            log.info("进程完整性=%s", level)
+        # loop="none" 表示沿用上面已设置的 Selector 事件循环策略。
+        uvicorn.run(app, host=host, port=port, loop="none")
+    finally:
+        # 等队列监听把缓冲写完再退出，否则崩溃前的最后几条日志会丢。
+        stop_logging(listener)
+
 
 if __name__ == "__main__":
     main()

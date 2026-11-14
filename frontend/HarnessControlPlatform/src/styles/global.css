@@ -59,15 +59,15 @@ body {
   font-family: var(--font-sans);
   font-size: 13px;
   color: var(--text-1);
-  background:
-    linear-gradient(rgba(126, 154, 198, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(126, 154, 198, 0.035) 1px, transparent 1px),
-    radial-gradient(1100px 620px at 82% -12%, rgba(91, 140, 255, 0.12), transparent 62%),
-    radial-gradient(900px 560px at -8% 108%, rgba(55, 208, 196, 0.06), transparent 60%),
-    var(--bg-deep);
-  background-size: 64px 64px, 64px 64px, auto, auto, auto;
-  background-attachment: fixed;
+  /* 整体背景：深空插画 + 压暗遮罩，保证面板与正文仍然可读。 */
   background-color: var(--bg-deep);
+  background-image:
+    linear-gradient(180deg, rgba(7, 11, 20, 0.66), rgba(7, 11, 20, 0.88)),
+    url('../assets/BG_Chat.png');
+  background-size: cover, cover;
+  background-position: center, center;
+  background-repeat: no-repeat, no-repeat;
+  background-attachment: fixed, fixed;
   -webkit-font-smoothing: antialiased;
 }
 

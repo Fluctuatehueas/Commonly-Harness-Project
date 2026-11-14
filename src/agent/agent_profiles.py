@@ -83,7 +83,8 @@ def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _normalize_model(raw: Any) -> dict[str, Any]:
+def normalize_model(raw: Any) -> dict[str, Any]:
+    """裁剪模型配置字段；Agent 档案与组模型共用同一套白名单。"""
     if not isinstance(raw, dict):
         return {}
     allowed = {
@@ -187,7 +188,7 @@ class AgentProfileStore:
             "system_prompt": str(
                 payload.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
             )[:MAX_SYSTEM_PROMPT],
-            "model": _normalize_model(payload.get("model")),
+            "model": normalize_model(payload.get("model")),
             "mcp_server_ids": _normalize_mcp_ids(payload.get("mcp_server_ids")),
             "enabled": bool(payload.get("enabled", True)),
             "is_default": False,
@@ -223,7 +224,7 @@ class AgentProfileStore:
             updated["system_prompt"] = prompt[:MAX_SYSTEM_PROMPT]
         if "model" in patch:
             # 前端回传空字符串表示“沿用用户默认模型”，不保存空键。
-            updated["model"] = _normalize_model(patch.get("model"))
+            updated["model"] = normalize_model(patch.get("model"))
         if "mcp_server_ids" in patch:
             updated["mcp_server_ids"] = _normalize_mcp_ids(
                 patch.get("mcp_server_ids")
@@ -247,6 +248,6 @@ class AgentProfileStore:
     def merge_model(profile: dict[str, Any], user_model: dict[str, Any]) -> dict[str, Any]:
         """档案模型配置覆盖用户默认值；未配置的字段继续继承。"""
         merged = dict(user_model)
-        override = _normalize_model(profile.get("model"))
+        override = normalize_model(profile.get("model"))
         merged.update(override)
         return merged

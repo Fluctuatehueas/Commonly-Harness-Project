@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -27,6 +27,7 @@ from agent.schema import (
     SessionMessagesResponse,
     SessionUpdateRequest,
 )
+from agent.time_context import message_timestamp, parse_iso, strip_time_tags
 from agent.tools.async_sandbox_tools import START_ASYNC_TASK_TOOL_NAME
 from api.agent_loader import agent_loader
 from api.async_tasks import extract_async_task_id
@@ -130,6 +131,11 @@ def _message_reasoning(message: Any) -> str:
     return ""
 
 
+def _message_created_at(message: Any) -> datetime | None:
+    """读取消息自身的时间戳；旧 checkpoint 没有记录时返回 None。"""
+    return parse_iso(message_timestamp(message))
+
+
 def serialize_messages(
     messages: list[Any],
     usage_by_message: dict[str, dict[str, int]] | None = None,
@@ -143,7 +149,6 @@ def serialize_messages(
     """
     serialized: list[Message] = []
     tool_messages: dict[str, Message] = {}
-    now = datetime.now(timezone.utc)
     completed_tasks = {
         str(_message_value(message, "id", "")).removeprefix("async-task-result:")
         for message in messages
@@ -153,6 +158,12 @@ def serialize_messages(
     for index, message in enumerate(messages):
         role = _message_role(message)
         message_content = _message_value(message, "content", "")
+        # 任务流规范等内部注入消息只给模型看，不进用户历史与气泡。
+        additional_kwargs = _message_value(message, "additional_kwargs", {}) or {}
+        if isinstance(additional_kwargs, dict) and additional_kwargs.get(
+            "harness_internal"
+        ):
+            continue
         # 用户消息带附件时，只回显原话，避免把注入的文档正文带进历史列表。
         content = (
             _user_display_content(message_content)
@@ -160,12 +171,12 @@ def serialize_messages(
             else content_to_text(message_content)
         )
         if role == "assistant":
-            content = _strip_self_check_header(content)
+            # 旧版本把时间标记写进正文，历史回放时一并清除，气泡时间由前端展示。
+            content = strip_time_tags(_strip_self_check_header(content))
             # AIMessage 可同时携带文本和工具调用，必须先保留文本的原始顺序。
-            additional_kwargs = _message_value(message, "additional_kwargs", {}) or {}
             source = str(additional_kwargs.get("source", "main"))
             # 思考内容先于同一条 AI 消息的正文与工具调用到达，历史也按同样顺序回放。
-            reasoning = _message_reasoning(message)
+            reasoning = strip_time_tags(_message_reasoning(message))
             if reasoning:
                 serialized.append(
                     Message(
@@ -173,7 +184,7 @@ def serialize_messages(
                         role="reasoning",
                         content=reasoning,
                         source=source,
-                        created_at=now,
+                        created_at=_message_created_at(message),
                     )
                 )
             if content:
@@ -187,7 +198,7 @@ def serialize_messages(
                         content=content,
                         source=source,
                         async_task_id=additional_kwargs.get("async_task_id"),
-                        created_at=now,
+                        created_at=_message_created_at(message),
                         tokens=(
                             usage_by_message.get(
                                 str(_message_value(message, "id", "") or "")
@@ -224,7 +235,7 @@ def serialize_messages(
                     text="",
                     tool_status="calling",
                     source=subagent_name or ("subagent" if is_delegation else "main"),
-                    created_at=now,
+                    created_at=_message_created_at(message),
                 )
                 serialized.append(tool_message)
                 tool_messages[call_id] = tool_message
@@ -242,7 +253,7 @@ def serialize_messages(
                         text=content,
                         tool_status=tool_status,
                         source="main",
-                        created_at=now,
+                        created_at=_message_created_at(message),
                     )
                 )
             else:
@@ -272,7 +283,7 @@ def serialize_messages(
                     id=f"message-{index}",
                     role="user",
                     content=content,
-                    created_at=now,
+                    created_at=_message_created_at(message),
                 )
             )
     return serialized
@@ -290,6 +301,7 @@ def _session_from_index(item: dict[str, Any], message_count: int) -> Session:
         project_id=item.get("project_id") or None,
         integration_server_id=item.get("integration_server_id") or None,
         agent_id=item.get("agent_id") or None,
+        group_id=item.get("group_id") or None,
         archived=bool(item.get("archived", False)),
         archived_at=(
             datetime.fromisoformat(item["archived_at"])
@@ -305,6 +317,7 @@ async def create_session(
     project_id: str | None = Query(None, min_length=1),
     integration_server_id: str | None = Query(None, min_length=1),
     agent_id: str = Query("default", min_length=1, max_length=64),
+    group_id: str | None = Query(None, max_length=64),
 ) -> Session:
     """创建一条尚未发送消息的会话。
 
@@ -349,6 +362,8 @@ async def create_session(
         bind_integration=True,
         agent_id=agent_id,
         bind_agent=True,
+        group_id=group_id,
+        bind_group=True,
     )
     session = await agent_loader.get_session(user_id, thread_id)
     assert session is not None

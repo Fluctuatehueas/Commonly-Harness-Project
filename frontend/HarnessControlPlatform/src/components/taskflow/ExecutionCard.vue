@@ -13,11 +13,20 @@ const props = withDefaults(
     currentStep?: string
     steps?: ExecutionStepView[]
     traces?: StepTrace[]
+    /** 顶部常驻卡片：默认折叠，只显示标题与进度条。 */
+    collapsible?: boolean
   }>(),
-  { currentStep: '', steps: () => [], traces: () => [] },
+  { currentStep: '', steps: () => [], traces: () => [], collapsible: false },
 )
 
 const expanded = ref(false)
+// 可折叠时默认收起：折叠只留标题 + 进度条，展开才显示步骤列表。
+const open = ref(!props.collapsible)
+
+function toggle() {
+  if (!props.collapsible) return
+  open.value = !open.value
+}
 
 const statusLabel: Record<string, string> = {
   running: '执行中',
@@ -66,9 +75,12 @@ function formatDuration(ms: number): string {
 
 <template>
   <article class="exec-card" :class="status">
-    <header class="exec-head">
+    <header class="exec-head" :class="{ clickable: collapsible }" @click="toggle">
       <span class="exec-icon">
-        <AppIcon :name="status === 'done' ? 'check' : status === 'failed' ? 'close' : 'target'" :size="13" />
+        <AppIcon
+          :name="status === 'done' ? 'check' : status === 'failed' ? 'close' : 'target'"
+          :size="13"
+        />
       </span>
       <div class="exec-title">
         <strong>{{ flowName }}</strong>
@@ -77,7 +89,16 @@ function formatDuration(ms: number): string {
       </div>
       <span class="exec-state">{{ statusLabel[status] || status }}</span>
       <button
-        v-if="traces.length"
+        v-if="collapsible"
+        class="expand-btn"
+        type="button"
+        :title="open ? '收起步骤进度' : '展开步骤进度'"
+        @click.stop="toggle"
+      >
+        <AppIcon name="chevronRight" :size="12" :class="{ rotated: open }" />
+      </button>
+      <button
+        v-else-if="traces.length"
         class="expand-btn"
         type="button"
         :title="expanded ? '收起步骤详情' : '展开步骤详情'"
@@ -91,24 +112,31 @@ function formatDuration(ms: number): string {
       <i :style="{ width: `${Math.max(4, progress)}%` }"></i>
     </div>
 
-    <ul v-if="steps.length" class="step-list">
-      <li v-for="step in steps" :key="step.id" class="step-item" :class="step.status">
-        <span class="step-icon">
-          <AppIcon :name="stepIcon[step.status] || 'clock'" :size="11" />
+    <ul v-if="steps.length && open" class="step-list">
+      <li v-for="(step, index) in steps" :key="step.id" class="step-item" :class="step.status">
+        <span class="step-name">
+          <em class="step-index">{{ index + 1 }}</em>
+          <span class="step-dash">—</span>
+          <span>{{ step.name || step.id }}</span>
         </span>
-        <span class="step-name">{{ step.name || step.id }}</span>
         <em v-if="step.branch" class="step-branch">{{ step.branch }}</em>
-        <em class="step-state">{{ stepStatusLabel[step.status] || step.status }}</em>
+        <span class="step-state" :title="stepStatusLabel[step.status] || step.status">
+          <AppIcon :name="stepIcon[step.status] || 'clock'" :size="13" />
+        </span>
 
         <!-- 运行中的步骤实时展示模型增量输出，避免长时间无反馈 -->
-        <pre v-if="step.status === 'running' && step.output" class="live-output">{{ step.output }}</pre>
+        <pre v-if="step.status === 'running' && step.output" class="live-output">{{
+          step.output
+        }}</pre>
 
         <div v-if="expanded && tracesOf(step.id).length" class="traces">
           <div v-for="(trace, ti) in tracesOf(step.id)" :key="ti" class="trace">
             <p class="trace-meta">
               <span v-if="trace.branch">分支：{{ trace.branch }} · </span>
               <span>尝试 {{ trace.attempts }} 次 · {{ formatDuration(trace.duration_ms) }}</span>
-              <span v-if="trace.state_source === 'user_provided'" class="user-provided">用户提供的上游状态</span>
+              <span v-if="trace.state_source === 'user_provided'" class="user-provided"
+                >用户提供的上游状态</span
+              >
             </p>
             <p v-if="traceOutput(trace)" class="trace-text">{{ traceOutput(trace) }}</p>
             <p v-if="trace.check_result" class="trace-text check">校验：{{ trace.check_result }}</p>
@@ -142,6 +170,10 @@ function formatDuration(ms: number): string {
   display: flex;
   align-items: center;
   gap: 9px;
+}
+
+.exec-head.clickable {
+  cursor: pointer;
 }
 
 .exec-icon {
@@ -249,49 +281,69 @@ function formatDuration(ms: number): string {
   align-items: center;
   flex-wrap: wrap;
   gap: 7px;
+  min-height: 20px;
   font-size: 11px;
   color: var(--text-3);
 }
 
-.step-icon {
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
+/* 左侧：序号 —— 步骤名；右侧只保留状态图标 */
+.step-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--text-2);
+}
+
+.step-index {
   flex: none;
-  border-radius: 50%;
-  border: 1px solid var(--line);
+  min-width: 14px;
+  font-family: var(--font-mono);
+  font-style: normal;
+  font-size: 10px;
   color: var(--text-3);
+  text-align: right;
 }
 
-.step-item.running .step-icon {
-  color: var(--accent-cyan);
-  border-color: rgba(55, 208, 196, 0.5);
+.step-dash {
+  flex: none;
+  color: var(--line-strong);
 }
 
-.step-item.done .step-icon {
-  color: var(--green);
-  border-color: rgba(55, 201, 164, 0.45);
-}
-
-.step-item.failed .step-icon {
-  color: var(--danger);
-  border-color: rgba(226, 96, 94, 0.45);
-}
-
-.step-item.degraded .step-icon {
-  color: var(--amber);
-  border-color: rgba(242, 176, 60, 0.45);
-}
-
+.step-item.done .step-name,
 .step-item.running .step-name {
   color: var(--text-1);
 }
 
 .step-state {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
   margin-left: auto;
-  font-style: normal;
-  font-size: 9.5px;
+  border-radius: 50%;
+  color: var(--text-3);
+}
+
+.step-item.running .step-state {
+  color: var(--accent-cyan);
+  border: 1px solid rgba(55, 208, 196, 0.5);
+}
+
+.step-item.done .step-state {
+  color: var(--green);
+  border: 1px solid rgba(55, 201, 164, 0.45);
+}
+
+.step-item.failed .step-state {
+  color: var(--danger);
+  border: 1px solid rgba(226, 96, 94, 0.45);
+}
+
+.step-item.degraded .step-state {
+  color: var(--amber);
+  border: 1px solid rgba(242, 176, 60, 0.45);
 }
 
 .step-branch {

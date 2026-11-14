@@ -46,6 +46,8 @@ const flowId = computed(() => String(route.params.id || ''))
 const meta = reactive({
   source: 'user' as FlowSource,
   status: 'draft' as FlowStatus,
+  // 是否参与自动命中；停用只暂停路由召回，不改变发布状态
+  enabled: true,
   updatedAt: '',
 })
 
@@ -58,8 +60,50 @@ const loading = ref(false)
 const saving = ref(false)
 const publishing = ref(false)
 const forking = ref(false)
+const togglingEnabled = ref(false)
 const issues = ref<FlowIssue[]>([])
 const selectedId = ref('')
+
+// ---------- 简图与配置面板的分栏宽度 ----------
+// 简图节点多、分支宽时需要更宽的区域；宽度记在本地，下次打开沿用。
+const MAP_WIDTH_KEY = 'harness.taskflow.mapWidth'
+const MAP_MIN_WIDTH = 260
+const MAP_MAX_WIDTH = 720
+const mapWidth = ref(320)
+
+function clampMapWidth(value: number): number {
+  return Math.min(MAP_MAX_WIDTH, Math.max(MAP_MIN_WIDTH, Math.round(value)))
+}
+
+function restoreMapWidth() {
+  try {
+    const saved = Number(localStorage.getItem(MAP_WIDTH_KEY))
+    if (Number.isFinite(saved) && saved > 0) mapWidth.value = clampMapWidth(saved)
+  } catch {
+    // 忽略存储异常
+  }
+}
+
+function startResize(event: PointerEvent) {
+  if (event.button !== 0) return
+  event.preventDefault()
+  const startX = event.clientX
+  const startWidth = mapWidth.value
+  const move = (moveEvent: PointerEvent) => {
+    mapWidth.value = clampMapWidth(startWidth + moveEvent.clientX - startX)
+  }
+  const stop = () => {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', stop)
+    try {
+      localStorage.setItem(MAP_WIDTH_KEY, String(mapWidth.value))
+    } catch {
+      // 忽略存储异常
+    }
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', stop)
+}
 
 const skillOptions = ref<{ name: string; label: string }[]>([])
 const mcpOptions = ref<{ id: string; label: string }[]>([])
@@ -92,7 +136,7 @@ function blankFlow(): TaskFlowSchema {
   }
 }
 
-const readonly = computed(() => meta.source === 'builtin')
+// 内置流与用户流权限相同：都可以直接编辑、发布、删除。
 
 // 422 错误：按 step_id 聚合到节点，step_id 为空的作为全局错误展示
 const stepErrors = computed(() => {
@@ -120,7 +164,13 @@ function findStep(id: string): LocatedStep | null {
   for (let i = 0; i < draft.steps.length; i++) {
     const step = draft.steps[i] as StepDef
     if (step.id === id) {
-      return { step, list: draft.steps, index: i, label: `主流 步骤 ${i + 1}`, indexLabel: String(i + 1) }
+      return {
+        step,
+        list: draft.steps,
+        index: i,
+        label: `主流 步骤 ${i + 1}`,
+        indexLabel: String(i + 1),
+      }
     }
     for (const branch of step.parallel || []) {
       for (let j = 0; j < branch.steps.length; j++) {
@@ -173,6 +223,7 @@ function applyDetail(row: FlowDetail) {
   draft.steps = (schema.steps || []).map((step) => normalizeStep(step))
   meta.source = row.source
   meta.status = row.status
+  meta.enabled = row.enabled !== false
   meta.updatedAt = row.updated_at
   selectedId.value = draft.steps[0]?.id || ''
 }
@@ -186,6 +237,7 @@ async function load() {
     Object.assign(draft, blankFlow())
     meta.source = 'user'
     meta.status = 'draft'
+    meta.enabled = true
     meta.updatedAt = ''
     selectedId.value = ''
     return
@@ -304,7 +356,6 @@ watch(
 
 // ---------- 新增步骤（三个入口共用） ----------
 function addStep() {
-  if (readonly.value) return
   const step = blankStep()
   draft.steps.push(step)
   selectedId.value = step.id
@@ -318,7 +369,6 @@ function addStep() {
 const menu = ref<NodeMenuPayload | null>(null)
 
 function onNodeMenu(payload: NodeMenuPayload) {
-  if (readonly.value) return
   menu.value = payload
 }
 
@@ -328,7 +378,7 @@ function closeMenu() {
 
 async function menuAction(action: 'insert' | 'fork' | 'remove') {
   const target = menu.value
-  if (!target || readonly.value) return
+  if (!target) return
   menu.value = null
 
   const located = findStep(target.id)
@@ -384,7 +434,6 @@ function pruneEmptyBranches() {
 
 /** 子分支末尾快速加步。 */
 function addSubStep(payload: { stepId: string; branchIndex: number }) {
-  if (readonly.value) return
   const located = findStep(payload.stepId)
   const branch = located?.step.parallel?.[payload.branchIndex]
   if (!branch) return
@@ -413,7 +462,7 @@ function handleValidation(err: FlowValidationError) {
 }
 
 async function save(): Promise<boolean> {
-  if (readonly.value || saving.value) return false
+  if (saving.value) return false
   saving.value = true
   issues.value = []
   try {
@@ -435,7 +484,7 @@ async function save(): Promise<boolean> {
 }
 
 async function publish() {
-  if (readonly.value || publishing.value) return
+  if (publishing.value) return
   if (!(await save())) return
   publishing.value = true
   issues.value = []
@@ -448,6 +497,22 @@ async function publish() {
     else ElMessage.error((err as Error).message)
   } finally {
     publishing.value = false
+  }
+}
+
+async function toggleEnabled(enabled: boolean) {
+  if (isNew.value || meta.status !== 'published' || togglingEnabled.value) return
+  togglingEnabled.value = true
+  try {
+    await store.setEnabled(flowId.value, enabled)
+    meta.enabled = enabled
+    ElMessage.success(
+      enabled ? '已启用，Agent 会重新自动命中' : '已停用，Agent 不会再自动命中',
+    )
+  } catch (err) {
+    ElMessage.error((err as Error).message)
+  } finally {
+    togglingEnabled.value = false
   }
 }
 
@@ -472,6 +537,7 @@ function formatTime(iso: string): string {
 }
 
 onMounted(() => {
+  restoreMapWidth()
   void load()
   void fetchSkills({ page: 1, page_size: 100 })
     .then((data) => {
@@ -495,7 +561,7 @@ onMounted(() => {
 <template>
   <div class="app-shell">
     <TopNav />
-      <div v-loading="loading" class="page">
+    <div v-loading="loading" class="page">
       <!-- 页头：返回 + 标题 + 状态 + 操作 -->
       <header class="page-head">
         <div class="head-left">
@@ -503,11 +569,31 @@ onMounted(() => {
           <div class="head-title">
             <div class="title-line">
               <strong>{{ isNew ? '新建任务流' : draft.name || '未命名任务流' }}</strong>
-              <el-tag size="small" effect="plain" :type="meta.source === 'builtin' ? 'primary' : 'info'">
+              <el-tag
+                size="small"
+                effect="plain"
+                :type="meta.source === 'builtin' ? 'primary' : 'info'"
+              >
                 {{ meta.source === 'builtin' ? '内置' : '我的' }}
               </el-tag>
-              <el-tag size="small" effect="plain" :type="meta.status === 'published' ? 'success' : 'warning'">
-                {{ meta.status === 'published' ? '已发布' : '草稿' }}
+              <el-tag
+                size="small"
+                effect="plain"
+                :type="
+                  meta.status !== 'published'
+                    ? 'warning'
+                    : meta.enabled
+                      ? 'success'
+                      : 'info'
+                "
+              >
+                {{
+                  meta.status !== 'published'
+                    ? '草稿'
+                    : meta.enabled
+                      ? '已启用'
+                      : '已停用'
+                }}
               </el-tag>
             </div>
             <small class="head-meta">
@@ -520,23 +606,42 @@ onMounted(() => {
         </div>
 
         <div class="head-actions">
-          <template v-if="readonly">
-            <el-button type="primary" :icon="CopyDocument" :loading="forking" @click="fork">
-              复制为我的任务流
-            </el-button>
-          </template>
-          <template v-else>
-            <el-button :loading="saving" :disabled="publishing" @click="save">保存</el-button>
-            <el-button
-              type="primary"
-              :icon="Upload"
-              :loading="publishing"
-              :disabled="saving"
-              @click="publish"
-            >
-              {{ meta.status === 'published' ? '重新发布' : '发布' }}
-            </el-button>
-          </template>
+          <!-- 启用开关：只暂停自动命中，不改变发布状态 -->
+          <el-tooltip
+            v-if="!isNew && meta.status !== 'published'"
+            content="发布后才能启用"
+            placement="top"
+          >
+            <span class="enable-switch">
+              <el-switch :model-value="false" size="small" disabled />
+              <span class="enable-label">启用</span>
+            </span>
+          </el-tooltip>
+          <span v-else-if="!isNew" class="enable-switch">
+            <el-switch
+              :model-value="meta.enabled"
+              size="small"
+              :loading="togglingEnabled"
+              :disabled="togglingEnabled"
+              @update:model-value="
+                (value: string | number | boolean) => toggleEnabled(value === true)
+              "
+            />
+            <span class="enable-label">{{ meta.enabled ? '已启用' : '已停用' }}</span>
+          </span>
+          <el-button v-if="!isNew" :icon="CopyDocument" :loading="forking" @click="fork">
+            复制为我的任务流
+          </el-button>
+          <el-button :loading="saving" :disabled="publishing" @click="save">保存</el-button>
+          <el-button
+            type="primary"
+            :icon="Upload"
+            :loading="publishing"
+            :disabled="saving"
+            @click="publish"
+          >
+            {{ meta.status === 'published' ? '重新发布' : '发布' }}
+          </el-button>
         </div>
       </header>
 
@@ -553,24 +658,18 @@ onMounted(() => {
       </div>
 
       <!-- 上部：流程全局配置 -->
-      <FlowGlobalPanel :flow="draft" :mcp-options="mcpOptions" :readonly="readonly" />
+      <FlowGlobalPanel :flow="draft" :mcp-options="mcpOptions" />
 
-      <!-- 下部：左简图 + 右步骤配置 -->
-      <div class="editor-row">
+      <!-- 下部：左简图 + 右步骤配置（中间可拖动调整宽度） -->
+      <div class="editor-row" :style="{ gridTemplateColumns: `${mapWidth}px 6px minmax(0, 1fr)` }">
         <aside class="map-pane">
           <header class="pane-head">
             <div class="pane-title">
               <el-icon><Promotion /></el-icon>
               <strong>流程简图</strong>
-              <small v-if="!readonly">单击选中 · 右键编辑</small>
+              <small>单击选中 · 右键编辑</small>
             </div>
-            <el-button
-              v-if="!readonly"
-              type="primary"
-              size="small"
-              :icon="Plus"
-              @click="addStep"
-            >
+            <el-button type="primary" size="small" :icon="Plus" @click="addStep">
               新增步骤
             </el-button>
           </header>
@@ -579,7 +678,6 @@ onMounted(() => {
               :steps="draft.steps"
               :selected-id="selectedId"
               :errors="stepErrors"
-              :readonly="readonly"
               @select="selectedId = $event"
               @menu="onNodeMenu"
               @add="addStep"
@@ -588,13 +686,21 @@ onMounted(() => {
           </div>
         </aside>
 
+        <!-- 分栏拖拽手柄：拖动调整简图宽度 -->
+        <div
+          class="split-handle"
+          role="separator"
+          aria-orientation="vertical"
+          title="拖动调整简图宽度"
+          @pointerdown="startResize"
+        ></div>
+
         <section class="step-pane">
           <StepConfigPanel
             :step="selected?.step ?? null"
             :title="selected?.label || ''"
             :step-index="selected?.indexLabel || ''"
             :skill-options="skillOptions"
-            :readonly="readonly"
             :error="selectedId ? stepErrors[selectedId] || '' : ''"
           />
         </section>
@@ -623,12 +729,7 @@ onMounted(() => {
           description="还没有执行记录：在对话中命中该任务流后会自动记录"
           :image-size="56"
         />
-        <el-collapse
-          v-else
-          v-model="execExpanded"
-          class="exec-list"
-          @change="onExecChange"
-        >
+        <el-collapse v-else v-model="execExpanded" class="exec-list" @change="onExecChange">
           <el-collapse-item v-for="row in store.executions" :key="row.id" :name="row.id">
             <template #title>
               <div class="exec-row-title">
@@ -676,7 +777,7 @@ onMounted(() => {
           </el-collapse-item>
         </el-collapse>
       </section>
-      </div>
+    </div>
 
     <!-- 步骤右键菜单 -->
     <Transition name="fade">
@@ -721,13 +822,19 @@ onMounted(() => {
 }
 
 /* ---------- 页头 ---------- */
+/* 页头固定在顶栏下方：滚动步骤配置时仍能看到流名称、保存与发布 */
 .page-head {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 20;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
   flex-wrap: wrap;
-  padding: 4px 2px 12px;
+  margin: 0 -18px;
+  padding: 8px 20px 12px;
+  background: var(--bg-deep);
   border-bottom: 1px solid var(--line);
 }
 
@@ -773,6 +880,20 @@ onMounted(() => {
   gap: 8px;
 }
 
+/* 启用开关：与保存/发布按钮同排，靠左一眼可见 */
+.enable-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.enable-label {
+  font-size: 11px;
+  color: var(--text-2);
+  user-select: none;
+}
+
 .global-issues {
   display: flex;
   flex-direction: column;
@@ -785,6 +906,39 @@ onMounted(() => {
   grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   gap: 14px;
   align-items: stretch;
+}
+
+/* 分栏手柄：可见的 6px 轨道，hover / 拖动时高亮 */
+.split-handle {
+  position: relative;
+  width: 6px;
+  cursor: col-resize;
+  border-radius: 3px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.split-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 36px;
+  transform: translate(-50%, -50%);
+  border-radius: 1px;
+  background: var(--line-strong);
+  transition: background 0.15s ease;
+}
+
+.split-handle:hover,
+.split-handle:active {
+  background: rgba(91, 140, 255, 0.12);
+}
+
+.split-handle:hover::after,
+.split-handle:active::after {
+  background: var(--accent);
 }
 
 .map-pane {
@@ -826,7 +980,8 @@ onMounted(() => {
 .map-scroll {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  /* 简图内部自带视口与拖拽平移，外层不再滚动，避免双滚动条 */
+  overflow: hidden;
 }
 
 .step-pane {

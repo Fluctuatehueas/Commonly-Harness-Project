@@ -187,11 +187,12 @@ class AgentLoader:
         username: str,
         thread_id: str,
         agent_id: str = "default",
+        group_id: str = "",
     ) -> Any:
         """获取用户所选 Agent 的图，并登记该用户访问过的会话。
 
-        缓存键包含 ``agent_id``：同一用户招募的多个 Agent 各自拥有独立的
-        系统提示词、模型配置与 MCP 工具集，不能复用同一张图。
+        缓存键包含 ``agent_id`` 与 ``group_id``：同一 Agent 在不同组里拥有
+        不同的提示词、模型、成员视图与权限边界，不能复用同一张图。
         """
         await self.initialize()
         assert self._agent_factory is not None
@@ -206,6 +207,10 @@ class AgentLoader:
             (session or {}).get("integration_server_id") or ""
         )
         resolved_agent_id = str(agent_id or "default").strip() or "default"
+        resolved_group_id = str(group_id or "").strip()
+        if not agent_config.AGENT_TEAM_ENABLED:
+            # 总开关关闭时忽略组，全部按独立 Agent 运行。
+            resolved_group_id = ""
 
         # 用户级锁防止重复构建；沙箱探测和构图不会阻塞其他用户。
         async with self._user_locks.setdefault(user_id, asyncio.Lock()):
@@ -229,19 +234,29 @@ class AgentLoader:
                     user_id,
                 )
 
-            cache_key = f"{resolved_agent_id}:{integration_server_id}"
+            cache_key = (
+                f"{resolved_agent_id}:{resolved_group_id}:{integration_server_id}"
+            )
             agent = group.agents.get(cache_key)
             if agent is None:
-                from agent.agent_profiles import AgentProfileStore
+                from agent.agent_team.factory import (
+                    AgentContextFactory,
+                    GroupNotFoundError,
+                    NotGroupMemberError,
+                )
 
-                profile = await AgentProfileStore(
-                    self._store, user_id
-                ).get(resolved_agent_id)
-                if profile is None or not bool(profile.get("enabled", True)):
-                    # 档案被删除或停用时回退默认 Agent，避免会话直接失败。
-                    profile = await AgentProfileStore(
-                        self._store, user_id
-                    ).get("default")
+                try:
+                    context = await AgentContextFactory(self._store, user_id).build(
+                        resolved_agent_id, resolved_group_id or None
+                    )
+                except GroupNotFoundError as error:
+                    raise HTTPException(
+                        status_code=404, detail="组不存在或无权访问"
+                    ) from error
+                except NotGroupMemberError as error:
+                    raise HTTPException(
+                        status_code=403, detail="该 Agent 不在所选组中"
+                    ) from error
                 agent = await self._agent_factory(
                     self.create_config(
                         thread_id=thread_id,
@@ -252,7 +267,7 @@ class AgentLoader:
                     checkpointer=self._checkpointer,
                     sandbox_backend=sandbox_backend,
                     integration_server_id=integration_server_id or None,
-                    agent_profile=profile,
+                    agent_context=context,
                 )
                 group.agents[cache_key] = agent
             return agent
@@ -359,6 +374,8 @@ class AgentLoader:
         bind_integration: bool = False,
         agent_id: str | None = None,
         bind_agent: bool = False,
+        group_id: str | None = None,
+        bind_group: bool = False,
     ) -> None:
         """将用户会话索引保存到 PostgreSQL 的 LangGraph Store。
 
@@ -385,6 +402,8 @@ class AgentLoader:
             value["integration_server_id"] = integration_server_id or None
         if bind_agent:
             value["agent_id"] = agent_id or "default"
+        if bind_group:
+            value["group_id"] = group_id or None
         value.update(
             {
                 "thread_id": thread_id,
@@ -559,6 +578,8 @@ class AgentLoader:
         """
         from langchain_core.messages import AIMessage, HumanMessage
 
+        from agent.time_context import MESSAGE_TIME_KEY, now_iso
+
         try:
             await self.initialize()
             state = await self.get_thread_state(thread_id)
@@ -571,6 +592,7 @@ class AgentLoader:
                 username=username,
                 thread_id=thread_id,
                 agent_id=str((session or {}).get("agent_id") or "default"),
+                group_id=str((session or {}).get("group_id") or ""),
             )
             config = self.create_config(
                 thread_id=thread_id,
@@ -582,11 +604,15 @@ class AgentLoader:
                     HumanMessage(
                         id=f"tf-user-{uuid.uuid4().hex}",
                         content=user_content,
+                        additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
                     ),
                     AIMessage(
                         id=f"tf-ai-{uuid.uuid4().hex}",
                         content=assistant_content,
-                        additional_kwargs={"source": "main"},
+                        additional_kwargs={
+                            "source": "main",
+                            MESSAGE_TIME_KEY: now_iso(),
+                        },
                     ),
                 ]
             }
@@ -722,10 +748,13 @@ class AgentLoader:
         if state.next or state.interrupts:
             return False
 
+        session = await self.get_session(binding.user_id, binding.thread_id)
         agent = await self.get_agent_for_user(
             user_id=binding.user_id,
             username=binding.username,
             thread_id=binding.thread_id,
+            agent_id=str((session or {}).get("agent_id") or "default"),
+            group_id=str((session or {}).get("group_id") or ""),
         )
         # 使用固定消息 ID 配合 messages reducer，避免多次轮询或重试产生重复消息。
         await agent.aupdate_state(

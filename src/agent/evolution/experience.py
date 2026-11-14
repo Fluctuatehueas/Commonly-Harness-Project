@@ -146,6 +146,20 @@ class ExperienceStore:
         record.updated_at = _now()
         return await self.upsert(record)
 
+    async def record_hits(self, experience_ids: list[str]) -> None:
+        """记录经验被注入的次数；单条失败不影响其他条目。"""
+        if self._store is None:
+            return
+        for experience_id in dict.fromkeys(experience_ids):
+            try:
+                record = await self.get(experience_id)
+                if record is None:
+                    continue
+                record.hit_count += 1
+                await self.upsert(record)
+            except Exception:
+                logger.warning("经验命中计数失败：%s", experience_id, exc_info=True)
+
     async def update_utility(
         self,
         experience_id: str,

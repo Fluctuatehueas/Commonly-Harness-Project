@@ -5,19 +5,16 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CopyDocument, Delete, Plus, SetUp } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
-import FlowMiniMap from '@/components/taskflow/FlowMiniMap.vue'
-import { forkTaskFlow, type FlowListItem, type StepDef } from '@/api/taskflow'
+import { forkTaskFlow, type FlowListItem } from '@/api/taskflow'
 import { useTaskflowStore } from '@/stores/taskflow'
 
 const store = useTaskflowStore()
 const router = useRouter()
 
-function stepsOf(id: string): StepDef[] {
-  return store.schemas[id]?.steps ?? []
-}
-
 const forkingId = ref('')
 const deletingId = ref('')
+// 正在切换启用状态的流：同一时间只允许一个，避免连点造成状态回跳。
+const togglingId = ref('')
 
 const pages = computed(() => Math.max(1, Math.ceil(store.total / 12)))
 
@@ -42,6 +39,23 @@ async function fork(item: FlowListItem) {
     ElMessage.error((err as Error).message)
   } finally {
     forkingId.value = ''
+  }
+}
+
+async function toggleEnabled(item: FlowListItem, enabled: boolean) {
+  if (togglingId.value) return
+  togglingId.value = item.id
+  try {
+    await store.setEnabled(item.id, enabled)
+    ElMessage.success(
+      enabled
+        ? `已启用「${item.name}」`
+        : `已停用「${item.name}」，Agent 不会再自动命中`,
+    )
+  } catch (err) {
+    ElMessage.error((err as Error).message)
+  } finally {
+    togglingId.value = ''
   }
 }
 
@@ -118,31 +132,41 @@ onMounted(() => void store.loadList(1))
           class="flow-card"
           @click="openDetail(item)"
         >
-          <div class="card-top">
-            <div class="thumb">
-              <FlowMiniMap v-if="stepsOf(item.id).length" :steps="stepsOf(item.id)" compact />
-              <span v-else class="thumb-empty">加载结构…</span>
-            </div>
-
-            <div class="card-main">
-              <div class="card-title-row">
-                <strong>{{ item.name }}</strong>
-              </div>
-              <div class="tag-line">
-                <el-tag size="small" effect="plain" :type="item.source === 'builtin' ? 'primary' : 'info'">
-                  {{ item.source === 'builtin' ? '系统内置' : '我的' }}
-                </el-tag>
-                <el-tag
+          <div class="card-main">
+            <div class="card-title-row">
+              <strong>{{ item.name }}</strong>
+              <!-- 启用开关只对已发布流生效：草稿本来就不参与命中 -->
+              <span v-if="item.status === 'published'" class="enable-switch" @click.stop>
+                <el-switch
+                  :model-value="item.enabled"
                   size="small"
-                  effect="plain"
-                  :type="item.status === 'published' ? 'success' : 'warning'"
-                >
-                  {{ item.status === 'published' ? '已发布' : '草稿' }}
-                </el-tag>
-              </div>
-              <p class="card-desc">{{ item.search_doc?.description || '暂无描述' }}</p>
-              <span class="card-meta">更新于 {{ formatTime(item.updated_at) }}</span>
+                  :loading="togglingId === item.id"
+                  :disabled="togglingId === item.id"
+                  @update:model-value="
+                    (value: string | number | boolean) => toggleEnabled(item, value === true)
+                  "
+                />
+              </span>
+              <el-tooltip v-else content="发布后才能启用" placement="top">
+                <span class="enable-switch" @click.stop>
+                  <el-switch :model-value="false" size="small" disabled />
+                </span>
+              </el-tooltip>
             </div>
+            <div class="tag-line">
+              <el-tag size="small" effect="plain" :type="item.source === 'builtin' ? 'primary' : 'info'">
+                {{ item.source === 'builtin' ? '系统内置' : '我的' }}
+              </el-tag>
+              <el-tag v-if="item.status !== 'published'" size="small" effect="plain" type="warning">
+                草稿
+              </el-tag>
+              <el-tag v-else-if="item.enabled" size="small" effect="plain" type="success">
+                已启用
+              </el-tag>
+              <el-tag v-else size="small" effect="plain" type="info">已停用</el-tag>
+            </div>
+            <p class="card-desc">{{ item.search_doc?.description || '暂无描述' }}</p>
+            <span class="card-meta">更新于 {{ formatTime(item.updated_at) }}</span>
           </div>
 
           <div class="card-actions">
@@ -153,22 +177,20 @@ onMounted(() => void store.loadList(1))
               :loading="forkingId === item.id"
               @click.stop="fork(item)"
             >
-              复制为我的任务流
+              复制
             </el-button>
-            <template v-else>
-              <el-button size="small" type="primary" plain @click.stop="openDetail(item)">
-                编辑
-              </el-button>
-              <el-button
-                size="small"
-                type="danger"
-                :icon="Delete"
-                :loading="deletingId === item.id"
-                @click.stop="remove(item)"
-              >
-                删除
-              </el-button>
-            </template>
+            <el-button size="small" type="primary" plain @click.stop="openDetail(item)">
+              编辑
+            </el-button>
+            <el-button
+              size="small"
+              type="danger"
+              :icon="Delete"
+              :loading="deletingId === item.id"
+              @click.stop="remove(item)"
+            >
+              删除
+            </el-button>
           </div>
         </article>
       </div>
@@ -278,40 +300,28 @@ onMounted(() => void store.loadList(1))
   cursor: default;
 }
 
-.card-top {
-  display: flex;
-  gap: 12px;
-  min-height: 84px;
-}
-
-.thumb {
-  flex: none;
-  width: 62px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  overflow: hidden;
-  border-right: 1px solid var(--line);
-}
-
-.thumb-empty {
-  font-size: 9.5px;
-  color: var(--text-3);
-  writing-mode: vertical-rl;
-  padding: 4px 0;
-}
-
 .card-main {
-  flex: 1;
-  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 5px;
 }
 
+.card-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .card-title-row strong {
   font-size: 14px;
   letter-spacing: -0.01em;
+}
+
+/* 开关只切换启用状态，不触发卡片打开 */
+.enable-switch {
+  display: inline-flex;
+  flex: none;
 }
 
 .tag-line {
@@ -341,6 +351,8 @@ onMounted(() => void store.loadList(1))
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  /* 统一贴到卡片右下角：同行卡片等高，按钮不再随描述行数上下浮动 */
+  margin-top: auto;
   padding-top: 10px;
   border-top: 1px solid var(--line);
 }

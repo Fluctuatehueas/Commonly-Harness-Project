@@ -51,6 +51,8 @@ export interface FlowListItem {
   source: FlowSource
   schema_hash: string | null
   search_doc: FlowSearchDoc | null
+  /** 是否参与自动命中；停用不改发布状态，仅暂停路由召回 */
+  enabled: boolean
   updated_at: string
 }
 
@@ -210,6 +212,17 @@ export function publishTaskFlow(flowId: string): Promise<SaveResult> {
 
 export function forkTaskFlow(flowId: string): Promise<ForkResult> {
   return request(`/task-flows/${encodeURIComponent(flowId)}/fork`, { method: 'POST' })
+}
+
+/** 启用/停用任务流：只影响自动命中，不改发布状态。 */
+export function setTaskFlowEnabled(
+  flowId: string,
+  enabled: boolean,
+): Promise<{ id: string; enabled: boolean }> {
+  return request(
+    `/task-flows/${encodeURIComponent(flowId)}/enabled`,
+    jsonInit('PATCH', { enabled }),
+  )
 }
 
 export function fetchFlowExecutions(flowId: string, page = 1, size = 20): Promise<ExecutionList> {

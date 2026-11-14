@@ -74,6 +74,12 @@ class FlowPayload(BaseModel):
     payload: dict[str, Any]
 
 
+class FlowEnabledPayload(BaseModel):
+    """启用/停用请求体。"""
+
+    enabled: bool
+
+
 class ExecutionStartPayload(BaseModel):
     """显式发起执行（含中途接管）。"""
 
@@ -120,6 +126,8 @@ async def get_flow(flow_id: str):
     row = await store.get_flow(flow_id)
     if not row or (row["user_id"] not in (_current_user(), BUILTIN_USER_ID)):
         raise HTTPException(status_code=404, detail="任务流不存在")
+    # 启用状态按当前用户计算：内置流的关闭记录属于用户自己。
+    row["enabled"] = await store.is_flow_enabled(flow_id, _current_user())
     return row
 
 
@@ -129,14 +137,14 @@ async def update_flow(flow_id: str, body: FlowPayload):
     row = await store.get_flow(flow_id)
     if not row:
         raise HTTPException(status_code=404, detail="任务流不存在")
-    if row["user_id"] == BUILTIN_USER_ID:
-        raise HTTPException(status_code=403, detail="内置流只读，请使用复制")
-    if row["user_id"] != _current_user():
+    if row["user_id"] not in (_current_user(), BUILTIN_USER_ID):
         raise HTTPException(status_code=403, detail="无权编辑他人任务流")
 
     payload = dict(body.payload)
     payload["id"] = flow_id
     payload["source"] = "user"
+    # 编辑内置流等同于接管：source 转为 user、归属改为当前用户，
+    # 之后就是普通用户流，不再受内置流升级逻辑影响。
     # 已发布流再编辑：回退 draft、plan 由重新编译产出但状态不发布，
     # 路由器只选 published，所以在用 plan 不受影响（发布时才覆盖）。
     try:
@@ -149,10 +157,16 @@ async def update_flow(flow_id: str, body: FlowPayload):
 
 @router.delete("/{flow_id}", status_code=204)
 async def delete_flow(flow_id: str):
+    """删除任务流；内置流与用户流一视同仁。"""
     store = await get_store()
     row = await store.get_flow(flow_id)
-    if row and row["user_id"] == BUILTIN_USER_ID:
-        raise HTTPException(status_code=403, detail="内置流不可删除")
+    if not row:
+        raise HTTPException(status_code=404, detail="任务流不存在")
+    if row["user_id"] not in (_current_user(), BUILTIN_USER_ID):
+        raise HTTPException(status_code=403, detail="无权删除他人任务流")
+    if row["user_id"] == BUILTIN_USER_ID:
+        # 内置流删掉后写入墓碑，避免下次启动被仓库文件重新注册。
+        await store.mark_builtin_deleted(flow_id)
     deleted = await store.delete_flow(flow_id, _current_user())
     if not deleted:
         raise HTTPException(status_code=404, detail="任务流不存在")
@@ -165,15 +179,32 @@ async def publish_flow(flow_id: str):
     row = await store.get_flow(flow_id)
     if not row:
         raise HTTPException(status_code=404, detail="任务流不存在")
-    if row["user_id"] != _current_user():
+    if row["user_id"] not in (_current_user(), BUILTIN_USER_ID):
         raise HTTPException(status_code=403, detail="无权发布他人任务流")
     try:
         flow = TaskFlow.model_validate({**row["schema"], "status": "published"})
         flow, plan, search_doc = compile_flow(flow.model_dump(mode="json"), _validation_ctx())
     except FlowValidationError as exc:
         raise _unprocessable(exc) from exc
-    await store.upsert_flow(flow, _current_user(), plan, search_doc)
+    await store.upsert_flow(flow, row["user_id"], plan, search_doc)
     return {"id": flow.id, "status": "published", "schema_hash": plan.schema_hash}
+
+
+@router.patch("/{flow_id}/enabled")
+async def set_flow_enabled(flow_id: str, body: FlowEnabledPayload):
+    """启用/停用任务流。
+
+    只影响路由命中，不改 ``status``；停用后重新启用即可恢复，无需重新发布。
+    """
+    store = await get_store()
+    row = await store.get_flow(flow_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="任务流不存在")
+    user = _current_user()
+    if row["user_id"] not in (user, BUILTIN_USER_ID):
+        raise HTTPException(status_code=403, detail="无权操作他人任务流")
+    await store.set_flow_enabled(flow_id, user, body.enabled)
+    return {"id": flow_id, "enabled": body.enabled}
 
 
 @router.post("/{flow_id}/fork", status_code=201)

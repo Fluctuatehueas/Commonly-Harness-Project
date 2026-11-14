@@ -18,12 +18,14 @@ import AppIcon from '@/components/console/AppIcon.vue'
 import SessionRow from './SessionRow.vue'
 import { useSessionStore, type SessionItem } from '@/stores/sessions'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { pickDirectory, projectNameFromPath, revealProject, type ProjectMode } from '@/api/workspace'
 import {
-  fetchMcpIntegrations,
-  probeMcpServer,
-  type McpServerItem,
-} from '@/api/mcp'
+  pickDirectory,
+  projectNameFromPath,
+  revealProject,
+  type ProjectMode,
+} from '@/api/workspace'
+import { fetchArchiveSettings } from '@/api/settings'
+import { fetchMcpIntegrations, probeMcpServer, type McpServerItem } from '@/api/mcp'
 
 const sessions = useSessionStore()
 const workspace = useWorkspaceStore()
@@ -148,16 +150,13 @@ function openProjectGroup(projectId: string) {
 
 // ---------- 分组数据 ----------
 // 默认工作区在运行时仍然存在，但按需求在侧边栏隐藏。
-const visibleProjects = computed(() =>
-  workspace.sorted.filter((project) => !project.is_default),
-)
+const visibleProjects = computed(() => workspace.sorted.filter((project) => !project.is_default))
 const projectIds = computed(() => new Set(visibleProjects.value.map((project) => project.id)))
 
 const ungrouped = computed(() =>
   sessions.sessions.filter(
     (item) =>
-      !item.integration_server_id &&
-      (!item.project_id || !projectIds.value.has(item.project_id)),
+      !item.integration_server_id && (!item.project_id || !projectIds.value.has(item.project_id)),
   ),
 )
 
@@ -166,9 +165,7 @@ function projectSessions(projectId: string) {
 }
 
 function integrationSessions(serverId: string) {
-  return sessions.sessions.filter(
-    (item) => item.integration_server_id === serverId,
-  )
+  return sessions.sessions.filter((item) => item.integration_server_id === serverId)
 }
 
 function integrationConnected(item: McpServerItem) {
@@ -207,9 +204,7 @@ async function connectIntegration(item: McpServerItem) {
   try {
     const result = await probeMcpServer(item.server_id)
     const detail = result.server
-    const index = integrations.value.findIndex(
-      (entry) => entry.server_id === item.server_id,
-    )
+    const index = integrations.value.findIndex((entry) => entry.server_id === item.server_id)
     if (index >= 0) integrations.value[index] = detail
     if (detail.state === 'Connected' || detail.state === 'Degraded') {
       open.integrations = true
@@ -228,8 +223,7 @@ async function connectIntegration(item: McpServerItem) {
 /** 点击集成项目：选中的后端才展示其会话；未连接时禁止操作。 */
 function selectIntegration(item: McpServerItem) {
   if (!integrationConnected(item)) return
-  selectedIntegration.value =
-    selectedIntegration.value === item.server_id ? '' : item.server_id
+  selectedIntegration.value = selectedIntegration.value === item.server_id ? '' : item.server_id
   if (selectedIntegration.value) open.integrations = true
 }
 
@@ -289,11 +283,7 @@ async function createProject(mode: ProjectMode) {
   let path = base
   let name = projectNameFromPath(base)
   if (mode === 'create') {
-    const input = await askInput(
-      '新建空项目',
-      '新项目',
-      '将在所选目录下创建同名子目录',
-    )
+    const input = await askInput('新建空项目', '新项目', '将在所选目录下创建同名子目录')
     const cleaned = (input || '').trim()
     if (!cleaned) return
     if (/[\\/:*?"<>|]/.test(cleaned)) {
@@ -330,8 +320,6 @@ async function createProject(mode: ProjectMode) {
     await createSessionInProject(created.id)
   }
 }
-
-
 
 async function renameProject(projectId: string) {
   const current = workspace.projects.find((project) => project.id === projectId)
@@ -374,7 +362,8 @@ async function removeProject(projectId: string, isDefault: boolean) {
     flash('默认项目不可删除')
     return
   }
-  if (!(await askConfirm('移出项目', '仅从列表移除项目登记，不会删除磁盘目录。是否继续？', true))) return
+  if (!(await askConfirm('移出项目', '仅从列表移除项目登记，不会删除磁盘目录。是否继续？', true)))
+    return
   projectMenu.value = null
   if (await workspace.remove(projectId)) {
     flash('已移出项目（磁盘目录未删除）')
@@ -384,6 +373,7 @@ async function removeProject(projectId: string, isDefault: boolean) {
 }
 
 async function copyProjectPath(projectId: string) {
+  projectMenu.value = null
   const path = workspace.projects.find((project) => project.id === projectId)?.path
   if (!path) return
   try {
@@ -415,6 +405,28 @@ function fmtArchiveTime(value: string | null): string {
   if (Number.isNaN(date.getTime())) return '未知时间'
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// 归档保留天数：与「设置 → 归档」一致，用于提示还有多久被清除。
+const archiveDays = ref(0)
+const DAY_MS = 24 * 60 * 60 * 1000
+
+onMounted(() => {
+  void fetchArchiveSettings()
+    .then((config) => {
+      archiveDays.value = Number(config.days) || 0
+    })
+    .catch(() => undefined)
+})
+
+/** 归档会话剩余保留天数；未开启自动清除时返回空串。 */
+function purgeHint(item: SessionItem): string {
+  if (!archiveDays.value || !item.archived_at) return ''
+  const archivedAt = new Date(item.archived_at).getTime()
+  if (!Number.isFinite(archivedAt)) return ''
+  const left = Math.ceil((archivedAt + archiveDays.value * DAY_MS - Date.now()) / DAY_MS)
+  if (left <= 0) return '即将清除'
+  return `${left} 天后清除`
 }
 
 /** 归档会话如果属于本机项目，定位到对应磁盘目录；数据库会话不展示路径。 */
@@ -468,7 +480,13 @@ async function restoreArchived(threadId: string) {
 }
 
 async function removeArchived(threadId: string) {
-  if (!(await askConfirm('永久删除归档会话', '将永久删除该会话的记录和日志，且无法恢复。是否继续？', true))) {
+  if (
+    !(await askConfirm(
+      '永久删除归档会话',
+      '将永久删除该会话的记录和日志，且无法恢复。是否继续？',
+      true,
+    ))
+  ) {
     return
   }
   if (await sessions.removeSession(threadId)) {
@@ -546,11 +564,7 @@ onBeforeUnmount(() => {
           v-loading="integrationLoading && integrations.length === 0"
           class="group-body"
         >
-          <div
-            v-for="item in integrations"
-            :key="item.server_id"
-            class="integration-block"
-          >
+          <div v-for="item in integrations" :key="item.server_id" class="integration-block">
             <div
               class="integration-row"
               :class="{
@@ -649,7 +663,13 @@ onBeforeUnmount(() => {
 
         <div v-show="open.projects" class="group-body">
           <div v-for="project in visibleProjects" :key="project.id" class="project-block">
-            <div class="project-row" role="button" tabindex="0" @click="openProjectGroup(project.id)" @keydown.enter="openProjectGroup(project.id)">
+            <div
+              class="project-row"
+              role="button"
+              tabindex="0"
+              @click="openProjectGroup(project.id)"
+              @keydown.enter="openProjectGroup(project.id)"
+            >
               <AppIcon name="folder" :size="12" />
               <span class="p-name">{{ project.name }}</span>
               <span
@@ -668,9 +688,14 @@ onBeforeUnmount(() => {
                   size="small"
                   title="项目操作"
                   @click.stop="projectMenu = project.id"
-                >…</el-button>
+                  >…</el-button
+                >
               </span>
-              <span class="p-chev" :class="{ open: isExpanded(project.id) }" @click.stop="toggleProject(project.id)">
+              <span
+                class="p-chev"
+                :class="{ open: isExpanded(project.id) }"
+                @click.stop="toggleProject(project.id)"
+              >
                 <AppIcon name="chevronRight" :size="10" />
               </span>
             </div>
@@ -693,12 +718,26 @@ onBeforeUnmount(() => {
               <p v-if="projectSessions(project.id).length === 0" class="empty">暂无对话</p>
             </div>
 
-            <div v-if="projectMenu === project.id" class="menu-mask" @click.stop="projectMenu = null"></div>
+            <div
+              v-if="projectMenu === project.id"
+              class="menu-mask"
+              @click.stop="projectMenu = null"
+            ></div>
             <div v-if="projectMenu === project.id" class="p-menu" @click.stop>
-              <el-button class="p-menu-item" text :icon="ChatDotRound" @click="createSessionInProject(project.id)">
+              <el-button
+                class="p-menu-item"
+                text
+                :icon="ChatDotRound"
+                @click="createSessionInProject(project.id)"
+              >
                 在该项目下新建对话
               </el-button>
-              <el-button class="p-menu-item" text :icon="EditPen" @click="renameProject(project.id)">
+              <el-button
+                class="p-menu-item"
+                text
+                :icon="EditPen"
+                @click="renameProject(project.id)"
+              >
                 重命名
               </el-button>
               <el-button
@@ -709,17 +748,27 @@ onBeforeUnmount(() => {
               >
                 {{ project.pinned ? '取消置顶' : '置顶' }}
               </el-button>
-              <el-button class="p-menu-item" text :icon="Refresh" @click="repairProject(project.id)">
+              <el-button
+                class="p-menu-item"
+                text
+                :icon="Refresh"
+                @click="repairProject(project.id)"
+              >
                 重新校验 / 修复标记
               </el-button>
-              <el-button class="p-menu-item" text :icon="FolderOpened" @click="openProject(project.path)">
+              <el-button
+                class="p-menu-item"
+                text
+                :icon="FolderOpened"
+                @click="openProject(project.path)"
+              >
                 在资源管理器中打开
               </el-button>
               <el-button
                 class="p-menu-item"
                 text
                 :icon="CopyDocument"
-                @click="copyProjectPath(project.id); projectMenu = null"
+                @click="copyProjectPath(project.id)"
               >
                 复制目录路径
               </el-button>
@@ -775,7 +824,9 @@ onBeforeUnmount(() => {
           <el-empty
             v-else-if="ungrouped.length === 0 && !sessions.loading"
             :image-size="40"
-            :description="workspace.projects.length ? '暂无未分组对话' : '还没有对话，发一条消息开始'"
+            :description="
+              workspace.projects.length ? '暂无未分组对话' : '还没有对话，发一条消息开始'
+            "
           />
         </div>
       </section>
@@ -801,11 +852,7 @@ onBeforeUnmount(() => {
         v-loading="sessions.archivedLoading && sessions.archivedSessions.length === 0"
         class="archive-list"
       >
-        <div
-          v-for="item in sessions.archivedSessions"
-          :key="item.thread_id"
-          class="archive-item"
-        >
+        <div v-for="item in sessions.archivedSessions" :key="item.thread_id" class="archive-item">
           <div class="arc-main">
             <div class="arc-title-row">
               <AppIcon name="archive" :size="11" />
@@ -814,6 +861,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="arc-meta mono">
               <span>归档于 {{ fmtArchiveTime(item.archived_at) }}</span>
+              <span v-if="purgeHint(item)" class="arc-purge">· {{ purgeHint(item) }}</span>
               <el-button
                 v-if="archivedProject(item)"
                 class="arc-path"
@@ -966,7 +1014,9 @@ onBeforeUnmount(() => {
   padding: 3px 8px;
   color: var(--text-2);
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .integration-row:hover {
@@ -1072,7 +1122,9 @@ onBeforeUnmount(() => {
   padding: 0 8px;
   color: var(--text-2);
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
 
 .project-row:hover {
@@ -1346,6 +1398,12 @@ onBeforeUnmount(() => {
 .arc-meta > span {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 剩余保留天数：临近清除时用告警色提示 */
+.arc-meta .arc-purge {
+  flex: none;
+  color: var(--amber);
 }
 
 .arc-path.el-button {

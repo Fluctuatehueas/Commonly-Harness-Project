@@ -53,16 +53,14 @@ def build_agent_protection_middleware(
                 system_prompt=COMPACTION_SYSTEM_PROMPT,
             )
         )
-    middleware.extend(
-        [
-            ModelCallLimitMiddleware(
-                run_limit=model_run_limit,
-                exit_behavior="end",
-            ),
-            ToolCallLimitMiddleware(
-                run_limit=tool_run_limit,
-                exit_behavior="end",
-            ),
-        ]
-    )
+    # 次数上限 <= 0 表示不限制：长任务流里工具调用本来就多，
+    # 硬上限会在正常工作时被误判成异常终止。
+    if model_run_limit > 0:
+        middleware.append(
+            ModelCallLimitMiddleware(run_limit=model_run_limit, exit_behavior="end")
+        )
+    if tool_run_limit > 0:
+        middleware.append(
+            ToolCallLimitMiddleware(run_limit=tool_run_limit, exit_behavior="end")
+        )
     return middleware

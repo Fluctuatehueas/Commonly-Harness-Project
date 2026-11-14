@@ -8,12 +8,21 @@ value 结构::
 
     {
       "rounds": [
-        {"message_id": "...", "input": 6056, "output": 42, "total": 6098, "at": "iso"}
+        {
+          "message_id": "...",
+          "input": 6056,
+          "input_spent": 38210,
+          "output": 42,
+          "total": 38252,
+          "at": "iso",
+        }
       ],
-      "session": {"input": 6056, "output": 42, "total": 6098}
+      "session": {"input": 6056, "output": 42, "total": 6098, "spent": 38252}
     }
 
-``rounds`` 是唯一事实源，按写入顺序追加；``session`` 是它的前缀和。
+``input`` 是本轮最后一次模型调用的上下文占用；``input_spent`` 是本轮全部
+调用的输入之和（真实计费）。``rounds`` 是唯一事实源，按写入顺序追加；
+``session`` 按「最新上下文 + 历轮输出 + 历轮真实计费」计算。
 以最终回答消息 ID 去重，保证同一轮重放（如中断恢复）不会重复计数；
 即使历史消息随后被摘要压缩掉，累计值依然保留。
 """
@@ -23,7 +32,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from agent.config import MODEL_CONTEXT_LIMIT
+from agent.config import MODEL_CONTEXT_LIMIT, context_limit_for
 
 USAGE_NAMESPACE_PREFIX = ("usage",)
 SESSION_KEY = "session"
@@ -46,7 +55,11 @@ def _session_summary(rounds: list[dict[str, Any]]) -> dict[str, int]:
     """
     latest_input = int(rounds[-1].get("input") or 0) if rounds else 0
     output_sum = sum(int(entry.get("output") or 0) for entry in rounds)
-    input_sum = sum(int(entry.get("input") or 0) for entry in rounds)
+    # 旧记录没有 input_spent：回退到 input，保证历史会话的费用仍可累计。
+    input_sum = sum(
+        int(entry.get("input_spent", entry.get("input", 0)) or 0)
+        for entry in rounds
+    )
     return {
         "input": latest_input,
         "output": output_sum,
@@ -63,19 +76,33 @@ async def read_usage(store: Any, *, user_id: str, thread_id: str) -> dict[str, A
     让前端不用再维护本地上下文窗口常量。
     """
     if store is None or not user_id or not thread_id:
-        return _with_context_window({"rounds": [], "session": _session_summary([])})
+        return _with_context_window({"rounds": [], "session": _session_summary([])}, user_id)
     item = await store.aget(usage_namespace(user_id, thread_id), SESSION_KEY)
     if item is None:
-        return _with_context_window({"rounds": [], "session": _session_summary([])})
+        return _with_context_window({"rounds": [], "session": _session_summary([])}, user_id)
     value = dict(item.value or {})
     rounds = [dict(entry) for entry in value.get("rounds", []) if isinstance(entry, dict)]
-    return _with_context_window({"rounds": rounds, "session": _session_summary(rounds)})
+    return _with_context_window(
+        {"rounds": rounds, "session": _session_summary(rounds)}, user_id
+    )
 
 
-def _with_context_window(usage: dict[str, Any]) -> dict[str, Any]:
-    """给会话用量补上真实上下文窗口与当前占用。"""
+def _with_context_window(
+    usage: dict[str, Any], user_id: str | None = None
+) -> dict[str, Any]:
+    """给会话用量补上真实上下文窗口与当前占用。
+
+    窗口取该用户生效的模型配置，而不是进程启动时读到的全局常量：
+    用户在设置页或 Agent 档案里调整上下文上限后，前端圆环应立即跟随。
+    """
     session = dict(usage.get("session") or {})
-    session.setdefault("context_window", int(MODEL_CONTEXT_LIMIT))
+    window = 0
+    if user_id:
+        try:
+            window = int(context_limit_for(user_id))
+        except Exception:
+            window = 0
+    session.setdefault("context_window", window or int(MODEL_CONTEXT_LIMIT))
     session.setdefault("context_used", int(session.get("input") or 0))
     result = dict(usage)
     result["session"] = session
@@ -91,8 +118,13 @@ async def append_usage_round(
     input_tokens: int,
     output_tokens: int,
     total_tokens: int,
+    input_spent_tokens: int = 0,
 ) -> None:
-    """追加一轮的最终回答用量；同一消息 ID 重复写入时保持幂等。"""
+    """追加一轮的最终回答用量；同一消息 ID 重复写入时保持幂等。
+
+    ``input_tokens`` 是上下文占用，``input_spent_tokens`` 是本轮真实计费输入；
+    旧调用方不传后者时按上下文占用计，保持向后兼容。
+    """
     if store is None or not user_id or not thread_id or not message_id:
         return
     namespace = usage_namespace(user_id, thread_id)
@@ -105,6 +137,7 @@ async def append_usage_round(
         {
             "message_id": message_id,
             "input": int(input_tokens),
+            "input_spent": int(input_spent_tokens or input_tokens),
             "output": int(output_tokens),
             "total": int(total_tokens),
             "at": datetime.now(timezone.utc).isoformat(),

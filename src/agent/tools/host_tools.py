@@ -129,6 +129,25 @@ def _assert_not_forbidden(path: Path) -> None:
             continue
 
 
+def _resolve_working_directory(raw_path: str) -> Path:
+    """解析命令工作目录；允许项目外目录，但拒绝受保护路径。"""
+    text = (raw_path or "").strip()
+    if not text:
+        raise HostPathError("工作目录不能为空")
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        project = current_project_optional()
+        if project is None or project.root is None:
+            raise HostPathError("相对工作目录只能在项目会话中使用；请提供绝对路径")
+        candidate = project.root / text.lstrip("/")
+    if not candidate.exists():
+        raise HostPathError(f"工作目录不存在：{candidate}")
+    if not candidate.is_dir():
+        raise HostPathError(f"工作目录不是目录：{candidate}")
+    _assert_not_forbidden(candidate)
+    return candidate.resolve()
+
+
 def _resolve_host_path(
     raw_path: str,
     *,
@@ -252,6 +271,11 @@ def _request_approval(
             "summary": summary,
             "reason": reason,
             "args": args,
+            "options": [
+                {"value": "approve", "label": "允许本次"},
+                {"value": "approve_thread", "label": "仅本会话允许"},
+                {"value": "reject", "label": "拒绝"},
+            ],
         },
     }
     decision, message = _parse_decision(interrupt(payload))
@@ -344,17 +368,19 @@ async def host_execute(
     reason: str,
     timeout: int = 120,
     shell: str = "",
+    cwd: str = "",
 ) -> str:
-    """在本机执行一条命令（仅项目会话；cwd 固定为项目根目录）。
+    """在本机执行一条命令（项目会话；默认 cwd 为项目根目录）。
 
-    只有沙箱缺少目标运行环境时才使用。调用会暂停等待人工审批：
-    批准、仅本会话允许、拒绝。命令与工作目录会原样展示给审批人。
+    只有沙箱缺少目标运行环境、或必须访问项目外目录时才使用。调用会暂停等待
+    人工审批：允许本次、仅本会话允许、拒绝。命令与工作目录会原样展示。
 
     Args:
         command: 要执行的命令。
         reason: 为什么必须在本机执行（必填，会展示给审批人）。
         timeout: 超时秒数，最大 600。
         shell: powershell / cmd / bash；留空按平台默认。
+        cwd: 工作目录；默认项目根。项目外目录必须传绝对路径。
     """
     if not (host_config.HOST_ACCESS_ENABLED and host_config.HOST_EXEC_ENABLED):
         return _error("HOST_DISABLED", "宿主执行能力未开启")
@@ -381,15 +407,22 @@ async def host_execute(
         return _error("COMMAND_DENIED", str(exc))
 
     seconds = max(1, min(int(timeout or host_config.HOST_EXEC_TIMEOUT), MAX_TIMEOUT_SECONDS))
-    cwd = project.root.resolve()
-    key = f"exec|{selected_shell}|{text}|{_norm(cwd)}"
+    try:
+        workdir = (
+            _resolve_working_directory(cwd)
+            if (cwd or "").strip()
+            else project.root.resolve()
+        )
+    except HostPathError as exc:
+        return _error("PATH_DENIED", str(exc))
+    key = f"exec|{selected_shell}|{text}|{_norm(workdir)}"
     decision, message = _request_approval(
         tool_name="host_execute",
         key=key,
-        summary=f"在本机执行命令（cwd={cwd}）：{text}",
+        summary=f"在本机执行命令（cwd={workdir}）：{text}",
         args={
             "command": text,
-            "cwd": str(cwd),
+            "cwd": str(workdir),
             "shell": selected_shell,
             "timeout": seconds,
             "reason": reason,
@@ -403,7 +436,7 @@ async def host_execute(
         )
 
     try:
-        result = await asyncio.to_thread(_run_command, text, selected_shell, cwd, seconds)
+        result = await asyncio.to_thread(_run_command, text, selected_shell, workdir, seconds)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return _error("EXEC_FAILED", f"本机执行失败：{exc}")
     return json.dumps(

@@ -6,7 +6,6 @@ import { computed, ref } from 'vue'
 import { Plus } from '@element-plus/icons-vue'
 import type { StepDef } from '@/api/taskflow'
 import type { NodeMenuPayload } from './types'
-
 const props = withDefaults(
   defineProps<{
     steps: StepDef[]
@@ -33,12 +32,12 @@ function brief(text: string): string {
 }
 
 function onSelect(id: string) {
-  if (props.compact) return
+  if (props.compact || isDragClick()) return
   emit('select', id)
 }
 
 function onMenu(event: MouseEvent, step: StepDef, branch: string | null) {
-  if (props.compact || props.readonly) return
+  if (props.compact || props.readonly || isDragClick()) return
   emit('menu', {
     id: step.id,
     x: event.clientX,
@@ -129,88 +128,195 @@ const popupStyle = computed(() => {
     top: `${card.y}px`,
   }
 })
+
+// ---------- 缩放查看 ----------
+// 步骤多、分支宽时简图会超出可视区，这里复用图表查看器的缩放思路：
+// 工具条 + Ctrl/⌘ + 滚轮缩放 + 一键适应 / 还原。
+const MAP_MIN_ZOOM = 0.4
+const MAP_MAX_ZOOM = 1.5
+const MAP_ZOOM_STEP = 0.1
+const mapZoom = ref(1)
+const mapEl = ref<HTMLElement | null>(null)
+const viewport = ref<HTMLElement | null>(null)
+const panning = ref(false)
+
+// 拖拽产生的位移要吞掉随后的 click，否则一拖就误选节点。
+let panStart = { x: 0, y: 0, left: 0, top: 0 }
+let panMoved = false
+let suppressClickUntil = 0
+
+const canvasStyle = computed(() => (props.compact ? {} : { zoom: String(mapZoom.value) }))
+
+function zoomMapBy(step: number) {
+  const next = Math.min(MAP_MAX_ZOOM, Math.max(MAP_MIN_ZOOM, mapZoom.value + step))
+  mapZoom.value = Number(next.toFixed(2))
+}
+
+function resetMapZoom() {
+  mapZoom.value = 1
+}
+
+/** 按可视高度等比缩放，步骤很多时一键看到全貌。 */
+function fitMapZoom() {
+  const el = mapEl.value
+  const view = viewport.value
+  if (!el || !view) return
+  // zoom 会同时影响布局尺寸，先按当前倍率还原出内容真实高度。
+  const natural = el.getBoundingClientRect().height / mapZoom.value
+  if (!natural) return
+  const target = (view.clientHeight - 20) / natural
+  mapZoom.value = Number(Math.min(MAP_MAX_ZOOM, Math.max(MAP_MIN_ZOOM, target)).toFixed(2))
+}
+
+function onMapWheel(event: WheelEvent) {
+  if (props.compact) return
+  // 普通滚轮保持滚动，Ctrl / Cmd + 滚轮才缩放，避免抢走浏览手势。
+  if (!event.ctrlKey && !event.metaKey) return
+  event.preventDefault()
+  zoomMapBy(event.deltaY < 0 ? MAP_ZOOM_STEP : -MAP_ZOOM_STEP)
+}
+
+// ---------- 拖拽平移 ----------
+function onPanDown(event: PointerEvent) {
+  if (props.compact || event.button !== 0) return
+  const el = viewport.value
+  if (!el) return
+  panning.value = true
+  panMoved = false
+  panStart = { x: event.clientX, y: event.clientY, left: el.scrollLeft, top: el.scrollTop }
+  el.setPointerCapture(event.pointerId)
+}
+
+function onPanMove(event: PointerEvent) {
+  if (!panning.value) return
+  const el = viewport.value
+  if (!el) return
+  const dx = event.clientX - panStart.x
+  const dy = event.clientY - panStart.y
+  if (!panMoved && Math.hypot(dx, dy) > 4) panMoved = true
+  el.scrollLeft = panStart.left - dx
+  el.scrollTop = panStart.top - dy
+}
+
+function onPanUp(event: PointerEvent) {
+  if (!panning.value) return
+  panning.value = false
+  const el = viewport.value
+  el?.releasePointerCapture?.(event.pointerId)
+  if (panMoved) suppressClickUntil = Date.now() + 150
+}
+
+/** 拖拽结束后的第一次点击不当作选中。 */
+function isDragClick() {
+  return Date.now() < suppressClickUntil
+}
 </script>
 
 <template>
-  <div class="mini-map" :class="{ compact }">
-    <template v-for="(step, i) in steps" :key="step.id">
-      <div
-        class="node-wrap main"
-        :class="{ selected: step.id === selectedId, invalid: !!errors[step.id] }"
-        @click="onSelect(step.id)"
-        @mouseenter="showCard($event, step, null)"
-        @mouseleave="hideCard"
-        @contextmenu.prevent="onMenu($event, step, null)"
-      >
-        <span class="dot">
-          {{ i + 1 }}
-          <i v-if="step.checkpoint && !compact" class="cp-mark" title="校验点" />
-          <i v-if="step.parallel?.length && !compact" class="fork-mark" title="并行子流" />
-        </span>
-        <p v-if="!compact && errors[step.id]" class="err-note">{{ errors[step.id] }}</p>
-      </div>
-
-      <div v-if="step.parallel?.length" class="fork">
-        <div
-          v-for="(branch, bi) in step.parallel"
-          :key="`${step.id}-${bi}`"
-          class="branch"
-          :style="branchStyle(bi)"
-        >
-          <span class="branch-name">{{ branch.name || '未命名分支' }}</span>
-          <div
-            v-for="(sub, j) in branch.steps"
-            :key="sub.id"
-            class="node-wrap sub"
-            :class="{ selected: sub.id === selectedId, invalid: !!errors[sub.id] }"
-            @click="onSelect(sub.id)"
-            @mouseenter="showCard($event, sub, branch.name)"
-            @mouseleave="hideCard"
-            @contextmenu.prevent="onMenu($event, sub, branch.name)"
-          >
-            <span class="dot">{{ i + 1 }}.{{ j + 1 }}</span>
-            <p v-if="!compact && errors[sub.id]" class="err-note">{{ errors[sub.id] }}</p>
-          </div>
-          <!-- 子分支末尾快速加步 -->
-          <button
-            v-if="!compact && !readonly"
-            class="branch-add"
-            type="button"
-            :title="`在「${branch.name || '未命名分支'}」末尾新增步骤`"
-            @click.stop="onAddSub(step, bi)"
-          >
-            <el-icon><Plus /></el-icon>
-          </button>
-        </div>
-      </div>
-    </template>
-
-    <!-- fork 覆盖层不占主流程高度，用空白占位保证滚动区能容纳最长分支 -->
-    <div v-if="forkSpacer > 0" class="fork-spacer" :style="{ height: `${forkSpacer}px` }" />
-
-    <!-- 空态：直接给可点的建流程入口 -->
-    <div v-if="!steps.length && !compact" class="empty-state">
-      <div class="empty-orb">
-        <el-icon><Plus /></el-icon>
-      </div>
-      <p class="empty-title">还没有步骤</p>
-      <p class="empty-desc">任务流由一个个步骤串起来，先建第一个</p>
-      <el-button v-if="!readonly" type="primary" :icon="Plus" @click="onAdd">
-        新增第一个步骤
-      </el-button>
-      <el-tag v-else type="info" effect="plain">只读流程</el-tag>
+  <div class="map-shell" :class="{ compact }">
+    <!-- 缩放工具条：绝对定位于右上角，鼠标进入简图区域时才淡入 -->
+    <div v-if="!compact" class="map-toolbar">
+      <button type="button" title="缩小" @click="zoomMapBy(-MAP_ZOOM_STEP)">−</button>
+      <button type="button" class="map-zoom" title="还原为 100%" @click="resetMapZoom">
+        {{ Math.round(mapZoom * 100) }}%
+      </button>
+      <button type="button" title="放大" @click="zoomMapBy(MAP_ZOOM_STEP)">+</button>
+      <button type="button" class="map-fit" title="按高度缩放，看到完整流程" @click="fitMapZoom">
+        适应
+      </button>
     </div>
 
-    <!-- 追加节点：始终可点，不依赖右键 -->
-    <button
-      v-else-if="!compact && !readonly"
-      class="append-node"
-      type="button"
-      title="在末尾新增步骤"
-      @click="onAdd"
+    <div
+      ref="viewport"
+      class="map-viewport"
+      :class="{ panning }"
+      @wheel="onMapWheel"
+      @pointerdown="onPanDown"
+      @pointermove="onPanMove"
+      @pointerup="onPanUp"
+      @pointercancel="onPanUp"
     >
-      <el-icon><Plus /></el-icon>
-    </button>
+      <div ref="mapEl" class="mini-map" :style="canvasStyle">
+        <template v-for="(step, i) in steps" :key="step.id">
+          <div
+            class="node-wrap main"
+            :class="{ selected: step.id === selectedId, invalid: !!errors[step.id] }"
+            @click="onSelect(step.id)"
+            @mouseenter="showCard($event, step, null)"
+            @mouseleave="hideCard"
+            @contextmenu.prevent="onMenu($event, step, null)"
+          >
+            <span class="dot">
+              {{ i + 1 }}
+              <i v-if="step.checkpoint && !compact" class="cp-mark" title="校验点" />
+              <i v-if="step.parallel?.length && !compact" class="fork-mark" title="并行子流" />
+            </span>
+            <p v-if="!compact && errors[step.id]" class="err-note">{{ errors[step.id] }}</p>
+          </div>
+
+          <div v-if="step.parallel?.length" class="fork">
+            <div
+              v-for="(branch, bi) in step.parallel"
+              :key="`${step.id}-${bi}`"
+              class="branch"
+              :style="branchStyle(bi)"
+            >
+              <span class="branch-name">{{ branch.name || '未命名分支' }}</span>
+              <div
+                v-for="(sub, j) in branch.steps"
+                :key="sub.id"
+                class="node-wrap sub"
+                :class="{ selected: sub.id === selectedId, invalid: !!errors[sub.id] }"
+                @click="onSelect(sub.id)"
+                @mouseenter="showCard($event, sub, branch.name)"
+                @mouseleave="hideCard"
+                @contextmenu.prevent="onMenu($event, sub, branch.name)"
+              >
+                <span class="dot">{{ i + 1 }}.{{ j + 1 }}</span>
+                <p v-if="!compact && errors[sub.id]" class="err-note">{{ errors[sub.id] }}</p>
+              </div>
+              <!-- 子分支末尾快速加步 -->
+              <button
+                v-if="!compact && !readonly"
+                class="branch-add"
+                type="button"
+                :title="`在「${branch.name || '未命名分支'}」末尾新增步骤`"
+                @click.stop="onAddSub(step, bi)"
+              >
+                <el-icon><Plus /></el-icon>
+              </button>
+            </div>
+          </div>
+        </template>
+
+        <!-- fork 覆盖层不占主流程高度，用空白占位保证滚动区能容纳最长分支 -->
+        <div v-if="forkSpacer > 0" class="fork-spacer" :style="{ height: `${forkSpacer}px` }" />
+
+        <!-- 空态：直接给可点的建流程入口 -->
+        <div v-if="!steps.length && !compact" class="empty-state">
+          <div class="empty-orb">
+            <el-icon><Plus /></el-icon>
+          </div>
+          <p class="empty-title">还没有步骤</p>
+          <p class="empty-desc">任务流由一个个步骤串起来，先建第一个</p>
+          <el-button v-if="!readonly" type="primary" :icon="Plus" @click="onAdd">
+            新增第一个步骤
+          </el-button>
+          <el-tag v-else type="info" effect="plain">只读流程</el-tag>
+        </div>
+
+        <!-- 追加节点：始终可点，不依赖右键 -->
+        <button
+          v-else-if="!compact && !readonly"
+          class="append-node"
+          type="button"
+          title="在末尾新增步骤"
+          @click="onAdd"
+        >
+          <el-icon><Plus /></el-icon>
+        </button>
+      </div>
+    </div>
   </div>
 
   <!-- 步骤信息卡：Teleport 到 body + fixed 定位，彻底避开滚动容器裁剪 -->
@@ -234,6 +340,102 @@ const popupStyle = computed(() => {
 </template>
 
 <style scoped>
+<style scoped>
+/* ---------- 外层：工具条浮在视口右上角 ---------- */
+.map-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.map-shell.compact {
+  height: auto;
+}
+
+/* 缩放工具条：水平排列，默认隐藏，鼠标进入简图区域后淡入 */
+.map-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 7;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(9, 14, 25, 0.92);
+  box-shadow: 0 6px 18px rgba(2, 6, 14, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+
+.map-shell:hover .map-toolbar,
+.map-toolbar:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+
+.map-toolbar button {
+  display: grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+
+.map-toolbar button:hover {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+
+.map-toolbar .map-zoom {
+  min-width: 44px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-toolbar .map-fit {
+  min-width: 44px;
+  font-size: 10px;
+}
+
+/* ---------- 视口：独立滚动 + 拖拽平移 ---------- */
+.map-viewport {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  cursor: grab;
+}
+
+.map-viewport.panning {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.map-shell.compact .map-viewport {
+  overflow: visible;
+  cursor: default;
+}
+
 .mini-map {
   position: relative;
   display: flex;

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 轨迹页：顶部甘特图 + 顺次日志列表 + 右侧详情
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
@@ -158,12 +158,61 @@ const ganttRange = computed(() => {
   return { start, end, span: end - start }
 })
 
+// ---------- 甘特图水平缩放 ----------
+// 默认 2 倍：原始密度下工具条几乎不可读。放大后时间轴随之展开并按容器横向滚动。
+const GANTT_MIN_ZOOM = 1
+const GANTT_MAX_ZOOM = 10
+const GANTT_ZOOM_STEP = 0.5
+const ganttZoom = ref(2)
+const ganttScroll = ref<HTMLElement | null>(null)
+// 刻度数量随缩放增加，避免拉宽后只剩几个稀疏标签。
+const ganttTickCount = computed(() => Math.max(5, Math.round(ganttZoom.value * 2)))
+
 const ticks = computed(() =>
-  Array.from({ length: 5 }, (_, index) => {
-    const offset = (ganttRange.value.span * index) / 4
-    return { offset: (index / 4) * 100, label: formatOffset(offset) }
+  Array.from({ length: ganttTickCount.value }, (_, index) => {
+    const ratio = index / (ganttTickCount.value - 1)
+    return {
+      offset: ratio * 100,
+      label: formatOffset(ganttRange.value.span * ratio),
+    }
   }),
 )
+
+function applyGanttZoom(next: number, anchor = 0.5) {
+  const clamped = Math.min(GANTT_MAX_ZOOM, Math.max(GANTT_MIN_ZOOM, next))
+  if (Math.abs(clamped - ganttZoom.value) < 0.001) return
+  const el = ganttScroll.value
+  // 记录锚点在时间轴上的相对位置，缩放后保持它停在视口同一处。
+  const ratio = el
+    ? (el.scrollLeft + el.clientWidth * anchor) / Math.max(1, el.clientWidth * ganttZoom.value)
+    : anchor
+  const previous = ganttZoom.value
+  ganttZoom.value = clamped
+  if (!el) return
+  void nextTick(() => {
+    const width = el.clientWidth * (clamped / previous)
+    el.scrollLeft = Math.max(0, ratio * width - el.clientWidth * anchor)
+  })
+}
+
+function zoomGanttBy(step: number) {
+  applyGanttZoom(ganttZoom.value + step)
+}
+
+function onGanttZoomInput(event: Event) {
+  applyGanttZoom(Number((event.target as HTMLInputElement).value))
+}
+
+function onGanttWheel(event: WheelEvent) {
+  // 只在按住 Ctrl / Cmd 时缩放，普通滚轮仍然翻页与滚动页面。
+  if (!event.ctrlKey && !event.metaKey) return
+  event.preventDefault()
+  const el = ganttScroll.value
+  const anchor = el
+    ? Math.min(1, Math.max(0, (event.clientX - el.getBoundingClientRect().left) / el.clientWidth))
+    : 0.5
+  applyGanttZoom(ganttZoom.value + (event.deltaY < 0 ? GANTT_ZOOM_STEP : -GANTT_ZOOM_STEP), anchor)
+}
 
 function laneEvents(lane: string) {
   return events.value.filter((event) => event.type === lane)
@@ -536,35 +585,87 @@ onBeforeUnmount(stopTimer)
         <div class="traj-layout">
           <div class="traj-main">
             <section class="panel gantt-panel">
-             
-              <div class="axis">
-                <span class="axis-spacer"></span>
-                <div class="axis-track">
-                  <span v-for="tick in ticks" :key="tick.label" :style="{ left: `${tick.offset}%` }">
-                    {{ tick.label }}
-                  </span>
+              <header class="panel-head gantt-head">
+                <div class="gantt-title">
+                  <strong>过程甘特图</strong>
+                  <small>{{ events.length }} 个过程 · Ctrl + 滚轮可缩放</small>
                 </div>
-              </div>
-              <div class="lanes">
-                <div v-for="lane in LANES" :key="lane.key" class="lane">
-                  <div class="lane-label">
+                <div class="gantt-zoom">
+                  <button
+                    type="button"
+                    class="gantt-zoom-btn"
+                    title="缩小"
+                    @click="zoomGanttBy(-GANTT_ZOOM_STEP)"
+                  >
+                    −
+                  </button>
+                  <input
+                    class="gantt-zoom-range"
+                    type="range"
+                    :min="GANTT_MIN_ZOOM"
+                    :max="GANTT_MAX_ZOOM"
+                    :step="GANTT_ZOOM_STEP"
+                    :value="ganttZoom"
+                    aria-label="甘特图水平缩放"
+                    @input="onGanttZoomInput"
+                  />
+                  <button
+                    type="button"
+                    class="gantt-zoom-btn"
+                    title="放大"
+                    @click="zoomGanttBy(GANTT_ZOOM_STEP)"
+                  >
+                    +
+                  </button>
+                  <button
+                    type="button"
+                    class="gantt-zoom-reset"
+                    title="恢复默认缩放"
+                    @click="applyGanttZoom(2)"
+                  >
+                    {{ Math.round(ganttZoom * 100) }}%
+                  </button>
+                </div>
+              </header>
+
+              <div class="gantt-body">
+                <!-- 左侧泳道名固定，不随时间轴横向滚动 -->
+                <div class="gantt-labels">
+                  <span class="axis-spacer"></span>
+                  <div v-for="lane in LANES" :key="lane.key" class="lane-label">
                     <i :style="{ background: lane.color }"></i>
                     <AppIcon :name="lane.icon" :size="12" />
                     <span>{{ lane.label }}</span>
                   </div>
-                  <div class="lane-track">
-                    <button
-                      v-for="event in laneEvents(lane.key)"
-                      :key="event.id"
-                      class="gantt-bar"
-                      type="button"
-                      :class="{ selected: selectedEventId === event.id }"
-                      :style="barStyle(event)"
-                      :title="`${barLabel(event)} · ${durationLabel(event.duration_ms)}`"
-                      @click="selectEvent(event.id)"
-                    >
-                      <span class="bar-label">{{ barLabel(event) }}</span>
-                    </button>
+                </div>
+
+                <div ref="ganttScroll" class="gantt-scroll" @wheel="onGanttWheel">
+                  <div class="gantt-track" :style="{ width: `${ganttZoom * 100}%` }">
+                    <div class="axis-track">
+                      <span
+                        v-for="(tick, index) in ticks"
+                        :key="index"
+                        :style="{ left: `${tick.offset}%` }"
+                      >
+                        {{ tick.label }}
+                      </span>
+                    </div>
+                    <div class="lanes">
+                      <div v-for="lane in LANES" :key="lane.key" class="lane-track">
+                        <button
+                          v-for="event in laneEvents(lane.key)"
+                          :key="event.id"
+                          class="gantt-bar"
+                          type="button"
+                          :class="{ selected: selectedEventId === event.id }"
+                          :style="barStyle(event)"
+                          :title="`${barLabel(event)} · ${durationLabel(event.duration_ms)}`"
+                          @click="selectEvent(event.id)"
+                        >
+                          <span class="bar-label">{{ barLabel(event) }}</span>
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -905,24 +1006,129 @@ onBeforeUnmount(stopTimer)
   color: var(--text-3);
 }
 
-.axis {
+/* ---------- 甘特图：左侧泳道名固定，时间轴按缩放比例横向滚动 ---------- */
+.gantt-head {
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.gantt-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.gantt-zoom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.gantt-zoom-btn {
   display: grid;
-  grid-template-columns: 96px 1fr;
-  margin-bottom: 4px;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+}
+
+.gantt-zoom-btn:hover {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+
+.gantt-zoom-range {
+  width: 108px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.gantt-zoom-reset {
+  min-width: 48px;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+}
+
+.gantt-zoom-reset:hover {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+
+.gantt-body {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.gantt-labels {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 5px;
+  width: 96px;
+}
+
+.gantt-labels .axis-spacer {
+  flex: none;
+  height: 24px;
+}
+
+.gantt-scroll {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.gantt-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.gantt-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.gantt-scroll::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: var(--line-strong);
+}
+
+.gantt-track {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 100%;
 }
 
 .axis-track {
   position: relative;
-  height: 16px;
+  flex: none;
+  height: 24px;
 }
 
 .axis-track span {
   position: absolute;
-  top: 0;
+  top: 3px;
   font-size: 9.5px;
   color: var(--text-3);
   transform: translateX(-50%);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .axis-track span:first-child {
@@ -939,17 +1145,11 @@ onBeforeUnmount(stopTimer)
   gap: 5px;
 }
 
-.lane {
-  display: grid;
-  grid-template-columns: 96px 1fr;
-  align-items: center;
-  min-height: 24px;
-}
-
 .lane-label {
   display: flex;
   align-items: center;
   gap: 5px;
+  height: 24px;
   font-size: 10.5px;
   color: var(--text-2);
 }
@@ -963,7 +1163,7 @@ onBeforeUnmount(stopTimer)
 
 .lane-track {
   position: relative;
-  height: 20px;
+  height: 24px;
   border-radius: 0;
   background:
     repeating-linear-gradient(
@@ -978,7 +1178,7 @@ onBeforeUnmount(stopTimer)
 
 .gantt-bar {
   position: absolute;
-  top: 4px;
+  top: 6px;
   height: 12px;
   padding: 0;
   border: none;

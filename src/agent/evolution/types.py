@@ -292,10 +292,17 @@ class JudgeVerdict:
     contradiction: bool
     needs_verification: bool
     reason: str = ""
+    # 有工作计划时：最终回答是否覆盖了计划中的全部工作项。
+    plan_covered: bool = True
 
     @property
     def passed(self) -> bool:
-        return self.complete and self.grounded and not self.contradiction
+        return (
+            self.complete
+            and self.grounded
+            and not self.contradiction
+            and self.plan_covered
+        )
 
 
 @dataclass

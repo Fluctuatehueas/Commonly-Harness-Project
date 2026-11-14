@@ -143,6 +143,8 @@
 | `entry_step` | string | 否 | - | 任务流中途接管入口 |
 | `user_state` | string | 否 | `""` | 中途接管时用户已完成部分的描述 |
 | `agent_id` | string | 否 | 会话绑定值 | MyAgent 档案 ID |
+| `output_schema` | object | 否 | - | 最终回答必须满足的 JSON Schema（含 `required`）；提供后启用确定性校验 |
+| `numeric_ranges` | object | 否 | - | 数值断言，如 `{"total":{"value":120,"min":0,"max":200}}` |
 
 **响应**
 
@@ -172,6 +174,8 @@
 | 409 | 会话正在处理中 |
 | 500 / 502 / 503 | 模型或运行时异常 |
 
+> 服务端在返回最终回答前会做 PDCA 自检：规则检查 → L1 模型自检 → L2 确定性验证（`output_schema` / `numeric_ranges`）→ 计划完成度。未通过时最多带反馈重做 2 轮（`HARNESS_PDCA_MAX_ROUNDS`），会增加响应时间与 Token 消耗。
+
 ### 4.2 流式对话
 
 **POST** `/chat/stream`
@@ -199,6 +203,7 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
 | `interrupt` | `thread_id`、`interrupt_id`、`interrupt_type`、载荷 | 人工介入 |
 | `context_marker` | `marker_type`、`thread_id`、`items` | 上下文压缩 / 经验注入标记 |
 | `retry_start` | `thread_id` | 重新生成开始 |
+| `pdc_revision` | `round`、`reason` | 自检未通过，开始第 N 轮修正；前端可丢弃上一版草稿 |
 | `task_flow_start` | `flow_id`、`flow_name`、`steps` | 任务流开始 |
 | `task_flow_progress` | `flow_id`、`step_id`、`status`、`output` | 任务流步骤进度 |
 | `task_flow_end` | `flow_id`、`status` | 任务流结束 |
@@ -342,7 +347,16 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
 {"resume": {"decision": "approve"}}
 ```
 
-`decision` 可选 `approve` / `approve_thread` / `reject`，`reject` 时可带 `message`。
+`decision` 可选：
+
+| 值 | 含义 |
+| :-- | :-- |
+| `approve` | 允许本次 |
+| `approve_project` | 本项目内允许（仅本机编译命令） |
+| `approve_thread` | 仅本会话允许 |
+| `reject` | 拒绝，可带 `message` |
+
+`compile_project` 在本机执行编译前一定会触发 `host_approval`，载荷中带 `options`（允许本次 / 本项目内允许 / 仅本会话允许 / 拒绝）。`host_execute` 的项目外命令只提供「允许本次 / 仅本会话允许 / 拒绝」。
 
 ---
 

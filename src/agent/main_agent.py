@@ -35,19 +35,21 @@ from agent.config import (
 )
 from agent.user_data import model_settings, user_skills_root
 from agent.memory.prompts import build_web_search_policy
-from agent.memory.prompts import system_prompt as CODE_DEFAULT_AGENT_PROMPT
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware
 from agent.middlewares.context_window_monitor import ContextWindowMonitorMiddleWare
 from agent.middlewares.evolution import EvolutionMiddleware
 from agent.middlewares.experience_injection import ExperienceInjectionMiddleware
 from agent.middlewares.memory_update import MemoryUpdateMiddleware
-from agent.middlewares.self_judge import SelfJudgeMiddleware
+from agent.middlewares.model_concurrency import ModelConcurrencyMiddleware
+from agent.middlewares.pdc_guard import PdcGuardMiddleware
 from agent.middlewares.skills_sync import SandboxSkillsMiddleware
 from agent.middlewares.subagent_progress import SubagentProgressMiddleware
+from agent.middlewares.time_awareness import TimeAwarenessMiddleware
 from agent.middlewares.token_usage import TokenUsageMiddleware
 from agent.middlewares.trajectory import TrajectoryMiddleware
 from agent.middlewares.visualization import VisualizationMiddleware
+from agent.pdc_state import PdcState
 from agent.schema import HarnessContext
 from agent.subagents.async_registry import (
     get_async_subagent_instructions,
@@ -57,14 +59,28 @@ from agent.subagents.async_registry import (
 from agent.subagents.configs import config_path
 from agent.subagents.loader import read_subagent_config
 from agent.tools.async_sandbox_tools import create_async_sandbox_tools
+from agent.tools.build_tools import create_build_tools
 from agent.tools.document_tools import read_word_document
 from agent.tools.hitl_tool import request_additional_info, request_user_choice
 from agent.tools.host_tools import build_host_tools
 from agent.tools.planning_tools import create_planning_tools
 from agent.tools.rag_tools import create_rag_tools
 from agent.mcp.runtime import get_mcp_runtime
-from agent.agent_profiles import AgentProfileStore
+from agent.agent_team.assembly import (
+    _assert_unique_subagent_names,
+    build_team_subagents,
+    team_runtime_middleware,
+)
+from agent.agent_team.context import (
+    AgentMode,
+    HarnessAgentContextBase,
+    TeamAgentContext,
+)
+from agent.agent_team.factory import AgentContextFactory
+from agent.agent_team.runner import TeamDeps
+from agent.agent_team.tools import create_team_tools
 from agent.tools.skill_tools import create_skill_management_tools
+from agent.tools.task_flow_tools import create_task_flow_tools
 from agent.tools.commom_tools import get_basic_tools
 from agent.tools.vision_tools import create_vision_tools
 from agent.tools.workspace_tools import (
@@ -86,6 +102,10 @@ SYNC_SUBAGENT_CONFIG_FILES: list[str | Path] = [
     config_path("web_researcher.yaml"),
     config_path("vision_analyst.yaml"),
     config_path("skill_curator.yaml"),
+    # 通用角色：覆盖普通对话里最常见的调研 / 执行 / 审查三类分工。
+    config_path("researcher.yaml"),
+    config_path("executor.yaml"),
+    config_path("reviewer.yaml"),
 ]
 
 
@@ -162,6 +182,13 @@ async def _load_sync_subagents(
         # 每个子 Agent 都挂进度回调：并发委派时按 run_id 区分实例。
         subagent.setdefault("middleware", [])
         if isinstance(subagent["middleware"], list):
+            # 并发闸门放在最外层：先占名额再发起模型请求，避免同前缀并发抢占
+            # 缓存写入窗口。
+            subagent["middleware"].insert(0, ModelConcurrencyMiddleware())
+            # 子 Agent 的入口消息是委派任务，没有 API 层时间戳，需要入口补时。
+            subagent["middleware"].append(
+                TimeAwarenessMiddleware(stamp_missing_human=True)
+            )
             subagent["middleware"].append(
                 SubagentProgressMiddleware(str(subagent["name"]))
             )
@@ -192,6 +219,8 @@ async def create_main_agent(
     sandbox_backend: SandboxBackendProxy | None,
     integration_server_id: str | None = None,
     agent_profile: dict[str, Any] | None = None,
+    agent_context: HarnessAgentContextBase | None = None,
+    scheduler_enabled: bool = True,
 ) -> Any:
     """创建绑定用户身份、持久化资源和共享沙箱的主 Agent 图。
 
@@ -203,8 +232,10 @@ async def create_main_agent(
             模式（文件工具落到线程状态，禁用技能同步与异步任务）。
         integration_server_id: 会话绑定的集成 MCP；只有该后端与公共 MCP
             的工具可用，其他集成后端的业务工具不会暴露。
-        agent_profile: 用户在 MyAgent 中配置的 Agent 档案；决定系统提示词、
-            模型覆盖与 MCP 绑定。``None`` 时使用默认主 Agent。
+        agent_profile: 用户在 MyAgent 中配置的 Agent 档案；``agent_context``
+            为空时用它构造普通 Agent 上下文。
+        agent_context: 定义期上下文（普通或团队）。团队模式下决定成员子 Agent、
+            组提示词、组模型与可见性边界。
 
     Returns:
         已配置主工具、子 Agent、中间件和持久化后端的 DeepAgents 图。
@@ -213,9 +244,9 @@ async def create_main_agent(
     user_id = str(configurable.get("user_id", "anonymous"))
     sandbox_enabled = sandbox_backend is not None
 
-    # 每个用户 / 每个 Agent 都有自己的模型配置；未覆盖时继承用户默认模型。
-    profile = agent_profile or {}
-    effective_model = AgentProfileStore.merge_model(profile, model_settings(user_id))
+    context = agent_context or AgentContextFactory.from_profile(agent_profile)
+    # 模型三级继承：Agent → 组 → 用户默认。
+    effective_model = context.resolve_model(model_settings(user_id))
     model = build_model(effective_model, role="main", user_id=user_id)
     summary_model = build_model(effective_model, role="summary", user_id=user_id)
     effective_context_limit = int(
@@ -223,9 +254,7 @@ async def create_main_agent(
     )
     # 技能库按用户隔离；首次使用时由 user_data 从内置技能复制。
     skills_root = user_skills_root(user_id)
-    mcp_server_ids = [
-        str(item) for item in (profile.get("mcp_server_ids") or []) if item
-    ] or None
+    mcp_server_ids = list(context.capabilities.mcp_server_ids) or None
 
     # 文件路径决定存储位置：/memories/ 写 PostgreSQL，/artifacts/ 留在图状态，
     # 其余路径落当前项目目录；命令执行始终走沙箱。
@@ -291,9 +320,26 @@ async def create_main_agent(
 
     # 视觉分析工具注入视觉子 Agent；技能管理与视觉工具都作为 local_tools 参与构图。
     vision_tools = create_vision_tools(sandbox_backend)
-    sync_subagents = await _load_sync_subagents(
-        extra_local_tools=[*skill_management_tools, *vision_tools]
-    )
+    extra_local_tools = [*skill_management_tools, *vision_tools]
+    if context.mode is AgentMode.TEAM:
+        # 团队模式：成员 + 组白名单里的全局 YAML；其余全局 YAML 不注入。
+        assert isinstance(context, TeamAgentContext)
+        sync_subagents = await build_team_subagents(
+            context=context,
+            store=store,
+            user_id=user_id,
+            sandbox_backend=sandbox_backend,
+            local_tools=extra_local_tools,
+            load_global_subagents=lambda: _load_sync_subagents(
+                extra_local_tools=extra_local_tools
+            ),
+        )
+    else:
+        # 独立 Agent：行为与改造前完全一致。
+        sync_subagents = await _load_sync_subagents(
+            extra_local_tools=extra_local_tools
+        )
+    _assert_unique_subagent_names(sync_subagents)
 
     # 主 Agent 只保留通用能力：MCP 公共工具、异步任务提交、信息补齐和技能管理。
     # MCP 工具在 Agent 构图时才按 scope 懒发现/取代理，不在进程启动时连接。
@@ -307,6 +353,25 @@ async def create_main_agent(
     host_tools = build_host_tools()
     # 复杂任务先产出分工清单，再按波次并发委派。
     planning_tools = create_planning_tools()
+    # 调度工具独立开关：默认不注册，只有显式开启后才可能改变执行方式。
+    scheduler_tools: list[Any] = []
+    if scheduler_enabled:
+        from agent.tools.scheduler_tools import create_scheduler_tools
+        from scheduler.config import get_config
+
+        if get_config().exec_enabled:
+            scheduler_tools = create_scheduler_tools(
+                config=config,
+                store=store,
+                checkpointer=checkpointer,
+                sandbox_backend=sandbox_backend,
+                integration_server_id=integration_server_id,
+                agent_profile=agent_profile,
+            )
+    # 任务流步骤上报：仅命中任务流时由 HumanMsg 指示使用。
+    task_flow_tools = create_task_flow_tools()
+    # 编译/测试：本机已有运行时优先，缺失时自动转沙箱，不在本机安装环境。
+    build_tools = create_build_tools(sandbox_backend)
     main_tools = [
         *mcp_tools,
         *async_tools,
@@ -314,6 +379,9 @@ async def create_main_agent(
         *get_basic_tools(),
         *host_tools,
         *planning_tools,
+        *scheduler_tools,
+        *task_flow_tools,
+        *build_tools,
         request_additional_info,
         request_user_choice,
         read_word_document,
@@ -326,6 +394,17 @@ async def create_main_agent(
         create_run_in_sandbox_tool(sandbox_backend),
         *skill_management_tools,
     ]
+    if context.mode is AgentMode.TEAM:
+        assert isinstance(context, TeamAgentContext)
+        deps = TeamDeps(
+            store=store,
+            checkpointer=checkpointer,
+            sandbox_backend=sandbox_backend,
+            user_id=user_id,
+            username=str(configurable.get("username") or user_id),
+            integration_server_id=integration_server_id,
+        )
+        main_tools.extend(create_team_tools(context, deps))
     _ensure_unique_tool_names(main_tools)
 
     delegation_instructions = (
@@ -372,12 +451,25 @@ async def create_main_agent(
         f"{execute_policy_line}"
         "- 项目会话需要项目文件参与执行时，调用 `run_in_sandbox` 并在 `files` 中"
         "列出项目相对路径；自由会话直接在该会话沙箱目录执行。\n"
+        "- 写完代码需要编译或测试时，优先调用 `compile_project`："
+        "本机已有运行时会在本机执行；缺少运行时或必要依赖产物时自动转沙箱安装。"
+        "本机执行前会暂停等待用户审批（允许本次 / 本项目内允许 / 仅本会话允许 / 拒绝），"
+        "用户拒绝后不要重试同一命令。"
+        "不要用 `run_in_sandbox` 手动安装语言运行时，也不要在本机安装系统包或新建环境。\n"
         "- 只有项目会话才调用 `publish_to_project` 把成品落到本机；"
         "自由会话不要调用。中间脚本、日志、测试夹具不要发布。\n"
         "- `/.commonharness/` 是项目保留目录，禁止读写。\n"
         f"{host_policy}"
     )
-    base_prompt = f"{search_policy_prompt}{integration_policy}{execution_policy}"
+    # 时间感知改为按需工具：静态提示不会随秒级时间变化，避免破坏请求前缀缓存。
+    time_policy = (
+        "\n\n## 时间\n"
+        "- 需要当前日期、时间或时区时，调用 `get_current_time`；不要凭记忆猜测。\n"
+        "- 不要复述工具返回的时间格式，也不要在回答正文里写系统时间标记。\n"
+    )
+    base_prompt = (
+        f"{search_policy_prompt}{time_policy}{integration_policy}{execution_policy}"
+    )
     # 并行委派是默认工作方式：独立任务同一条消息里并发开多个子 Agent，
     # 同一类型也可以同时开多个实例；不同实例的状态互不共享。
     parallel_policy = (
@@ -402,16 +494,26 @@ async def create_main_agent(
         "- 委派描述必须包含：目标、输入、期望产出、禁止事项；需要过程可见时要求按阶段汇报进度。\n"
         "- 汇总时只采纳各实例的结论；不要把某个实例的内部过程当成最终答案。\n"
     )
+    scheduler_policy = (
+        "\n\n## 任务调度\n"
+        "- 只有多阶段、跨文件、需要检查点或重规划的任务才调用 `scheduler_plan`；"
+        "单步任务直接做，不要为简单任务搭计划。\n"
+        "- `phases` 是两级表：阶段 P0..PN，每个阶段下是带依赖与读写路径的条目。"
+        "MD 档只需给出前两个阶段，后续阶段在检查点自动展开；HD 档给出完整阶段表。\n"
+        "- 调度器已执行完成的条目不要重做；节点失败或需求变化时调用 "
+        "`scheduler_replan`，按 reorder / subtree / full 选择最小范围。\n"
+        "- 调用前先想清楚条目边界：一个条目应当由一次独立执行完成，并写明完成标准。\n"
+        if scheduler_tools
+        else ""
+    )
     harness_policy = (
-        f"{base_prompt}{parallel_policy}\n\n{delegation_instructions}"
+        f"{base_prompt}{parallel_policy}{scheduler_policy}\n\n{delegation_instructions}"
         if delegation_instructions
-        else f"{base_prompt}{parallel_policy}"
+        else f"{base_prompt}{parallel_policy}{scheduler_policy}"
     )
-    # 用户在 MyAgent 中编辑的角色提示词放最前，固定执行策略紧随其后，
-    # 保证自定义风格不会绕过安全与运行环境约束。
-    role_prompt = str(profile.get("system_prompt") or "").strip() or (
-        CODE_DEFAULT_AGENT_PROMPT.strip()
-    )
+    # 角色提示词已包含组信息段（TeamAgentContext.render()），固定策略紧随其后，
+    # 保证自定义风格与组语义不会绕过安全与运行环境约束。
+    role_prompt = context.render()
     full_system_prompt = (
         f"{role_prompt}\n\n{harness_policy}" if role_prompt else harness_policy
     )
@@ -424,12 +526,16 @@ async def create_main_agent(
         tools=main_tools,
         subagents=[*sync_subagents, *async_subagents],
         middleware=[
+            # 全局模型调用闸门：限制并发窗口，让同前缀请求复用缓存。
+            ModelConcurrencyMiddleware(),
             ContextInjectionMiddleware(),
+            # 团队工具可见性与硬拒绝；普通 Agent 返回空列表。
+            *team_runtime_middleware(context),
             # 前端可直接渲染的图表 / 图示 / 图片输出协议。
             VisualizationMiddleware(),
             # 演进模块默认开启；关闭对应环境变量后内部直接短路。
             ExperienceInjectionMiddleware(),
-            SelfJudgeMiddleware(summary_model),
+            PdcGuardMiddleware(summary_model),
             # 只读观测：上下文占用日志 + 过程轨迹落库，不修改 state。
             ContextWindowMonitorMiddleWare(),
             # after_agent 把最终回答的 Token 消耗累计写入 Store（会话统计）。
@@ -448,10 +554,14 @@ async def create_main_agent(
             ),
             # after_agent 阶段反序执行，最后写回用户长期偏好。
             MemoryUpdateMiddleware(summary_model),
+            # 时间感知放在最内层：上下文压缩会重写消息列表，渲染必须作用在
+            # 最终发给模型的消息副本上，才能保留每条消息的时间属性。
+            TimeAwarenessMiddleware(),
         ],
         skills=skills_sources,
         backend=backend,
         store=store,
         checkpointer=checkpointer,
+        state_schema=PdcState,
         context_schema=HarnessContext,
     )

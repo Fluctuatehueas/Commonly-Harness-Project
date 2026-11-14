@@ -18,19 +18,26 @@ _L1_PROMPT = """Audit the final answer before it is sent to the user.
 
 Return only JSON:
 {"complete": true/false, "grounded": true/false, "contradiction": true/false,
- "needs_verification": true/false, "reason": "..."}
+ "needs_verification": true/false, "plan_covered": true/false, "reason": "..."}
 
 Definitions:
 - complete: does it answer the user's actual request?
 - grounded: are key facts from user input or verified tool output, not invented?
 - contradiction: any internal contradiction, format error, or missing required field?
 - needs_verification: does it contain numbers, dates, units, or claims requiring external checking?
-
+- plan_covered: when a work plan is provided, does the answer cover every work item?
+  When no plan is provided, always return true.
+__PLAN_SECTION__
 User request:
 __USER_TEXT__
 
 Final answer:
 __ANSWER__
+"""
+
+_PLAN_SECTION = """
+Work plan (all work items must be completed):
+__PLAN__
 """
 
 
@@ -67,6 +74,7 @@ def _parse_verdict(content: str) -> JudgeVerdict:
         contradiction=bool(payload.get("contradiction", False)),
         needs_verification=bool(payload.get("needs_verification", False)),
         reason=str(payload.get("reason") or ""),
+        plan_covered=bool(payload.get("plan_covered", True)),
     )
 
 
@@ -76,9 +84,16 @@ class SelfJudge:
     def __init__(self, model: BaseChatModel) -> None:
         self._model = model
 
-    async def judge_l1(self, *, user_text: str, answer: str) -> JudgeVerdict:
-        prompt = _L1_PROMPT.replace("__USER_TEXT__", user_text[:4000]).replace(
-            "__ANSWER__", answer[:4000]
+    async def judge_l1(
+        self, *, user_text: str, answer: str, plan: str = ""
+    ) -> JudgeVerdict:
+        plan_section = (
+            _PLAN_SECTION.replace("__PLAN__", plan[:4000]) if plan else ""
+        )
+        prompt = (
+            _L1_PROMPT.replace("__PLAN_SECTION__", plan_section)
+            .replace("__USER_TEXT__", user_text[:4000])
+            .replace("__ANSWER__", answer[:4000])
         )
         try:
             # nostream：内部自检结果不得进入 SSE 消息流，否则会拼进用户可见回答。

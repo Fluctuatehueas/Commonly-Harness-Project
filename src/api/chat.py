@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -24,9 +23,25 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from agent.config import FEEDBACK_ENABLED, MAIN_AGENT_MODEL_RUN_LIMIT
+from agent.config import (
+    AGENT_TEAM_ENABLED,
+    EVOLUTION_ENABLED,
+    EVOLUTION_JUDGE_ENABLED,
+    EVOLUTION_MODE,
+    FEEDBACK_ENABLED,
+    MAIN_AGENT_MODEL_RUN_LIMIT,
+    PDCA_ENABLED,
+    RUNTIME_BACKOFF_MS,
+    RUNTIME_MAX_ATTEMPTS,
+    RUNTIME_NO_PROGRESS_LIMIT,
+    RUNTIME_RETRY_ENABLED,
+)
+from agent.runtime import RunSupervisor, RuntimeNotice
+from agent.runtime.errors import classify
+from utils.log_context import bind_log_fields, clear_log_fields, new_run_id, new_trace_id
 from agent.project_context import (
     reset_project_context,
     reset_project_thread,
@@ -42,14 +57,16 @@ from agent.schema import (
     WithdrawChatRequest,
     WithdrawChatResponse,
 )
+from agent.time_context import MESSAGE_TIME_KEY, now_iso, strip_time_tags
 from agent.feedback_store import save_retry_event
-from agent.middlewares.self_judge import HIGH_RISK_TOOLS
+from agent.middlewares.pdc_guard import HIGH_RISK_TOOLS
 from agent.trajectory_store import (
     delete_trajectory,
     delete_trajectory_events_since,
 )
 from agent.tools.async_sandbox_tools import START_ASYNC_TASK_TOOL_NAME
 from api.agent_loader import agent_loader
+from api.agent_groups import router as agent_groups_router
 from api.agents import router as agents_router
 from api.async_tasks import extract_async_task_id
 from api.async_tasks import router as async_tasks_router
@@ -68,9 +85,9 @@ from api.projects import router as projects_router
 from api.rag import router as rag_router
 from api.session_files import router as session_files_router
 from api.task_flow import router as task_flow_router
-from task_flow.agent_bridge import execute_task_flow, route_task_flow
-from task_flow.models import Execution
-from task_flow.router import RouteDecision
+from task_flow.agent_bridge import route_task_flow
+from task_flow.injection import build_flow_state, build_task_flow_spec
+from task_flow.models import Execution, StepTrace, new_execution_id, utcnow
 from api.message_utils import (
     content_to_text,
     make_session_title,
@@ -190,6 +207,47 @@ def _create_sse_message(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _pdc_buffering_active() -> bool:
+    """PDCA 自检是否会拦截正文。
+
+    自检关闭时 ``PdcGuardMiddleware`` 不会改写回答，正文没有缓冲的必要：
+    继续缓冲只会把逐 token 的增量合并成 done 前的一条大消息，表现为「没有流式」。
+    这里与 ``PdcGuardMiddleware._judging_enabled`` 使用同一组开关。
+    """
+    return (
+        PDCA_ENABLED
+        and EVOLUTION_ENABLED
+        and EVOLUTION_JUDGE_ENABLED
+        and EVOLUTION_MODE != "observe"
+    )
+
+
+def _drain_buffer(buffer: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """取出并清空缓冲事件；正文只有验证通过或确认是过程文本后才渲染。"""
+    pending = [*buffer]
+    buffer.clear()
+    merged: list[dict[str, Any]] = []
+    for event in pending:
+        content = str(event.get("content") or "")
+        if (
+            merged
+            and merged[-1].get("type") == "token"
+            and merged[-1].get("message_id") == event.get("message_id")
+        ):
+            merged[-1]["content"] += content
+            continue
+        merged.append({**event, "content": content})
+    # 时间标记只给模型做判断，不允许出现在正文里：放行前统一清洗。
+    for event in merged:
+        if event.get("type") == "token":
+            event["content"] = strip_time_tags(str(event.get("content") or ""))
+    return [
+        event
+        for event in merged
+        if event.get("type") != "token" or event.get("content")
+    ]
+
+
 def _get_stream_message(chunk: Any) -> tuple[Any, dict[str, Any]] | None:
     """从 LangGraph 消息流事件中提取 token 和元数据。"""
     if isinstance(chunk, dict):
@@ -222,6 +280,22 @@ def _get_custom_event(chunk: Any) -> dict[str, Any] | None:
             "type": event_type,
             **{key: value for key, value in data.items() if key != "type"},
         }
+    # pdc_verified 是「正文可以放行」的信号：漏掉它，正文会一直缓冲到 done，
+    # 表现就是正式回答没有流式输出、结束后才一次性出现。
+    if event_type in {"pdc_revision", "pdc_verified"}:
+        if chunk.get("ns"):
+            return None
+        return {"type": event_type, **{key: value for key, value in data.items() if key != "type"}}
+    if event_type == "task_flow_progress":
+        # 任务流步骤上报只来自主图；子图事件不参与执行卡片。
+        if chunk.get("ns"):
+            return None
+        return {"type": event_type, **{key: value for key, value in data.items() if key != "type"}}
+    if event_type == "scheduler_progress":
+        # 调度事件来自主图的调度工具；节点子图内部不直发该事件。
+        if chunk.get("ns"):
+            return None
+        return {"type": event_type, **{key: value for key, value in data.items() if key != "type"}}
     if chunk.get("ns"):
         return None
     if not event_type.startswith("compaction_"):
@@ -334,24 +408,36 @@ def _serialize_tool_args(args: Any) -> str:
     return str(args)
 
 
-async def _run_chat(request: ChatRequest) -> ChatResponse:
+async def _run_chat(
+    request: ChatRequest, *, flow_turn: FlowTurn | None = None
+) -> ChatResponse:
     """在会话 guard 中校验归属并执行非流式对话。"""
     request.user_id = effective_user_id(request.user_id)
     thread_id = request.thread_id or str(uuid.uuid4())
     async with agent_loader.thread_operation(thread_id):
         if request.thread_id:
             await agent_loader.require_session(request.user_id, thread_id)
+        # Agent / 组是会话级选择：显式提供（含显式清空组）时记到当前会话，
+        # 切回该会话时恢复；未提供才保留原绑定。
+        explicit_group = (
+            request.group_id if "group_id" in request.model_fields_set else None
+        )
         await agent_loader.save_session(
             request.user_id,
             thread_id,
             make_session_title(request.message),
             agent_id=request.agent_id,
-            bind_agent=not request.thread_id,
+            bind_agent=not request.thread_id
+            or "agent_id" in request.model_fields_set,
+            group_id=explicit_group,
+            bind_group=not request.thread_id or explicit_group is not None,
         )
-        return await _run_chat_unlocked(request, thread_id)
+        return await _run_chat_unlocked(request, thread_id, flow_turn=flow_turn)
 
 
-async def _run_chat_unlocked(request: ChatRequest, thread_id: str) -> ChatResponse:
+async def _run_chat_unlocked(
+    request: ChatRequest, thread_id: str, *, flow_turn: FlowTurn | None = None
+) -> ChatResponse:
     """执行一轮非流式对话，并返回标准化响应。"""
     username = request.username or request.user_id
     # 本轮绑定的项目决定文件落点；Agent 图本身按用户缓存，不随项目重建。
@@ -359,7 +445,7 @@ async def _run_chat_unlocked(request: ChatRequest, thread_id: str) -> ChatRespon
     project_token = set_project_context(project)
     thread_token = set_project_thread(thread_id)
     try:
-        return await _run_chat_turn(request, thread_id, username)
+        return await _run_chat_turn(request, thread_id, username, flow_turn=flow_turn)
     finally:
         reset_project_thread(thread_token)
         reset_project_context(project_token)
@@ -376,18 +462,45 @@ async def _resolve_agent_id(
     return str((session or {}).get("agent_id") or "default")
 
 
+async def _resolve_group_id(
+    user_id: str,
+    thread_id: str,
+    explicit: str | None = None,
+) -> str:
+    """本轮生效组：请求显式选择 > 会话绑定 > 无组。
+
+    默认不自动选组：组是会话级选择，新会话以独立 Agent 身份执行，
+    只有用户显式选过（或该会话之前绑定过）才带上组。
+    """
+    if not AGENT_TEAM_ENABLED:
+        return ""
+    selected = str(explicit or "").strip()
+    if selected:
+        return selected
+    session = await agent_loader.get_session(user_id, thread_id)
+    return str((session or {}).get("group_id") or "").strip()
+
+
 async def _run_chat_turn(
-    request: ChatRequest, thread_id: str, username: str,
+    request: ChatRequest,
+    thread_id: str,
+    username: str,
+    *,
+    flow_turn: FlowTurn | None = None,
 ) -> ChatResponse:
     """持有会话工作目录上下文执行一轮对话。"""
     agent_id = await _resolve_agent_id(
         request.user_id, thread_id, getattr(request, "agent_id", None)
+    )
+    group_id = await _resolve_group_id(
+        request.user_id, thread_id, getattr(request, "group_id", None)
     )
     agent = await agent_loader.get_agent_for_user(
         user_id=request.user_id,
         username=username,
         thread_id=thread_id,
         agent_id=agent_id,
+        group_id=group_id,
     )
     # thread_id 用于 checkpoint 恢复会话，user_id 和 username 用于 Agent 身份隔离。
     config = agent_loader.create_config(
@@ -400,16 +513,38 @@ async def _run_chat_turn(
         username=username,
         thread_id=thread_id,
         tenant_id=request.tenant_id,
+        evolution_output_schema=getattr(request, "output_schema", None),
+        evolution_numeric_ranges=getattr(request, "numeric_ranges", None),
+        agent_id=agent_id,
+        group_id=group_id,
     )
 
     try:
-        # 有附件时组装成多模态内容块（文本 + 图片 + 文档抽取文本）。
-        user_content = await build_user_content(
-            user_id=request.user_id,
-            message=request.message,
-            attachment_ids=request.attachments,
-        )
-        agent_input = {"messages": [{"role": "user", "content": user_content}]}
+        if flow_turn is not None:
+            # 命中任务流：用户原文一条 + 任务流规范一条（内部标记，历史不渲染）。
+            agent_input = {
+                "messages": _flow_messages(flow_turn, request.message),
+                "task_flow": flow_turn.state,
+            }
+            await _carry_over_flow_progress(agent, config, flow_turn.state)
+        else:
+            # 有附件时组装成多模态内容块（文本 + 图片 + 文档抽取文本）。
+            user_content = await build_user_content(
+                user_id=request.user_id,
+                message=request.message,
+                attachment_ids=request.attachments,
+            )
+            # task_flow 置空：新一轮普通消息不应继承上一轮的流程快照。
+            agent_input = {
+                "messages": [
+                    HumanMessage(
+                        content=user_content,
+                        # 用户发送时刻就是这条消息的时间属性，供后续轮次回看。
+                        additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
+                    )
+                ],
+                "task_flow": {},
+            }
         result = await agent.ainvoke(
             agent_input,
             config=config,
@@ -435,6 +570,10 @@ async def _run_chat_turn(
     interrupts = result.get("__interrupt__", []) if isinstance(result, dict) else []
     if not answer and not interrupts:
         raise HTTPException(status_code=502, detail="Agent 未返回有效回答")
+    # 任务流一轮结束：用图状态里的步骤轨迹落执行记录（中断轮不落，等恢复后收尾）。
+    flow_state = result.get("task_flow") if isinstance(result, dict) else None
+    if flow_turn is not None and isinstance(flow_state, dict) and not interrupts:
+        await _save_flow_execution(request, thread_id, flow_state)
     await _bind_async_tasks_from_result(
         result,
         user_id=request.user_id,
@@ -469,76 +608,18 @@ def _skip_task_flow_route(request: ChatRequest) -> bool:
     return bool(request.attachments)
 
 
-def _task_flow_answer(
-    decision: RouteDecision, execution: Execution, final_output: str
-) -> str:
-    """把任务流执行结果汇总为本轮回答文本。"""
-    flow_name = decision.flow.name if decision.flow else ""
-    if execution.status == "done":
-        return final_output.strip() or f"任务流「{flow_name}」已执行完成。"
-    failed = [t for t in execution.step_traces if t.status == "failed"]
-    failed_steps = "、".join(t.step_id for t in failed) or "未知步骤"
-    return (
-        f"任务流「{flow_name}」执行失败：步骤 {failed_steps} 重试后仍未完成，"
-        "已降级处理并记录执行详情，可在任务流执行记录中查看。"
-    )
+@dataclass
+class FlowTurn:
+    """一次命中任务流后的注入信息。"""
+
+    flow_id: str
+    flow_name: str
+    content: str
+    state: dict[str, Any]
 
 
-def _task_flow_steps_payload(decision: RouteDecision) -> list[dict[str, Any]]:
-    """把执行计划展开成前端执行卡片需要的步骤视图（含 fork 分支）。"""
-    flow, plan = decision.flow, decision.plan
-    if flow is None or plan is None:
-        return []
-
-    step_map: dict[str, Any] = {}
-
-    def walk(steps: list[Any]) -> None:
-        for step in steps:
-            step_map[step.id] = step
-            for sub in step.parallel or []:
-                walk(sub.steps)
-
-    walk(flow.steps)
-    items: list[dict[str, Any]] = []
-    for unit in plan.units:
-        if unit.type == "fork":
-            for branch in unit.branches or []:
-                for sub_unit in branch.units:
-                    step = step_map.get(sub_unit.ref)
-                    items.append(
-                        {
-                            "id": sub_unit.ref,
-                            "name": step.name if step else sub_unit.ref,
-                            "branch": branch.name,
-                        }
-                    )
-            continue
-        step = step_map.get(unit.ref)
-        items.append(
-            {
-                "id": unit.ref,
-                "name": step.name if step else unit.ref,
-                "branch": None,
-            }
-        )
-    return items
-
-
-async def _persist_task_flow_turn(
-    request: ChatRequest, thread_id: str, answer: str
-) -> None:
-    """把任务流这一轮写入 checkpoint，刷新后历史会话仍能看到问答。"""
-    await agent_loader.append_thread_messages(
-        user_id=request.user_id,
-        username=request.username or request.user_id,
-        thread_id=thread_id,
-        user_content=request.message,
-        assistant_content=answer,
-    )
-
-
-async def _try_task_flow_chat(request: ChatRequest) -> ChatResponse | None:
-    """``/chat`` 的任务流前置分支：命中则执行并直接回答，未命中返回 None。"""
+async def _prepare_flow_turn(request: ChatRequest) -> FlowTurn | None:
+    """路由命中则构造注入消息与图状态；未命中返回 None。"""
     if _skip_task_flow_route(request):
         return None
     decision = await route_task_flow(
@@ -548,178 +629,207 @@ async def _try_task_flow_chat(request: ChatRequest) -> ChatResponse | None:
         entry_step=request.entry_step,
         user_state=request.user_state,
     )
-    if decision is None:
+    if decision is None or decision.flow is None:
         return None
-    thread_id = request.thread_id or str(uuid.uuid4())
-    username = request.username or request.user_id
-    async with agent_loader.thread_operation(thread_id):
-        if request.thread_id:
-            await agent_loader.require_session(request.user_id, thread_id)
-        # 会话索引照常建立，保证侧边栏与后续 resume 能找到本线程。
-        await agent_loader.save_session(
-            request.user_id, thread_id, make_session_title(request.message),
-        )
-        execution, final_output = await execute_task_flow(
-            decision, user_id=request.user_id, thread_id=thread_id,
-        )
-        answer = _task_flow_answer(decision, execution, final_output)
-        await _persist_task_flow_turn(request, thread_id, answer)
-    logger.info(
-        "任务流执行完成：flow=%s execution=%s status=%s",
-        decision.flow.id if decision.flow else "",
-        execution.id,
-        execution.status,
+    flow = decision.flow
+    state = build_flow_state(flow, entry_step=decision.entry_step)
+    content = build_task_flow_spec(
+        flow,
+        entry_step=decision.entry_step,
+        user_state=decision.user_state,
     )
-    return ChatResponse(
-        thread_id=thread_id,
-        user_id=request.user_id,
-        username=username,
-        answer=answer,
-    )
+    return FlowTurn(flow_id=flow.id, flow_name=flow.name, content=content, state=state)
 
 
-async def _task_flow_sse_stream(
-    request: ChatRequest, thread_id: str, decision: RouteDecision
-) -> AsyncIterator[str]:
-    """任务流执行的 SSE 事件流：进度事件驱动前端执行卡片，最终回答复用 token/done。"""
-    username = request.username or request.user_id
-    flow_id = decision.flow.id if decision.flow else ""
-    flow_name = decision.flow.name if decision.flow else ""
-    turn_started = time.monotonic()
-    # 执行器回调（event_sink）与 SSE 生成器之间用队列解耦。
-    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+TASK_FLOW_INTERNAL_MARKER = "task_flow_spec"
 
-    async def event_sink(event_type: str, payload: dict[str, Any]) -> None:
-        event = {
-            "type": "task_flow_progress",
-            "thread_id": thread_id,
-            "flow_id": flow_id,
-            "flow_name": flow_name,
-            "status": event_type,
-            "step_id": payload.get("step_id"),
-            "branch": payload.get("branch"),
-            "attempts": payload.get("attempt"),
-        }
-        if payload.get("delta"):
-            event["delta"] = payload["delta"]
-        if payload.get("error"):
-            event["error"] = payload["error"]
-        await queue.put(("progress", event))
 
-    async def run_flow() -> None:
-        try:
-            async with agent_loader.thread_operation(thread_id):
-                if request.thread_id:
-                    await agent_loader.require_session(request.user_id, thread_id)
-                await agent_loader.save_session(
-                    request.user_id, thread_id, make_session_title(request.message),
-                )
-                execution, final_output = await execute_task_flow(
-                    decision,
-                    user_id=request.user_id,
-                    thread_id=thread_id,
-                    event_sink=event_sink,
-                )
-                answer = _task_flow_answer(decision, execution, final_output)
-                await _persist_task_flow_turn(request, thread_id, answer)
-            await queue.put(("result", (execution, final_output, answer)))
-        except Exception as exc:  # noqa: BLE001 - 执行异常统一走 error 事件
-            logger.exception("任务流执行异常")
-            await queue.put(("error", exc))
+def _flow_messages(flow_turn: FlowTurn, user_text: str) -> list[Any]:
+    """构造任务流一轮的输入消息。
 
-    # 先告诉前端这条流命中哪条任务流、包含哪些步骤，卡片才能先渲染骨架。
-    yield _create_sse_message(
-        {
-            "type": "task_flow_start",
-            "thread_id": thread_id,
-            "flow_id": flow_id,
-            "flow_name": flow_name,
-            "steps": _task_flow_steps_payload(decision),
-        }
-    )
+    用户原文与任务流规范都是 HumanMessage，但职责不同：
+    - 用户原文保持原样，是气泡与历史里唯一可见的内容；
+    - 任务流规范带上 ``harness_internal`` 标记，历史渲染时会被过滤掉，
+      避免把整段提示词灌进用户气泡。
+    """
+    return [
+        HumanMessage(
+            content=user_text,
+            additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
+        ),
+        HumanMessage(
+            content=flow_turn.content,
+            additional_kwargs={
+                "harness_internal": TASK_FLOW_INTERNAL_MARKER,
+                MESSAGE_TIME_KEY: now_iso(),
+            },
+        ),
+    ]
 
-    task = asyncio.create_task(run_flow())
+
+async def _carry_over_flow_progress(
+    agent: Any, config: dict[str, Any], flow_state: dict[str, Any]
+) -> None:
+    """跨轮续跑：沿用上一轮已完成的步骤，避免卡片进度退回全量等待。
+
+    只有上一轮仍有未完成步骤时才续跑；整条流已走完则视为新一轮执行，
+    与"任务流真正走完后卡片不再出现"的展示规则保持一致。
+    """
+    steps = flow_state.get("steps") or []
+    if not steps:
+        return
+    get_state = getattr(agent, "aget_state", None)
+    if not callable(get_state):
+        return
     try:
-        while True:
-            kind, payload = await queue.get()
-            if kind == "progress":
-                yield _create_sse_message(payload)
-                continue
-            if kind == "error":
-                yield _create_sse_message(
-                    {
-                        "type": "task_flow_end",
-                        "thread_id": thread_id,
-                        "flow_id": flow_id,
-                        "flow_name": flow_name,
-                        "status": "failed",
-                    }
-                )
-                yield _create_sse_message({"type": "error", "message": "任务流执行失败"})
-                return
-            execution, final_output, answer = payload
-            break
-    finally:
-        if not task.done():
-            task.cancel()
-
+        state = await get_state(config)
+    except Exception:  # noqa: BLE001 - 读不到历史就按全新执行，不影响本轮
+        logger.warning("event=taskflow.resume.probe_failed", exc_info=True)
+        return
+    previous = (getattr(state, "values", {}) or {}).get("task_flow")
+    if not isinstance(previous, dict) or previous.get("flow_id") != flow_state.get("flow_id"):
+        return
+    previous_steps = {
+        str(item.get("id")): item
+        for item in previous.get("steps") or []
+        if isinstance(item, dict)
+    }
+    unfinished = [
+        step_id
+        for step_id, item in previous_steps.items()
+        if item.get("status") not in ("done", "skipped")
+    ]
+    if not unfinished:
+        return
+    for step in steps:
+        prev = previous_steps.get(str(step.get("id")))
+        if prev and prev.get("status") in ("done", "skipped"):
+            step["status"] = prev["status"]
+            step["summary"] = prev.get("summary") or ""
+    flow_state["resumed"] = True
     logger.info(
-        "任务流执行完成：flow=%s execution=%s status=%s",
-        flow_id,
-        execution.id,
-        execution.status,
-    )
-    yield _create_sse_message(
-        {
-            "type": "task_flow_end",
-            "thread_id": thread_id,
-            "flow_id": flow_id,
-            "flow_name": flow_name,
-            "execution_id": execution.id,
-            "status": execution.status,
-            "step_traces": [
-                trace.model_dump(mode="json") for trace in execution.step_traces
-            ],
-        }
+        "event=taskflow.resume flow_id=%s done_steps=%s",
+        flow_state.get("flow_id"),
+        sum(1 for step in steps if step.get("status") in ("done", "skipped")),
     )
 
-    # 最终回答按小片推送，前端逐段渲染，避免末尾突然出现整段文本。
-    message_id = f"assistant-{uuid.uuid4()}"
-    for offset in range(0, len(answer), 160):
-        yield _create_sse_message(
+
+async def _stored_flow_state(agent: Any, config: dict[str, Any]) -> dict[str, Any] | None:
+    """读取 checkpoint 里的任务流快照；读不到返回 None。"""
+    get_state = getattr(agent, "aget_state", None)
+    if not callable(get_state):
+        return None
+    try:
+        state = await get_state(config)
+    except Exception:  # noqa: BLE001 - 读不到就按普通轮次继续
+        logger.warning("event=taskflow.resume.probe_failed", exc_info=True)
+        return None
+    stored = (getattr(state, "values", {}) or {}).get("task_flow")
+    if isinstance(stored, dict) and stored.get("steps"):
+        return stored
+    return None
+
+
+def _flow_start_event(
+    flow_turn: FlowTurn,
+    thread_id: str,
+    flow_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """命中卡片骨架：步骤 id 必须与后续 progress 事件一致。
+
+    ``flow_state`` 带步骤状态时一并下发，续跑与中断恢复后的卡片直接按进度渲染，
+    不会把已完成的步骤重置成等待。
+    """
+    state = flow_state if isinstance(flow_state, dict) and flow_state.get("steps") else flow_turn.state
+    steps: list[dict[str, Any]] = []
+    for item in state.get("steps", []):
+        entry: dict[str, Any] = {
+            "id": item.get("id", ""),
+            "name": item.get("name", ""),
+            "branch": item.get("branch"),
+        }
+        status = str(item.get("status") or "pending")
+        if status != "pending":
+            # skipped 在前端归入已完成，避免新增一种卡片状态。
+            entry["status"] = "done" if status == "skipped" else status
+        steps.append(entry)
+    return {
+        "type": "task_flow_start",
+        "thread_id": thread_id,
+        "flow_id": flow_turn.flow_id,
+        "flow_name": flow_turn.flow_name,
+        "steps": steps,
+    }
+
+
+def _flow_traces(flow_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """把图状态里的步骤快照转成执行记录的轨迹结构。"""
+    traces: list[dict[str, Any]] = []
+    for index, step in enumerate(flow_state.get("steps") or [], start=1):
+        status = str(step.get("status") or "pending")
+        summary = str(step.get("summary") or "")
+        traces.append(
             {
-                "type": "token",
-                "message_id": message_id,
-                "content": answer[offset : offset + 160],
-                "source": "main",
+                "seq": index,
+                "step_id": str(step.get("id") or ""),
+                "branch": step.get("branch"),
+                "status": (
+                    status if status in ("done", "failed", "skipped", "degraded") else "skipped"
+                ),
+                "attempts": 1,
+                "input_summary": "",
+                "output_summary": summary[:200],
+                "output": summary[:20000],
+                # 步骤起止时间来自 task_flow_step_update 的上报，旧数据为空。
+                "started_at": step.get("started_at") or None,
+                "finished_at": step.get("finished_at") or None,
+                "duration_ms": 0,
+                "check_result": None,
+                "state_source": "step",
             }
         )
-        await asyncio.sleep(0)
-    yield _create_sse_message(
-        {
-            "type": "done",
-            "thread_id": thread_id,
-            "user_id": request.user_id,
-            "username": username,
-            "content": answer,
-            "interrupted": False,
-            "usage": {},
-            "session_usage": {},
-            "round_limit": MAIN_AGENT_MODEL_RUN_LIMIT,
-            "duration_ms": int((time.monotonic() - turn_started) * 1000),
-        }
+    return traces
+
+
+async def _save_flow_execution(
+    request: ChatRequest, thread_id: str, flow_state: dict[str, Any]
+) -> str:
+    """把图状态里的步骤轨迹落成执行记录；返回执行 id。
+
+    执行 id 在命中时生成并写入图状态，HITL 恢复后会复用同一 id 做 upsert。
+    """
+    traces = _flow_traces(flow_state)
+    execution_id = str(flow_state.get("execution_id") or new_execution_id())
+    failed = any(trace["status"] == "failed" for trace in traces)
+    execution = Execution(
+        id=execution_id,
+        flow_id=str(flow_state.get("flow_id") or ""),
+        user_id=request.user_id,
+        thread_id=thread_id,
+        schema_hash=str(flow_state.get("schema_hash") or ""),
+        entry_step=flow_state.get("entry_step"),
+        status="failed" if failed else "done",
+        step_traces=[StepTrace(**trace) for trace in traces],
+        finished_at=utcnow(),
     )
+    try:
+        from api.task_flow import get_store
+
+        store = await get_store()
+        await store.save_execution(execution)
+    except Exception:
+        # 落库失败不吞掉本轮结果，只记日志。
+        logger.exception("任务流执行记录落库失败：%s", execution_id)
+    return execution_id
 
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """接收一条消息并返回完整的 Agent 回答。"""
     request.user_id = effective_user_id(request.user_id)
-    # 任务流路由前置：命中则由任务流执行并直接返回结果，不再进入主 Agent 循环。
-    flow_response = await _try_task_flow_chat(request)
-    if flow_response is not None:
-        return flow_response
-    return await _run_chat(request)
+    # 命中任务流时把流程规范注入用户消息，仍由主 Agent 图执行。
+    flow_turn = await _prepare_flow_turn(request)
+    return await _run_chat(request, flow_turn=flow_turn)
 
 
 def _summarize_hitl_resume(payload: dict[str, Any]) -> tuple[str, str]:
@@ -845,11 +955,13 @@ async def _prepare_retry(
     会话一律拒绝，避免重复执行写操作或丢弃后续轮次。
     """
     agent_id = await _resolve_agent_id(user_id, thread_id)  # noqa: F841
+    group_id = await _resolve_group_id(user_id, thread_id, None, agent_id)
     agent = await agent_loader.get_agent_for_user(
         user_id=user_id,
         username=username,
         thread_id=thread_id,
         agent_id=agent_id,
+        group_id=group_id,
     )
     config = agent_loader.create_config(
         thread_id=thread_id,
@@ -967,11 +1079,13 @@ async def _prepare_withdraw(
 ) -> tuple[Any, WithdrawPlan]:
     """定位「最新用户消息之前」的检查点，并校验可以撤回。"""
     agent_id = await _resolve_agent_id(user_id, thread_id)
+    group_id = await _resolve_group_id(user_id, thread_id, None, agent_id)
     agent = await agent_loader.get_agent_for_user(
         user_id=user_id,
         username=username,
         thread_id=thread_id,
         agent_id=agent_id,
+        group_id=group_id,
     )
     config = agent_loader.create_config(
         thread_id=thread_id,
@@ -1056,6 +1170,7 @@ async def _stream_response(
     agent_input: dict[str, Any] | Command | None,
     is_resume: bool,
     retry_plan: RetryPlan | None = None,
+    flow_turn: FlowTurn | None = None,
 ) -> AsyncIterator[str]:
     """在整个 SSE 生命周期持有会话 guard，取消和异常时也释放。"""
     request.user_id = effective_user_id(request.user_id)
@@ -1069,6 +1184,7 @@ async def _stream_response(
                 agent_input=agent_input,
                 is_resume=is_resume,
                 retry_plan=retry_plan,
+                flow_turn=flow_turn,
             )) as response:
                 async for event in response:
                     yield event
@@ -1085,6 +1201,7 @@ async def _stream_response_unlocked(
     agent_input: dict[str, Any] | Command | None,
     is_resume: bool,
     retry_plan: RetryPlan | None = None,
+    flow_turn: FlowTurn | None = None,
 ) -> AsyncIterator[str]:
     """流式发送 Agent 文本、工具和中断事件。
 
@@ -1109,6 +1226,11 @@ async def _stream_response_unlocked(
     active_by_name: dict[str, list[str]] = {}
     pending_interrupts: dict[str, dict[str, Any]] = {}
     answer_parts: list[str] = []
+    # 正文先缓冲不直发：PDCA 自检可能重做，草稿渲染出去只会被撤回重放。
+    # 自检通过（pdc_verified）、确认是工具前的过程文本（出现工具调用）或本轮
+    # 结束时才真正下发给前端。自检整体关闭时不做缓冲，保持逐 token 流式。
+    answer_buffer: list[dict[str, Any]] = []
+    buffer_answer = _pdc_buffering_active()
     assistant_message_id: str | None = None
     # 经验命中标签只推一次：注入发生在首次模型调用前，首个 token 到达时即可读到。
     experience_marker_sent = False
@@ -1133,17 +1255,38 @@ async def _stream_response_unlocked(
             return candidates[0]
         return active_delegations[-1] if active_delegations else ""
 
-    stream = None
+    # 监督者与 run_id 必须在 try 之前就位：注册会话等前置步骤也可能失败，
+    # 异常兜底需要它们来记录与收尾。
+    supervisor = RunSupervisor(
+        enabled=RUNTIME_RETRY_ENABLED,
+        max_attempts=RUNTIME_MAX_ATTEMPTS,
+        backoff_ms=RUNTIME_BACKOFF_MS,
+        no_progress_limit=RUNTIME_NO_PROGRESS_LIMIT,
+    )
+    run_id = new_run_id()
+    # 关联字段一次绑定：本请求内所有日志（含中间件、工具）都自动带上。
+    bind_log_fields(
+        trace_id=new_trace_id(),
+        run_id=run_id,
+        thread_id=thread_id,
+        user_id=request.user_id,
+    )
     try:
         if not is_resume and retry_plan is None:
             assert isinstance(request, ChatRequest)
             # 中断发生前也必须建立会话索引，否则前端无法用 thread_id 恢复它。
+            explicit_group = (
+                request.group_id if "group_id" in request.model_fields_set else None
+            )
             await agent_loader.save_session(
                 request.user_id,
                 thread_id,
                 make_session_title(request.message),
                 agent_id=request.agent_id,
-                bind_agent=not request.thread_id,
+                bind_agent=not request.thread_id
+                or "agent_id" in request.model_fields_set,
+                group_id=explicit_group,
+                bind_group=not request.thread_id or explicit_group is not None,
             )
         # 会话索引已存在后解析项目；解析失败由 store 回落到默认项目。
         project = await agent_loader.resolve_project(request.user_id, thread_id)
@@ -1152,11 +1295,15 @@ async def _stream_response_unlocked(
         agent_id = await _resolve_agent_id(
             request.user_id, thread_id, getattr(request, "agent_id", None)
         )
+        group_id = await _resolve_group_id(
+            request.user_id, thread_id, getattr(request, "group_id", None)
+        )
         agent = await agent_loader.get_agent_for_user(
             user_id=request.user_id,
             username=username,
             thread_id=thread_id,
             agent_id=agent_id,
+            group_id=group_id,
         )
         config = agent_loader.create_config(
             thread_id=thread_id,
@@ -1184,20 +1331,69 @@ async def _stream_response_unlocked(
             username=username,
             thread_id=thread_id,
             tenant_id=request.tenant_id,
+            evolution_output_schema=getattr(request, "output_schema", None),
+            evolution_numeric_ranges=getattr(request, "numeric_ranges", None),
+            agent_id=agent_id,
+            group_id=group_id,
         )
         _attach_hitl_resume(context, request, is_resume)
         # 必须使用异步流式调用：MCP StructuredTool 不支持同步 invoke/stream。
         # values 流用于捕获 interrupt；同时订阅子图以保证审批和补充信息能冒泡，
         # 但普通子 Agent 事件仅是内部执行细节，不发送给用户界面。
-        stream = agent.astream(
+        # 瞬时异常由监督者在同一事件循环内重试：复用 thread_id 从 checkpoint 续跑。
+        # 恢复（Command）与重新生成（分叉 checkpoint）不能重复执行同一命令。
+        resumable = not is_resume and retry_plan is None
+        if flow_turn is not None and isinstance(agent_input, dict):
+            # 续跑沿用上一轮已完成的步骤；整条流已完成则回到全量 pending。
+            await _carry_over_flow_progress(
+                agent, config, agent_input.get("task_flow") or {}
+            )
+        # 命中任务流：先给前端卡片骨架（含续跑进度），后续步骤由工具上报更新。
+        if flow_turn is not None:
+            yield _create_sse_message(
+                _flow_start_event(flow_turn, thread_id, agent_input.get("task_flow"))
+            )
+        elif is_resume:
+            # 中断恢复：卡片骨架从 checkpoint 里的流程快照重建，避免恢复后卡片消失。
+            stored = await _stored_flow_state(agent, config)
+            if stored:
+                yield _create_sse_message(
+                    _flow_start_event(
+                        FlowTurn(
+                            flow_id=str(stored.get("flow_id") or ""),
+                            flow_name=str(stored.get("flow_name") or ""),
+                            content="",
+                            state=stored,
+                        ),
+                        thread_id,
+                        stored,
+                    )
+                )
+        async for chunk in supervisor.stream(
+            agent,
             agent_input,
             config=config,
             context=context,
-            stream_mode=["messages", "values", "custom"],
-            subgraphs=True,
-            version="v2",
-        )
-        async for chunk in stream:
+            run_id=run_id,
+            thread_id=thread_id,
+            resumable=resumable,
+            has_partial_answer=lambda: bool(answer_parts),
+        ):
+            if isinstance(chunk, RuntimeNotice):
+                # 重试前收尾上一轮的半成品：结束悬挂工具占位、清空草稿正文，
+                # 否则重放会拼出两段回答或留下转圈的工具卡片。
+                for tool_call_id in list(pending_tool_ids):
+                    yield _create_sse_message(
+                        {"type": "tool_end", "tool_call_id": tool_call_id}
+                    )
+                pending_tool_ids.clear()
+                active_delegations.clear()
+                active_by_name.clear()
+                answer_parts.clear()
+                answer_buffer.clear()
+                assistant_message_id = None
+                yield _create_sse_message(chunk.to_event(thread_id))
+                continue
             if not experience_marker_sent:
                 raw_items = str(
                     getattr(context, "evolution_experience_items", "") or ""
@@ -1232,6 +1428,16 @@ async def _stream_response_unlocked(
             if stream_message is None:
                 custom_event = _get_custom_event(chunk)
                 if custom_event is not None:
+                    # PDCA 修正轮：丢弃上一版草稿的累计正文，避免 done 拼出两份回答。
+                    # 草稿仍在缓冲区，从未渲染，所以这里只需丢弃，前端不会看到撤回。
+                    if custom_event.get("type") == "pdc_revision":
+                        answer_parts.clear()
+                        answer_buffer.clear()
+                        assistant_message_id = None
+                    elif custom_event.get("type") == "pdc_verified":
+                        # 自检通过：此刻才把缓冲正文渲染给前端。
+                        for pending in _drain_buffer(answer_buffer):
+                            yield _create_sse_message(pending)
                     yield _create_sse_message({**custom_event, "thread_id": thread_id})
                 continue
             token, metadata = stream_message
@@ -1260,6 +1466,11 @@ async def _stream_response_unlocked(
                     }
                 )
 
+            # 带工具调用的消息正文只是过程说明：先放行缓冲正文，再发工具卡片，
+            # 保证气泡顺序与阅读顺序一致。
+            if tool_chunks:
+                for pending in _drain_buffer(answer_buffer):
+                    yield _create_sse_message(pending)
             for tool_chunk in tool_chunks:
                 assistant_message_id = None
                 # 工具参数可能跨多个 chunk 返回。首次收到工具名称时发送开始事件，
@@ -1381,7 +1592,21 @@ async def _stream_response_unlocked(
                 )
                 continue
             answer_parts.append(content)
-            yield _create_sse_message(
+            if not buffer_answer:
+                # 自检关闭：不缓冲，逐 token 直接下发，恢复实时流式。
+                cleaned = strip_time_tags(content)
+                if cleaned:
+                    yield _create_sse_message(
+                        {
+                            "type": "token",
+                            "message_id": assistant_message_id,
+                            "content": cleaned,
+                            "source": source,
+                        }
+                    )
+                continue
+            # 正文先入缓冲，等自检结果或明确的工具调用信号再渲染。
+            answer_buffer.append(
                 {
                     "type": "token",
                     "message_id": assistant_message_id,
@@ -1434,6 +1659,9 @@ async def _stream_response_unlocked(
             yield _create_sse_message(event)
         for tool_call_id in pending_tool_ids:
             yield _create_sse_message({"type": "tool_end", "tool_call_id": tool_call_id})
+        # 兜底：未经自检（或自检被跳过）的正文在此统一放行，保证内容不丢。
+        for pending in _drain_buffer(answer_buffer):
+            yield _create_sse_message(pending)
         # Token 统计唯一数据源是 TokenUsageMiddleware 写入的 Store：
         # rounds 最后一条 = 本轮最终回答的消耗；session = 会话累计。
         usage_data = await agent_loader.get_thread_usage(request.user_id, thread_id)
@@ -1441,6 +1669,7 @@ async def _stream_response_unlocked(
         # 最终回答 ID 以最新 head 为准；usage 只作为兜底，避免模型未返回
         # usage 时把上一轮的消息 ID 错配给本轮。
         final_message_id = ""
+        flow_state: dict[str, Any] | None = None
         if callable(get_state):
             try:
                 head_state = await get_state(
@@ -1450,9 +1679,11 @@ async def _stream_response_unlocked(
                         username=username,
                     )
                 )
-                head_messages = list(
-                    (getattr(head_state, "values", {}) or {}).get("messages", []) or []
-                )
+                head_values = getattr(head_state, "values", {}) or {}
+                stored_flow = head_values.get("task_flow")
+                if isinstance(stored_flow, dict):
+                    flow_state = stored_flow
+                head_messages = list(head_values.get("messages", []) or [])
                 last_human = -1
                 for index, message in enumerate(head_messages):
                     if _state_role(message) == "user":
@@ -1485,13 +1716,36 @@ async def _stream_response_unlocked(
                 )
             except Exception:
                 logger.warning("写入重试反馈失败", exc_info=True)
+        # 任务流收尾：中断轮不收尾，等恢复后由后续请求补发 task_flow_end。
+        if (
+            isinstance(flow_state, dict)
+            and flow_state.get("steps")
+            and not pending_interrupts
+        ):
+            traces = _flow_traces(flow_state)
+            execution_id = await _save_flow_execution(request, thread_id, flow_state)
+            yield _create_sse_message(
+                {
+                    "type": "task_flow_end",
+                    "thread_id": thread_id,
+                    "flow_id": flow_state.get("flow_id", ""),
+                    "flow_name": flow_state.get("flow_name", ""),
+                    "execution_id": execution_id,
+                    "status": (
+                        "failed"
+                        if any(trace["status"] == "failed" for trace in traces)
+                        else "done"
+                    ),
+                    "step_traces": traces,
+                }
+            )
         yield _create_sse_message(
             {
                 "type": "done",
                 "thread_id": thread_id,
                 "user_id": request.user_id,
                 "username": username,
-                "content": "".join(answer_parts),
+                "content": strip_time_tags("".join(answer_parts)),
                 "interrupted": bool(pending_interrupts),
                 "usage": rounds[-1] if rounds else {},
                 "session_usage": usage_data.get("session", {}),
@@ -1501,23 +1755,36 @@ async def _stream_response_unlocked(
             }
         )
     except Exception as exc:
-        logger.exception("Agent 流式调用异常")
+        info = classify(exc)
+        logger.error(
+            "event=agent.run.failed run_id=%s thread_id=%s category=%s "
+            "error_class=%s fingerprint=%s",
+            run_id,
+            thread_id,
+            info.category.value,
+            info.error_class,
+            info.fingerprint,
+            exc_info=True,
+        )
         for tool_call_id in pending_tool_ids:
             yield _create_sse_message({"type": "tool_end", "tool_call_id": tool_call_id})
         # RuntimeError 都是配置/环境级错误，消息可读，直接透传给前端。
         detail = (
             str(exc)
             if isinstance(exc, RuntimeError) and str(exc)
-            else "Agent 调用失败"
+            else "内部异常，已停止自动重试，已记录日志"
         )
-        yield _create_sse_message({"type": "error", "message": detail})
+        # run_id 是用户报障时的唯一锚点：前端复制它即可在日志中定位。
+        yield _create_sse_message(
+            {"type": "error", "message": detail, "run_id": run_id}
+        )
     finally:
-        if stream is not None:
-            await stream.aclose()
+        await supervisor.aclose()
         if thread_token is not None:
             reset_project_thread(thread_token)
         if project_token is not None:
             reset_project_context(project_token)
+        clear_log_fields()
 
 
 @router.post("/chat/stream")
@@ -1528,34 +1795,38 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     thread_id = request.thread_id or str(uuid.uuid4())
     if request.thread_id:
         await agent_loader.require_session(request.user_id, thread_id)
-    # 任务流路由前置：命中则以任务流执行事件流响应，不再进入主 Agent 通用循环。
-    if not _skip_task_flow_route(request):
-        decision = await route_task_flow(
-            request.message,
-            request.user_id,
-            flow_id=request.flow_id,
-            entry_step=request.entry_step,
-            user_state=request.user_state,
+    # 任务流路由：命中则把流程规范注入用户消息，仍由主 Agent 图执行。
+    flow_turn = await _prepare_flow_turn(request)
+    if flow_turn is not None:
+        agent_input = {
+            "messages": _flow_messages(flow_turn, request.message),
+            "task_flow": flow_turn.state,
+        }
+    else:
+        # 有附件时组装成多模态内容块；解析失败会抛 4xx，不会静默丢附件。
+        user_content = await build_user_content(
+            user_id=request.user_id,
+            message=request.message,
+            attachment_ids=request.attachments,
         )
-        if decision is not None:
-            return StreamingResponse(
-                _task_flow_sse_stream(request, thread_id, decision),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-    # 有附件时组装成多模态内容块；解析失败会抛 4xx，不会静默丢附件。
-    user_content = await build_user_content(
-        user_id=request.user_id,
-        message=request.message,
-        attachment_ids=request.attachments,
-    )
-    agent_input = {"messages": [{"role": "user", "content": user_content}]}
+        # task_flow 置空：新一轮普通消息不应继承上一轮的流程快照。
+        agent_input = {
+            "messages": [
+                HumanMessage(
+                    content=user_content,
+                    # 用户发送时刻就是这条消息的时间属性，供后续轮次回看。
+                    additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
+                )
+            ],
+            "task_flow": {},
+        }
     return StreamingResponse(
         _stream_response(
             request,
             thread_id=thread_id,
             agent_input=agent_input,
             is_resume=False,
+            flow_turn=flow_turn,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -1699,6 +1970,7 @@ async def withdraw_chat(
 
 app.include_router(router)
 app.include_router(agents_router)
+app.include_router(agent_groups_router)
 app.include_router(feedback_router)
 app.include_router(history_router)
 app.include_router(async_tasks_router)

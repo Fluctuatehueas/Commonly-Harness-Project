@@ -16,7 +16,10 @@ import json
 from typing import Any
 
 from langchain_core.tools import tool
+from langchain.tools import ToolRuntime
 from pydantic import BaseModel, Field
+
+from agent.time_context import now_iso, timezone_name
 
 MAX_TASKS = 24
 
@@ -79,7 +82,11 @@ def _wave_conflicts(waves: list[list[WorkItem]]) -> list[dict[str, Any]]:
 
 
 @tool(args_schema=WorkPlanInput)
-def create_work_plan(goal: str, tasks: list[WorkItem]) -> str:
+def create_work_plan(
+    goal: str,
+    tasks: list[WorkItem],
+    runtime: ToolRuntime,
+) -> str:
     """产出多智能体分工清单，并计算可并行的执行波次。
 
     Args:
@@ -111,6 +118,9 @@ def create_work_plan(goal: str, tasks: list[WorkItem]) -> str:
     payload = {
         "ok": True,
         "goal": goal,
+        # 计划自身带时间属性：后续回看计划时能知道它是什么时候排出来的。
+        "created_at": now_iso(),
+        "timezone": timezone_name(),
         "waves": [
             {
                 "wave": index,
@@ -137,7 +147,21 @@ def create_work_plan(goal: str, tasks: list[WorkItem]) -> str:
         ),
         "error": None,
     }
-    return json.dumps(payload, ensure_ascii=False)
+    # 计划同时写进图状态与本轮上下文：状态用于 HITL 恢复，上下文用于快速校验。
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    state = getattr(runtime, "state", None)
+    if isinstance(state, dict):
+        try:
+            state["pdc_plan"] = payload_text
+        except Exception:  # noqa: BLE001 - 状态不可写时不影响规划结果
+            pass
+    context = getattr(runtime, "context", None)
+    if context is not None:
+        try:
+            setattr(context, "pdc_plan", payload_text)
+        except Exception:  # noqa: BLE001 - 上下文不可写时不影响规划结果
+            pass
+    return payload_text
 
 
 def create_planning_tools() -> list[Any]:

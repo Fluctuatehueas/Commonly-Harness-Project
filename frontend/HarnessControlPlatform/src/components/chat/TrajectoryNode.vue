@@ -1,14 +1,22 @@
 <script setup lang="ts">
 // 轨迹树节点：递归渲染推理 / 工具 / 委派及其子节点
-import { computed, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { IconName } from '@/components/console/icons'
 import { useDisplayStore } from '@/stores/display'
-import type { TreeNode } from './trajectoryTypes'
+import {
+  TRAJECTORY_REGISTRY,
+  type TrajectoryEntry,
+  type TreeNode,
+} from './trajectoryTypes'
 import TrajectoryNode from './TrajectoryNode.vue'
 
-const props = defineProps<{ node: TreeNode; agentName?: string }>()
+const props = defineProps<{ node: TreeNode; agentName?: string; level?: number }>()
 const display = useDisplayStore()
+
+// 递归深度：根节点为 L1，用于顶部粘性折叠条展示层级。
+const level = computed(() => props.level ?? 1)
+const registry = inject(TRAJECTORY_REGISTRY, null)
 
 // 委派节点（SubAgent）默认折叠：子 Agent 的推理、工具与输出都收在
 // 折叠行后面，行内只显示最近一步预览。其他节点维持原有展开策略。
@@ -162,11 +170,30 @@ watch(
     }
   },
 )
+
+// 登记到聊天页的轨迹索引：滚动时由顶部粘性折叠条反查当前节点并代理收起。
+const entry: TrajectoryEntry = {
+  level: () => level.value,
+  label: () => label.value,
+  collapsible: () => hasDetail.value,
+  open: () => open.value,
+  toggle: () => {
+    if (hasDetail.value) open.value = !open.value
+  },
+}
+onMounted(() => registry?.set(props.node.msg.id, entry))
+onBeforeUnmount(() => registry?.delete(props.node.msg.id))
 </script>
 
 <template>
   <div class="tnode" :class="[msg.kind, msg.category, msg.status]">
-    <div class="tnode-row" :class="{ clickable: hasDetail }" @click="hasDetail && (open = !open)">
+    <div
+      class="tnode-row"
+      :class="{ clickable: hasDetail }"
+      :data-traj-row="msg.id"
+      :data-traj-level="level"
+      @click="hasDetail && (open = !open)"
+    >
       <span class="rail-dot" :class="{ active: msg.streaming }">
         <AppIcon :name="icon" :size="11" />
       </span>
@@ -224,6 +251,7 @@ watch(
         :key="child.msg.id"
         :node="child"
         :agent-name="effectiveAgent || undefined"
+        :level="level + 1"
       />
     </div>
   </div>

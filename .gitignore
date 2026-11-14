@@ -34,6 +34,7 @@ yarn-error.log*
 
 # 应用运行状态、临时文件和日志
 runtime/
+logs/
 .harness/
 .langgraph_api/
 *.log

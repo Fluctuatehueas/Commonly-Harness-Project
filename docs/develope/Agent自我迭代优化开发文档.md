@@ -1,4 +1,4 @@
-# Agent 自我迭代与优化机制开发文档
+﻿# Agent 自我迭代与优化机制开发文档
 
 > 文档性质：评审结论 + 现状对齐 + 代码级实施设计。
 > 版本：v1.0 · 2026-11-04
@@ -265,7 +265,7 @@ graph TD
 | 轨迹补全 | `TrajectoryMiddleware.awrap_model_call` / `awrap_tool_call` | 在现有事件上增加 `atdp` 字段 |
 | 奖励采集 | `TrajectoryMiddleware.aafter_agent` + 下一轮 `abefore_agent` | 弱信号与延迟信号 |
 | 经验注入 | `ContextInjectionMiddleware` 之前或同级新增 `ExperienceInjectionMiddleware` | 只注入 top-k，控制 Token |
-| 自我裁定 | 新增 `SelfJudgeMiddleware` | 包住 `awrap_model_call`，只对最终回答与高风险工具结果生效 |
+| 自我裁定 | 新增 `PdcGuardMiddleware` | 包住 `awrap_model_call`，只对最终回答与高风险工具结果生效 |
 | 归因 | `aafter_agent` 之后异步执行 | 不阻塞主回复 |
 | 控制面 | 独立服务类 + `/evolution` API | 不进入 Agent 主图 |
 
@@ -561,7 +561,7 @@ src/agent/evolution/
 新增中间件：
 
 ```text
-src/agent/middlewares/self_judge.py
+src/agent/middlewares/pdc_guard.py
 src/agent/middlewares/experience_injection.py
 ```
 
@@ -991,30 +991,28 @@ class VerifyResult:
 裁定中间件概念骨架：
 
 ```python
-class SelfJudgeMiddleware(AgentMiddleware):
+class PdcGuardMiddleware(AgentMiddleware):
     async def awrap_model_call(self, request, handler):
         response = await handler(request)
-        if not self._should_judge(request, response):
+        candidate = self._should_judge(response)
+        if candidate is None:
             return response
 
-        verdict = await self._judge_l1(request, response)
-        if not verdict.needs_verification:
-            return response
+        while True:
+            ok, reason = await self._verify(candidate)
+            if ok:
+                return response
+            if self._rounds >= self._max_rounds:
+                return self._record_failure(response, reason)
 
-        verified = await self._judge_l2(request, response)
-        if verified.passed:
-            return response
-
-        if self._risk_tier(request) == RiskTier.T2:
-            # 高风险失败关闭：替换原答案并标记验证失败，进入人工复核。
-            return self._block_or_annotate(request, response, verified)
-
-        retry = self._corrective_request(request, verified)
-        response = await handler(retry)
-        final = await self._judge_l1(retry, response)
-        if not final.passed:
-            return self._annotate_failure(response, verified)
-        return response
+            self._rounds += 1
+            response = await self._retry_with_correction(
+                request, handler, reason, candidate
+            )
+            candidate = self._should_judge(response)
+            if candidate is None:
+                # 模型改为继续调用工具；下一次最终回答会重新进入检查。
+                return response
 ```
 
 注意：
@@ -1023,7 +1021,7 @@ class SelfJudgeMiddleware(AgentMiddleware):
 2. L1 使用摘要模型，不复用主模型实例，避免同一模型自证。
 3. L2 失败优先于 L1 通过。
 4. 重试必须有上限，且只允许修改提示，不允许修改用户原始要求。
-5. T2 失败时替换原答案并写入 `evolution_verification_failed`，由后续人工复核或发布流程处理；不在中间件内自动重放有副作用的工具。
+5. 重做轮次写入运行上下文，HITL 恢复时沿用；达到上限后写入 `evolution_verification_failed`，不把原因拼进用户可见回答。
 
 ### 5.8 归因引擎
 
@@ -1310,9 +1308,9 @@ EVOLUTION_BUILD_VERSION = os.getenv("HARNESS_BUILD_VERSION", "dev")
 | 任务 | 落点 | 验收 |
 | :-- | :-- | :-- |
 | L1 结构化自检 | `judge.py` | 输出固定 JSON，不产生自由文本污染 |
-| 风险分级 | `RiskTier` | T0 跳过、T1 重试 1 次、T2 阻止原答案并标记人工复核 |
-| L2 验证器 | `verifiers.py` | Schema/沙箱/数值/幂等重查可用 |
-| 失败关闭 | `SelfJudgeMiddleware` | T2 验证失败不自动继续 |
+| 风险分级 | `RiskTier` | T0 跳过；T1/T2 未通过时带反馈重做，默认 2 轮（`HARNESS_PDCA_MAX_ROUNDS`） |
+| L2 验证器 | `verifiers.py` | Schema/数值验证可通过 `output_schema` / `numeric_ranges` 启用 |
+| 失败收口 | `PdcGuardMiddleware` | 轮次耗尽后记录失败信号，不把自检原因暴露给用户 |
 | 成本控制 | 采样 + 只对最终回答 | 默认不增加每轮固定开销 |
 
 ### P4：归因、控制面与晋升
@@ -1399,7 +1397,7 @@ EVOLUTION_BUILD_VERSION = os.getenv("HARNESS_BUILD_VERSION", "dev")
 | 奖励污染（跨技能版本） | 训练数据只取当前 `skill_generation` | `VersionManifest` + `eval_sets.py` |
 | 目标漂移 / 无界自改 | 人类设定目标，Agent 只生成候选 | `HARNESS_EVOLUTION_REQUIRE_HUMAN_APPROVAL` |
 | 工具误判 | infra/tool/task 三分 + 置信下限 + 探索预算 | `tool_health.py`、`router.py` |
-| 自检循环 | 重试上限 1 次 + T2 阻断原答案并标记人工复核 | `SelfJudgeMiddleware` |
+| 自检循环 | 带反馈重做默认 2 轮，可配置上限 5；耗尽后记录失败信号 | `PdcGuardMiddleware` |
 | 验证器副作用 | 写操作禁止重放，只做幂等重查 | `verifiers.py` |
 | 轨迹泄密 | 落库前脱敏 + 原始内容不入轨迹 | `redaction.py`、`TraceGovernor` |
 | 多 worker 状态不一致 | 演进状态全部落 Store，不使用进程内单例做决策 | `releases.py`、`tool_health.py` |

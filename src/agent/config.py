@@ -389,18 +389,35 @@ FEEDBACK_MAX_ANSWER_EXCERPT = int(os.getenv("HARNESS_FEEDBACK_MAX_ANSWER_EXCERPT
 FEEDBACK_RETENTION_DAYS = int(os.getenv("HARNESS_FEEDBACK_RETENTION_DAYS", "180"))
 FEEDBACK_MAX_RECORDS = int(os.getenv("HARNESS_FEEDBACK_MAX_RECORDS", "20000"))
 
+# ============================================================
+# 运行时异常捕获与重试
+# ============================================================
+# 只对瞬时异常（网络、模型 5xx/429、连接中断）重试；确定性异常直接失败。
+RUNTIME_RETRY_ENABLED = _env_flag("HARNESS_RUNTIME_RETRY_ENABLED", True)
+# 首次执行 + 重试的总尝试次数。
+RUNTIME_MAX_ATTEMPTS = int(os.getenv("HARNESS_RUNTIME_MAX_ATTEMPTS", "3"))
+# 首次重试的退避毫秒数；后续按 2 倍指数增长并带 ±20% 抖动。
+RUNTIME_BACKOFF_MS = int(os.getenv("HARNESS_RUNTIME_BACKOFF_MS", "1000"))
+# 连续两次重试后 checkpoint 无进展，即判定毒丸并停止重试。
+RUNTIME_NO_PROGRESS_LIMIT = int(os.getenv("HARNESS_RUNTIME_NO_PROGRESS_LIMIT", "2"))
+
 
 # ============================================================
 # Agent 运行保护
 # ============================================================
 # 限制按单次 Agent run 计数；恢复中断（checkpoint resume）会开启新的 run，避免长期会话被历史调用耗尽。
-MAIN_AGENT_MODEL_RUN_LIMIT = 50  # 单词Agent对话次数
-MAIN_AGENT_TOOL_RUN_LIMIT = 500 # 单词Agent可调用工具限制
-SUBAGENT_MODEL_RUN_LIMIT = 100 # 子智能体对话次数
-SUBAGENT_TOOL_RUN_LIMIT = 500 # 子智能体工具运行限制
-ASYNC_SUBAGENT_MODEL_RUN_LIMIT = 50 # 异步子 Agent 的预算。
-# 不改变每次新询问重新计数的语义，也继续保留循环保护。
-ASYNC_SUBAGENT_TOOL_RUN_LIMIT = 32
+# 0 表示不限制；长任务流里工具调用本来就多，硬上限会把正常执行判成异常。
+# 需要防跑飞时再用环境变量打开。
+MAIN_AGENT_MODEL_RUN_LIMIT = int(os.getenv("HARNESS_MAIN_AGENT_MODEL_RUN_LIMIT", "0"))
+MAIN_AGENT_TOOL_RUN_LIMIT = int(os.getenv("HARNESS_MAIN_AGENT_TOOL_RUN_LIMIT", "0"))
+SUBAGENT_MODEL_RUN_LIMIT = int(os.getenv("HARNESS_SUBAGENT_MODEL_RUN_LIMIT", "0"))
+SUBAGENT_TOOL_RUN_LIMIT = int(os.getenv("HARNESS_SUBAGENT_TOOL_RUN_LIMIT", "0"))
+ASYNC_SUBAGENT_MODEL_RUN_LIMIT = int(
+    os.getenv("HARNESS_ASYNC_SUBAGENT_MODEL_RUN_LIMIT", "0")
+)
+ASYNC_SUBAGENT_TOOL_RUN_LIMIT = int(
+    os.getenv("HARNESS_ASYNC_SUBAGENT_TOOL_RUN_LIMIT", "0")
+)
 
 # ============================================================
 # OpenSandbox 配置
@@ -848,6 +865,11 @@ EVOLUTION_EXPERIENCE_INJECTION_ENABLED = _env_flag(
     "HARNESS_EVOLUTION_EXPERIENCE_INJECTION", True
 )
 EVOLUTION_JUDGE_ENABLED = _env_flag("HARNESS_EVOLUTION_JUDGE", True)
+# PDCA 闭环：最终回答未通过自检时，带反馈重做的最大轮次（不含首次执行）。
+PDCA_ENABLED = _env_flag("HARNESS_PDCA_ENABLED", True)
+PDCA_MAX_ROUNDS = int(os.getenv("HARNESS_PDCA_MAX_ROUNDS", "2"))
+# 代码编译：本机已有运行时优先；缺失时转沙箱安装，禁止在本机新建环境。
+LOCAL_BUILD_ENABLED = _env_flag("HARNESS_LOCAL_BUILD_ENABLED", True)
 EVOLUTION_ATTRIBUTION_ENABLED = _env_flag("HARNESS_EVOLUTION_ATTRIBUTION", True)
 EVOLUTION_CONTROL_PLANE_ENABLED = _env_flag(
     "HARNESS_EVOLUTION_CONTROL_PLANE", True
@@ -888,3 +910,19 @@ EVOLUTION_REQUIRE_HUMAN_APPROVAL = _env_flag(
 )
 EVOLUTION_BUILD_VERSION = os.getenv("HARNESS_BUILD_VERSION", "dev")
 EVOLUTION_TENANT_ID = (os.getenv("HARNESS_TENANT_ID") or "").strip()
+
+# ============================================================
+# AgentTeam
+# ============================================================
+# 团队模式总开关：关闭后 group_id 一律忽略，全部按独立 Agent 运行。
+AGENT_TEAM_ENABLED = _env_flag("HARNESS_AGENT_TEAM_ENABLED", True)
+# 跨组委派最大深度（本组 → 他组 → 再他组）。
+AGENT_TEAM_MAX_DEPTH = int(os.getenv("HARNESS_AGENT_TEAM_MAX_DEPTH", "2"))
+# 单次跨组委派超时（秒）。
+AGENT_TEAM_DELEGATION_TIMEOUT = float(
+    os.getenv("HARNESS_AGENT_TEAM_TIMEOUT", "300")
+)
+# 每用户同时进行的跨组委派上限；忙则拒绝，不排队。
+AGENT_TEAM_MAX_CONCURRENT = int(
+    os.getenv("HARNESS_AGENT_TEAM_MAX_CONCURRENT", "2")
+)

@@ -138,6 +138,9 @@ class StepTrace(BaseModel):
     attempts: int = 1
     input_summary: str = ""
     output_summary: str = ""
+    # 步骤起止时间（UTC，带偏移）；用于回看每一步耗时与执行顺序。
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     # 完整产出（受 EXECUTION_OUTPUT_MAX_CHARS 上限约束），供执行记录回放；
     # output_summary 只保留前 200 字，用于卡片等轻量场景。
     output: str = ""

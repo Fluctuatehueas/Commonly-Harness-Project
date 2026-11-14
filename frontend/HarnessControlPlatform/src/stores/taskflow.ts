@@ -10,6 +10,7 @@ import {
   fetchTaskFlows,
   forkTaskFlow,
   publishTaskFlow,
+  setTaskFlowEnabled,
   updateTaskFlow,
   type ExecutionDetail,
   type ExecutionItem,
@@ -29,8 +30,6 @@ export const useTaskflowStore = defineStore('taskflow', () => {
   const page = ref(1)
   const listLoading = ref(false)
   const listError = ref('')
-  // 列表接口不含 schema，卡片缩略图按 id 缓存详情里的 steps 结构
-  const schemas = ref<Record<string, TaskFlowSchema>>({})
 
   let listSeq = 0
 
@@ -44,31 +43,12 @@ export const useTaskflowStore = defineStore('taskflow', () => {
       items.value = data.items
       total.value = data.total
       page.value = data.page
-      void loadCardSchemas(data.items)
     } catch (err) {
       if (seq !== listSeq) return
       listError.value = (err as Error).message
     } finally {
       if (seq === listSeq) listLoading.value = false
     }
-  }
-
-  async function loadCardSchemas(list: FlowListItem[]) {
-    const results = await Promise.all(
-      list.map(async (item) => {
-        if (schemas.value[item.id]) return null
-        try {
-          return [item.id, (await fetchTaskFlow(item.id)).schema] as const
-        } catch {
-          return null
-        }
-      }),
-    )
-    const next = { ...schemas.value }
-    for (const entry of results) {
-      if (entry) next[entry[0]] = entry[1]
-    }
-    schemas.value = next
   }
 
   // ---------- 当前详情 ----------
@@ -103,6 +83,14 @@ export const useTaskflowStore = defineStore('taskflow', () => {
     return forkTaskFlow(id)
   }
 
+  /** 启用/停用：同步更新列表与详情里的状态，避免两端显示不一致。 */
+  async function setEnabled(id: string, enabled: boolean): Promise<void> {
+    const res = await setTaskFlowEnabled(id, enabled)
+    const item = items.value.find((flow) => flow.id === id)
+    if (item) item.enabled = res.enabled
+    if (current.value?.id === id) current.value.enabled = res.enabled
+  }
+
   async function remove(id: string): Promise<void> {
     await deleteTaskFlow(id)
     if (current.value?.id === id) current.value = null
@@ -134,7 +122,6 @@ export const useTaskflowStore = defineStore('taskflow', () => {
     page,
     listLoading,
     listError,
-    schemas,
     loadList,
     current,
     detailLoading,
@@ -143,6 +130,7 @@ export const useTaskflowStore = defineStore('taskflow', () => {
     save,
     publish,
     fork,
+    setEnabled,
     remove,
     executions,
     executionsTotal,

@@ -3,7 +3,7 @@
 编译期（确定性，不调用 LLM）：
     parse → validate → compile → build_search_doc
 运行期（LLM 介入）：
-    route → execute
+    route → 封装 HumanMsg 注入主 Agent 图 → 步骤上报工具回写进度
 
 设计文档见本目录 README.md；开发文档见 docs/develope/任务流模块开发文档.md。
 """

@@ -23,6 +23,16 @@ export interface MessageTokens {
   contextUsed?: number
 }
 
+// 任务规划卡片里的单个条目：由 scheduler_progress.planned 的 plan_items 快照渲染。
+export interface SchedulerPlanItem {
+  id: string
+  title: string
+  phaseId: string
+  phaseTitle?: string
+  status: 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'needs_hitl'
+  detail?: string
+}
+
 export interface ChatMsg {
   id: string
   kind:
@@ -34,8 +44,11 @@ export interface ChatMsg {
     | 'interrupt'
     | 'system'
     | 'taskflow'
+    | 'scheduler'
     // 仅前端渲染的流程标记：经验命中 / 任务流命中，不写入轨迹存储
     | 'marker'
+    // 本轮终止原因，仅本地展示，不写入历史
+    | 'terminated'
   content?: string
   attachments?: ContextFile[]
   streaming?: boolean
@@ -65,12 +78,28 @@ export interface ChatMsg {
   flowSteps?: ExecutionStepView[]
   flowTraces?: StepTrace[]
   flowCurrentStep?: string
+  // ---------- 任务规划卡片 ----------
+  schedRunId?: string
+  schedGoal?: string
+  schedTier?: string
+  schedMode?: string
+  schedStatus?: 'running' | 'done' | 'failed' | 'paused'
+  schedPlanVersion?: number
+  schedItems?: SchedulerPlanItem[]
+  schedSummary?: string
+  schedReplans?: number
+  schedNote?: string
   // 用户对这条最终回答的最新反馈；刷新后由历史接口回填
   feedback?: 'like' | 'dislike' | null
   // ---------- 仅渲染的流程标记 ----------
   markerType?: 'experience' | 'taskflow'
   markerItems?: { id: string; name: string; rule?: string }[]
+  // ---------- 终止原因（仅本地，不落历史） ----------
+  termReason?: TerminateReason
+  termDetail?: string
 }
+
+export type TerminateReason = 'user' | 'network' | 'server' | 'limit'
 
 interface SseEvent {
   type: string
@@ -128,6 +157,8 @@ interface ThreadChat {
   retryReceived: boolean
   // 用户消息 ID -> 连续重试次数（仅本地，用于防滥用提示）
   retryCount: Record<string, number>
+  // 本轮是否已收到 done / error 终止事件，用于识别流被意外关闭
+  terminalSeen: boolean
 }
 
 const SKILL_TOOLS = new Set([
@@ -261,15 +292,11 @@ function summarizeResume(payload: Record<string, unknown>): string {
     return '批准（仅本次）'
   }
 
-  const decisions = payload.decisions as
-    | { type?: string; message?: string }[]
-    | undefined
+  const decisions = payload.decisions as { type?: string; message?: string }[] | undefined
   if (Array.isArray(decisions)) {
     return decisions
       .map((item) =>
-        item.type === 'reject'
-          ? `拒绝${item.message ? `：${item.message}` : ''}`
-          : '批准',
+        item.type === 'reject' ? `拒绝${item.message ? `：${item.message}` : ''}` : '批准',
       )
       .join('、')
       .slice(0, 120)
@@ -294,6 +321,9 @@ function summarizeResume(payload: Record<string, unknown>): string {
 export const useChatStore = defineStore('chat', () => {
   // threadId -> 独立会话状态。SSE 事件始终写入发起请求的那个 thread。
   const threads = ref<Record<string, ThreadChat>>({})
+  // threadId -> 最近一次未完成任务流的卡片快照。
+  // 历史重新拉取（撤回）会丢掉本地卡片，这里用于把未完成的进度卡挂回去。
+  const flowSnapshots = ref<Record<string, ChatMsg>>({})
   const threadId = ref<string | null>(null)
   const demoMode = ref(true)
   const lastError = ref('')
@@ -324,6 +354,7 @@ export const useChatStore = defineStore('chat', () => {
       retryPending: false,
       retryReceived: false,
       retryCount: {},
+      terminalSeen: false,
     }
   }
 
@@ -352,9 +383,7 @@ export const useChatStore = defineStore('chat', () => {
     return Boolean(threads.value[tid]?.sending)
   }
 
-  const current = computed(() =>
-    threadId.value ? threads.value[threadId.value] : undefined,
-  )
+  const current = computed(() => (threadId.value ? threads.value[threadId.value] : undefined))
   const messages = computed(() => current.value?.messages ?? EMPTY_MESSAGES)
   const sending = computed(() => current.value?.sending ?? false)
   const thinking = computed(() => current.value?.thinking ?? false)
@@ -362,13 +391,15 @@ export const useChatStore = defineStore('chat', () => {
   const sessionTokens = computed(() => current.value?.sessionTokens ?? null)
   const turnDurations = computed(() => current.value?.turnDurations ?? {})
   const compaction = computed(() => current.value?.compaction ?? null)
-  const compacting = computed(
-    () => Boolean(current.value?.compaction?.active && current.value.compaction.phase !== 'exiting'),
+  const compacting = computed(() =>
+    Boolean(current.value?.compaction?.active && current.value.compaction.phase !== 'exiting'),
   )
   const compactionCount = computed(() => current.value?.compactionCount ?? 0)
   const isEmpty = computed(() => messages.value.length === 0)
   // 用户选择的 MyAgent；切换会话时保持，默认 Agent 始终可选。
   const selectedAgentId = ref('default')
+  // 用户选择的生效组；空表示按独立 Agent 执行。
+  const selectedGroupId = ref('')
 
   // 后台仍在运行的会话集合，供侧边栏动画使用
   const runningThreadIds = computed(() =>
@@ -383,9 +414,7 @@ export const useChatStore = defineStore('chat', () => {
   )
 
   function findTool(state: ThreadChat, toolCallId: string) {
-    return state.messages.find(
-      (m) => m.kind === 'tool' && m.toolCallId === toolCallId,
-    )
+    return state.messages.find((m) => m.kind === 'tool' && m.toolCallId === toolCallId)
   }
 
   /**
@@ -422,6 +451,83 @@ export const useChatStore = defineStore('chat', () => {
     return undefined
   }
 
+  // 任务规划卡片：同一次运行只保留一张卡片；中断后恢复执行时复用它。
+  function findSchedulerMsg(state: ThreadChat, runId = ''): ChatMsg | undefined {
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const msg = state.messages[i]
+      if (msg?.kind !== 'scheduler') continue
+      if (runId && msg.schedRunId && msg.schedRunId !== runId) continue
+      return msg
+    }
+    return undefined
+  }
+
+  function parseSchedulerItems(raw: unknown): SchedulerPlanItem[] {
+    if (!Array.isArray(raw)) return []
+    const allowed = new Set(['pending', 'running', 'done', 'failed', 'skipped', 'needs_hitl'])
+    return raw.map((item) => {
+      const record = item as {
+        id?: string
+        title?: string
+        phase_id?: string
+        phase_title?: string
+        status?: string
+        summary?: string
+        error?: string
+      }
+      const status = String(record.status || 'pending')
+      return {
+        id: String(record.id || ''),
+        title: String(record.title || record.id || '条目'),
+        phaseId: String(record.phase_id || ''),
+        phaseTitle: record.phase_title ? String(record.phase_title) : undefined,
+        status: (allowed.has(status) ? status : 'pending') as SchedulerPlanItem['status'],
+        detail: record.summary || record.error || undefined,
+      }
+    })
+  }
+
+  /** 记录/清理任务流快照：整条流走完后删除，保证卡片不再出现。 */
+  function rememberFlowSnapshot(key: string, card: ChatMsg | undefined) {
+    if (!card || card.kind !== 'taskflow') return
+    const steps = (card.flowSteps || []).map((step) => ({ ...step }))
+    const finished =
+      steps.length > 0 &&
+      steps.every((step) => step.status === 'done' || step.status === 'degraded')
+    if (finished) {
+      delete flowSnapshots.value[key]
+      return
+    }
+    flowSnapshots.value[key] = {
+      ...card,
+      id: uid('tf'),
+      flowStatus: 'running',
+      flowCurrentStep: '',
+      flowSteps: steps,
+      flowTraces: (card.flowTraces || []).slice(),
+      at: Date.now(),
+    }
+  }
+
+  /** 撤回导致历史被重新拉取后，把未完成任务流的进度卡挂回消息流。 */
+  function restoreFlowCard(tid: string) {
+    const snapshot = flowSnapshots.value[tid]
+    const state = threads.value[tid]
+    if (!snapshot || !state) return
+    if (
+      state.messages.some(
+        (message) => message.kind === 'taskflow' && message.flowStatus === 'running',
+      )
+    ) {
+      return
+    }
+    state.messages.push({
+      ...snapshot,
+      id: uid('tf'),
+      flowSteps: (snapshot.flowSteps || []).map((step) => ({ ...step })),
+    })
+  }
+
   function migrateThread(from: string, to: string) {
     if (!from || !to || from === to) return
     const state = threads.value[from]
@@ -429,6 +535,45 @@ export const useChatStore = defineStore('chat', () => {
     threads.value[to] = state
     delete threads.value[from]
     if (threadId.value === from) threadId.value = to
+  }
+
+  /**
+   * 在当前轮末尾记录终止原因，供 AI 气泡下方状态条渲染。
+   *
+   * 同一轮只保留一条；重复调用只更新原因与详情，避免多次收尾产生多条提示。
+   */
+  function markTerminated(
+    state: ThreadChat,
+    reason: TerminateReason,
+    detail = '',
+  ) {
+    // 所有流式节点都停下，否则中止后气泡会一直挂着光标。
+    for (const message of state.messages) {
+      if (message.streaming) message.streaming = false
+    }
+    let lastUser = -1
+    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+      if (state.messages[index]?.kind === 'user') {
+        lastUser = index
+        break
+      }
+    }
+    const existing = state.messages
+      .slice(lastUser + 1)
+      .find((message) => message.kind === 'terminated')
+    if (existing) {
+      existing.termReason = reason
+      existing.termDetail = detail
+      existing.at = Date.now()
+      return
+    }
+    state.messages.push({
+      id: uid('t'),
+      kind: 'terminated',
+      termReason: reason,
+      termDetail: detail,
+      at: Date.now(),
+    })
   }
 
   // 单个 SSE 事件 → 指定 thread 的消息列表变更
@@ -440,9 +585,7 @@ export const useChatStore = defineStore('chat', () => {
       state.thinking = false
       if (kind === 'assistant' && state.retryPending) state.retryReceived = true
       const source = String(evt.source || 'main')
-      const parent = evt.parent_tool_call_id
-        ? String(evt.parent_tool_call_id)
-        : undefined
+      const parent = evt.parent_tool_call_id ? String(evt.parent_tool_call_id) : undefined
       const text = String(evt.content || '')
       // 压缩期间不往气泡里追加内容，先缓冲；退场动画开始时统一回放。
       if (state.compaction?.active && !state.compaction.exiting && kind === 'assistant') {
@@ -513,6 +656,35 @@ export const useChatStore = defineStore('chat', () => {
         state.retryReceived = false
         break
       }
+      case 'pdc_revision': {
+        // 自检未通过，后端开始带反馈重做：移除上一版仍在流式的助手草稿。
+        for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+          const message = state.messages[index]!
+          if (message.kind !== 'assistant') break
+          if (!message.streaming) break
+          state.messages.splice(index, 1)
+        }
+        state.thinking = true
+        break
+      }
+      case 'runtime_notice': {
+        // 运行时自愈提示：只在轨迹内留一行说明，不结束本轮，也不当作回答。
+        // 后端重试会从 checkpoint 重放，先前已流式的草稿必须丢弃，避免拼出两段回答。
+        for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+          const message = state.messages[index]!
+          if (message.kind !== 'assistant') break
+          if (!message.streaming) break
+          state.messages.splice(index, 1)
+        }
+        state.thinking = true
+        state.messages.push({
+          id: uid('s'),
+          kind: 'system',
+          content: String(evt.message || '内部异常，正在重试'),
+          at: Date.now(),
+        })
+        break
+      }
       case 'token':
         appendDelta('assistant')
         break
@@ -535,9 +707,7 @@ export const useChatStore = defineStore('chat', () => {
           status: 'calling',
           source: String(evt.source || 'main'),
           subagentName: evt.subagent_name ? String(evt.subagent_name) : undefined,
-          parentToolCallId: evt.parent_tool_call_id
-            ? String(evt.parent_tool_call_id)
-            : undefined,
+          parentToolCallId: evt.parent_tool_call_id ? String(evt.parent_tool_call_id) : undefined,
           at: Date.now(),
         })
         break
@@ -765,13 +935,24 @@ export const useChatStore = defineStore('chat', () => {
       case 'task_flow_start': {
         state.thinking = false
         const flowName = String(evt.flow_name || '任务流')
-        insertTurnMarker(state, {
-          id: uid('mk'),
-          kind: 'marker',
-          markerType: 'taskflow',
-          content: `【使用${flowName}任务流执行该任务】`,
-          at: Date.now(),
-        })
+        // 同一条流在同一会话里只留一次命中标记：卡片可能反复出现，
+        // 但轨迹里重复刷屏没有信息量。
+        const markerText = `【使用${flowName}任务流执行该任务】`
+        const marked = state.messages.some(
+          (message) =>
+            message.kind === 'marker' &&
+            message.markerType === 'taskflow' &&
+            message.content === markerText,
+        )
+        if (!marked) {
+          insertTurnMarker(state, {
+            id: uid('mk'),
+            kind: 'marker',
+            markerType: 'taskflow',
+            content: markerText,
+            at: Date.now(),
+          })
+        }
         const rawSteps = Array.isArray(evt.steps) ? evt.steps : []
         state.messages.push({
           id: uid('tf'),
@@ -780,12 +961,23 @@ export const useChatStore = defineStore('chat', () => {
           flowName: String(evt.flow_name || '任务流'),
           flowStatus: 'running',
           flowSteps: rawSteps.map((item) => {
-            const step = item as { id?: string; name?: string; branch?: string | null }
+            const step = item as {
+              id?: string
+              name?: string
+              branch?: string | null
+              status?: string
+            }
+            // 续跑/中断恢复时后端会带上已有进度；未知状态一律按等待处理。
+            const raw = String(step.status || 'pending')
+            const status: ExecutionStepView['status'] =
+              raw === 'running' || raw === 'done' || raw === 'failed' || raw === 'degraded'
+                ? raw
+                : 'pending'
             return {
               id: String(step.id || ''),
               name: String(step.name || step.id || '步骤'),
               branch: step.branch ?? null,
-              status: 'pending' as const,
+              status,
               output: '',
             }
           }),
@@ -832,32 +1024,113 @@ export const useChatStore = defineStore('chat', () => {
         const card = findTaskFlowMsg(state)
         if (!card) break
         const status = String(evt.status || 'done')
-        card.flowStatus =
-          status === 'failed' || status === 'aborted' ? status : 'done'
-        card.flowTraces = Array.isArray(evt.step_traces)
-          ? (evt.step_traces as StepTrace[])
-          : []
+        card.flowStatus = status === 'failed' || status === 'aborted' ? status : 'done'
+        card.flowTraces = Array.isArray(evt.step_traces) ? (evt.step_traces as StepTrace[]) : []
         if (card.flowStatus !== 'done') {
           for (const step of card.flowSteps || []) {
             if (step.status === 'running') step.status = 'failed'
           }
         }
         card.flowCurrentStep = ''
+        rememberFlowSnapshot(key, card)
+        break
+      }
+      case 'scheduler_progress': {
+        // 任务规划卡片：planned 创建，item_* 更新条目状态，run_finished 归档。
+        // 恢复执行（run_started / plan_revised）会把已归档卡片重新置为 running。
+        const phase = String(evt.event || '')
+        const runId = String(evt.run_id || '')
+        if (!runId) break
+        state.thinking = false
+        let card = findSchedulerMsg(state, runId)
+        const planItems = parseSchedulerItems(evt.plan_items)
+
+        if (!card) {
+          if (!['planned', 'run_started', 'plan_revised'].includes(phase)) break
+          card = {
+            id: uid('sc'),
+            kind: 'scheduler',
+            schedRunId: runId,
+            schedGoal: String(evt.goal || ''),
+            schedTier: String(evt.tier || ''),
+            schedMode: String(evt.mode || ''),
+            schedPlanVersion: Number(evt.plan_version || 1),
+            schedItems: planItems,
+            schedStatus: 'running',
+            at: Date.now(),
+          }
+          state.messages.push(card)
+          break
+        }
+
+        card.schedRunId = card.schedRunId || runId
+        if (evt.goal) card.schedGoal = String(evt.goal)
+        if (evt.tier) card.schedTier = String(evt.tier)
+        if (evt.mode) card.schedMode = String(evt.mode)
+        if (planItems.length) card.schedItems = planItems
+
+        if (phase === 'planned' || phase === 'run_started' || phase === 'plan_revised') {
+          card.schedStatus = 'running'
+          card.at = Date.now()
+          if (evt.plan_version) card.schedPlanVersion = Number(evt.plan_version)
+          if (evt.reason) card.schedNote = String(evt.reason)
+        } else if (phase === 'item_started') {
+          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+          if (item) item.status = 'running'
+          card.schedStatus = 'running'
+          card.at = Date.now()
+        } else if (phase === 'item_done') {
+          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+          if (item) item.status = 'done'
+        } else if (phase === 'item_failed') {
+          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+          if (item) {
+            item.status = 'failed'
+            item.detail = String(evt.error || '')
+          }
+        } else if (phase === 'item_skipped') {
+          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+          if (item) {
+            item.status = 'skipped'
+            item.detail = String(evt.reason || '')
+          }
+        } else if (phase === 'item_needs_hitl') {
+          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+          if (item) {
+            item.status = 'needs_hitl'
+            item.detail = String(evt.reason || '')
+          }
+          card.schedStatus = 'paused'
+          card.at = Date.now()
+        } else if (phase === 'run_finished') {
+          const status = String(evt.status || 'done')
+          card.schedStatus =
+            status === 'failed' ? 'failed' : status === 'paused' ? 'paused' : 'done'
+          card.schedSummary = String(evt.summary || '')
+          card.schedReplans = Number(evt.replans || 0)
+          // 完成后归档：时间戳后移，落到本轮轨迹的最底部。
+          card.at = Date.now()
+        }
         break
       }
       case 'done': {
-        if (typeof evt.round_limit === 'number' && evt.round_limit > 0) {
+        state.terminalSeen = true
+        if (typeof evt.round_limit === 'number') {
+          // 0 表示后端不做调用次数限制，前端也不再展示上限提示。
           roundLimit.value = evt.round_limit
         }
-        // 后端最终回答是权威文本（可能含自检提示）。流式期间若只有子 Agent 输出、
-        // 主回答没有落到气泡里，这里用 done.content 补齐，避免"看不到正式结果"。
+        // 只在气泡还没有正文时用 done.content 兜底（例如只收到子 Agent 输出）。
+        // 已有流式正文时绝不覆盖：正文已通过自检放行，覆盖会表现为「回答被撤回重写」。
         const doneContent = typeof evt.content === 'string' ? evt.content : ''
+        // 达到模型调用上限时，框架会把一条固定英文提示作为最终回答，据此标记。
+        const limitHit = /^Model call limits exceeded/i.test(doneContent)
         if (doneContent) {
           const lastAssistant = [...state.messages]
             .reverse()
             .find((message) => message.kind === 'assistant')
-          if (lastAssistant) {
-            lastAssistant.content = doneContent
+          // 只在本轮气泡（仍在流式或还没有正文）上兜底，不碰历史回答。
+          if (lastAssistant && (lastAssistant.streaming || !lastAssistant.content)) {
+            if (!lastAssistant.content) lastAssistant.content = doneContent
             lastAssistant.streaming = false
           } else {
             state.messages.push({
@@ -952,26 +1225,35 @@ export const useChatStore = defineStore('chat', () => {
         state.thinking = false
         state.controller = null
         state.activeTurnKey = null
+        // HITL 中断不算异常终止，不写终止原因；只有真正超限才标记。
+        if (limitHit && !evt.interrupted) markTerminated(state, 'limit')
         const flowCard = findTaskFlowMsg(state)
         if (flowCard && flowCard.flowStatus === 'running') flowCard.flowStatus = 'done'
+        // 本轮结束卡片即收起；未走完的流留一份快照，撤回后可重新挂出。
+        rememberFlowSnapshot(key, flowCard)
+        const schedCard = findSchedulerMsg(state)
+        if (schedCard && schedCard.schedStatus === 'running') {
+          schedCard.schedStatus = 'done'
+          schedCard.at = Date.now()
+        }
         if (!evt.interrupted) state.pendingInterrupt = null
         lastTurnThreadId.value = realId || key
         turnVersion.value++
         break
       }
       case 'error': {
+        state.terminalSeen = true
         lastError.value = String(evt.message || '未知错误')
+        // 后端返回的 run_id 是排障锚点：一并显示，用户反馈时可直接提供。
+        const runRef = evt.run_id ? `（run_id: ${String(evt.run_id)}）` : ''
         // 重试在产生任何新正文前失败：恢复旧回答，避免界面变空。
         restoreRetryBackup(state)
-        state.messages.push({
-          id: uid('s'),
-          kind: 'system',
-          content: `⚠ ${lastError.value}`,
-          at: Date.now(),
-        })
-        for (const message of state.messages) {
-          if (message.streaming) message.streaming = false
-        }
+        // 网络层异常由前端标记为 network，其余按服务端错误展示。
+        markTerminated(
+          state,
+          evt.network === true ? 'network' : 'server',
+          `${lastError.value}${runRef}`,
+        )
         removeCompactionNotes(state)
         clearCompactionTimers(state)
         clearCompactionWatchdog(state)
@@ -983,6 +1265,12 @@ export const useChatStore = defineStore('chat', () => {
         state.activeTurnKey = null
         const flowCard = findTaskFlowMsg(state)
         if (flowCard && flowCard.flowStatus === 'running') flowCard.flowStatus = 'failed'
+        rememberFlowSnapshot(key, flowCard)
+        const schedCard = findSchedulerMsg(state)
+        if (schedCard && schedCard.schedStatus === 'running') {
+          schedCard.schedStatus = 'failed'
+          schedCard.at = Date.now()
+        }
         break
       }
     }
@@ -1025,6 +1313,7 @@ export const useChatStore = defineStore('chat', () => {
 
   async function streamPost(path: string, body: unknown, state: ThreadChat, key: string) {
     state.controller = new AbortController()
+    state.terminalSeen = false
     try {
       const res = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
@@ -1033,10 +1322,23 @@ export const useChatStore = defineStore('chat', () => {
         signal: state.controller.signal,
       })
       await consumeStream(res, state, key)
+      // 流被对端关闭却始终没收到 done / error：按连接中断收尾。
+      if (!state.terminalSeen) {
+        handleEvent(
+          { type: 'error', message: '连接中断，回答未完成', network: true },
+          state,
+          key,
+        )
+      }
     } catch (error) {
       if (isAbortError(error)) return
+      // TypeError 通常来自 fetch/reader 的网络层错误，其余按服务端错误处理。
       handleEvent(
-        { type: 'error', message: friendlyError(error as Error) },
+        {
+          type: 'error',
+          message: friendlyError(error as Error),
+          network: error instanceof TypeError,
+        },
         state,
         key,
       )
@@ -1091,6 +1393,9 @@ export const useChatStore = defineStore('chat', () => {
         user_id: USER_ID,
         username: currentUser().name,
         agent_id: selectedAgentId.value,
+        // 显式传空串表示「本轮不组队」：后端据此把会话绑定清空，
+        // 下次切回该会话时不会误恢复上一个组。
+        group_id: selectedGroupId.value,
         attachments: attachments.map((item) => item.id),
       },
       state,
@@ -1199,9 +1504,7 @@ export const useChatStore = defineStore('chat', () => {
     state.sending = true
     state.thinking = true
     // HITL 恢复仍属于同一用户轮次，耗时回填到该轮。
-    const lastUser = [...state.messages]
-      .reverse()
-      .find((message) => message.kind === 'user')
+    const lastUser = [...state.messages].reverse().find((message) => message.kind === 'user')
     state.activeTurnKey = lastUser?.id || state.activeTurnKey
     if (demoMode.value) {
       void runDemoResume(state, key, markAs)
@@ -1219,14 +1522,19 @@ export const useChatStore = defineStore('chat', () => {
   function stop() {
     const state = current.value
     if (!state) return
+    // 只有确实在跑的一轮才写终止原因，避免空闲时点停止留下误提示。
+    const running = state.sending
     state.controller?.abort()
     state.controller = null
+    // 手动终止已经收尾，避免 abort 后流关闭检测再补一条「连接中断」。
+    state.terminalSeen = true
     clearCompactionTimers(state)
     clearCompactionWatchdog(state)
     removeCompactionNotes(state)
     state.compaction = null
     state.compactionBuffer = ''
     restoreRetryBackup(state)
+    if (running) markTerminated(state, 'user')
     state.sending = false
     state.thinking = false
     state.activeTurnKey = null
@@ -1238,18 +1546,12 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   // 切换会话：已有实时缓冲时直接恢复；否则用历史覆盖
-  function loadHistory(
-    msgs: ChatMsg[],
-    tid: string,
-    sessionUsage?: MessageTokens | null,
-  ) {
+  function loadHistory(msgs: ChatMsg[], tid: string, sessionUsage?: MessageTokens | null) {
     const state = ensureThread(tid)
     if (!state.sending) {
       state.messages = msgs
-      state.pendingInterrupt =
-        msgs.find((m) => m.kind === 'interrupt' && !m.resolved) || null
-      state.sessionTokens =
-        sessionUsage && sessionUsage.total > 0 ? sessionUsage : null
+      state.pendingInterrupt = msgs.find((m) => m.kind === 'interrupt' && !m.resolved) || null
+      state.sessionTokens = sessionUsage && sessionUsage.total > 0 ? sessionUsage : null
       clearCompactionTimers(state)
       clearCompactionWatchdog(state)
       state.compaction = null
@@ -1322,30 +1624,133 @@ export const useChatStore = defineStore('chat', () => {
       key,
     )
     await typeOut(state, `收到「${userText.slice(0, 18)}」。我先读取你的偏好文件，再检索资料。`)
-    handleEvent({ type: 'tool_start', tool_call_id: 'call-1', tool_name: 'read_file', source: 'main' }, state, key)
+    handleEvent(
+      { type: 'tool_start', tool_call_id: 'call-1', tool_name: 'read_file', source: 'main' },
+      state,
+      key,
+    )
     await sleep(300)
-    handleEvent({ type: 'tool_args', tool_call_id: 'call-1', args: `{"path": "/memories/${USER_ID}/preferences.md"}`, source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_args',
+        tool_call_id: 'call-1',
+        args: `{"path": "/memories/${USER_ID}/preferences.md"}`,
+        source: 'main',
+      },
+      state,
+      key,
+    )
     await sleep(600)
-    handleEvent({ type: 'tool_result', tool_call_id: 'call-1', tool_name: 'read_file', status: 'done', text: 'preferred:\n  language: zh-CN\n  output_style: concise\nrecent_queries:\n  - 控制台演示', source: 'main' }, state, key)
-    handleEvent({ type: 'tool_end', tool_call_id: 'call-1', status: 'done', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_result',
+        tool_call_id: 'call-1',
+        tool_name: 'read_file',
+        status: 'done',
+        text: 'preferred:\n  language: zh-CN\n  output_style: concise\nrecent_queries:\n  - 控制台演示',
+        source: 'main',
+      },
+      state,
+      key,
+    )
+    handleEvent(
+      { type: 'tool_end', tool_call_id: 'call-1', status: 'done', source: 'main' },
+      state,
+      key,
+    )
 
-    handleEvent({ type: 'tool_start', tool_call_id: 'call-2', tool_name: 'web_search', source: 'main' }, state, key)
+    handleEvent(
+      { type: 'tool_start', tool_call_id: 'call-2', tool_name: 'web_search', source: 'main' },
+      state,
+      key,
+    )
     await sleep(250)
-    handleEvent({ type: 'tool_args', tool_call_id: 'call-2', args: '{"query": "Harness 多智能体架构 最佳实践"}', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_args',
+        tool_call_id: 'call-2',
+        args: '{"query": "Harness 多智能体架构 最佳实践"}',
+        source: 'main',
+      },
+      state,
+      key,
+    )
     await sleep(900)
-    handleEvent({ type: 'tool_result', tool_call_id: 'call-2', tool_name: 'web_search', status: 'done', text: '1. 编排层评估（LangGraph 状态图）…\n2. 上下文工程：卸载/摘要/隔离…\n3. HITL 以 checkpoint 落地…', source: 'main' }, state, key)
-    handleEvent({ type: 'tool_end', tool_call_id: 'call-2', status: 'done', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_result',
+        tool_call_id: 'call-2',
+        tool_name: 'web_search',
+        status: 'done',
+        text: '1. 编排层评估（LangGraph 状态图）…\n2. 上下文工程：卸载/摘要/隔离…\n3. HITL 以 checkpoint 落地…',
+        source: 'main',
+      },
+      state,
+      key,
+    )
+    handleEvent(
+      { type: 'tool_end', tool_call_id: 'call-2', status: 'done', source: 'main' },
+      state,
+      key,
+    )
 
-    handleEvent({ type: 'tool_start', tool_call_id: 'call-3', tool_name: 'assign_skill', source: 'main' }, state, key)
+    handleEvent(
+      { type: 'tool_start', tool_call_id: 'call-3', tool_name: 'assign_skill', source: 'main' },
+      state,
+      key,
+    )
     await sleep(250)
-    handleEvent({ type: 'tool_args', tool_call_id: 'call-3', args: '{"skill_name": "report-writer", "subagent_name": "main"}', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_args',
+        tool_call_id: 'call-3',
+        args: '{"skill_name": "report-writer", "subagent_name": "main"}',
+        source: 'main',
+      },
+      state,
+      key,
+    )
     await sleep(700)
-    handleEvent({ type: 'tool_result', tool_call_id: 'call-3', tool_name: 'assign_skill', status: 'done', text: '{"ok": true, "skill_name": "report-writer", "target": "main", "path": "/skills/main/report-writer"}', source: 'main' }, state, key)
-    handleEvent({ type: 'tool_end', tool_call_id: 'call-3', status: 'done', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_result',
+        tool_call_id: 'call-3',
+        tool_name: 'assign_skill',
+        status: 'done',
+        text: '{"ok": true, "skill_name": "report-writer", "target": "main", "path": "/skills/main/report-writer"}',
+        source: 'main',
+      },
+      state,
+      key,
+    )
+    handleEvent(
+      { type: 'tool_end', tool_call_id: 'call-3', status: 'done', source: 'main' },
+      state,
+      key,
+    )
 
-    handleEvent({ type: 'tool_start', tool_call_id: 'call-4', tool_name: 'task', source: 'main', subagent_name: 'research_agent' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_start',
+        tool_call_id: 'call-4',
+        tool_name: 'task',
+        source: 'main',
+        subagent_name: 'research_agent',
+      },
+      state,
+      key,
+    )
     await sleep(250)
-    handleEvent({ type: 'tool_args', tool_call_id: 'call-4', args: '{"subagent_type": "research_agent", "description": "汇总检索结果并给出结构化结论"}', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_args',
+        tool_call_id: 'call-4',
+        args: '{"subagent_type": "research_agent", "description": "汇总检索结果并给出结构化结论"}',
+        source: 'main',
+      },
+      state,
+      key,
+    )
     handleEvent(
       {
         type: 'reasoning',
@@ -1368,8 +1773,23 @@ export const useChatStore = defineStore('chat', () => {
       key,
     )
     await sleep(400)
-    handleEvent({ type: 'tool_result', tool_call_id: 'call-4', tool_name: 'task', status: 'done', text: '子 Agent 报告：三条核心结论已生成，建议以 Markdown 输出。', source: 'research_agent' }, state, key)
-    handleEvent({ type: 'tool_end', tool_call_id: 'call-4', status: 'done', source: 'main' }, state, key)
+    handleEvent(
+      {
+        type: 'tool_result',
+        tool_call_id: 'call-4',
+        tool_name: 'task',
+        status: 'done',
+        text: '子 Agent 报告：三条核心结论已生成，建议以 Markdown 输出。',
+        source: 'research_agent',
+      },
+      state,
+      key,
+    )
+    handleEvent(
+      { type: 'tool_end', tool_call_id: 'call-4', status: 'done', source: 'main' },
+      state,
+      key,
+    )
 
     await typeOut(state, '整理完成，共 3 条核心结论。输出前需要确认一件事：')
     handleEvent(
@@ -1424,6 +1844,7 @@ export const useChatStore = defineStore('chat', () => {
     compactionCount,
     isEmpty,
     selectedAgentId,
+    selectedGroupId,
     turnVersion,
     lastTurnThreadId,
     runningThreadIds,
@@ -1431,6 +1852,7 @@ export const useChatStore = defineStore('chat', () => {
     activateThread,
     releaseThread,
     isThreadSending,
+    restoreFlowCard,
     send,
     resume,
     stop,
