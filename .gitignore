@@ -4,16 +4,17 @@
 !.env.example
 
 # Python 环境、缓存和测试产物
+# 注意：目录名规则必须带前导 /，否则会忽略任意层级的同名源码目录
 __pycache__/
 *.py[cod]
 *.pyd
-.venv/
-venv/
-env/
-myagent/
+/.venv/
+/venv/
+/env/
+/myagent/
 .pytest_cache/
 .mypy_cache/
-.ruff_cache/
+/.ruff_cache/
 .coverage
 htmlcov/
 *.egg-info/
@@ -33,8 +34,9 @@ yarn-error.log*
 *.war
 
 # 应用运行状态、临时文件和日志
-runtime/
-logs/
+# 只忽略仓库根目录的运行态目录：src/agent/runtime 是源码，不能被忽略
+/runtime/
+/logs/
 .harness/
 .langgraph_api/
 *.log
