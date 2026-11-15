@@ -27,10 +27,13 @@ AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 MAX_SYSTEM_PROMPT = 20_000
 
 # 默认主 Agent 的角色卡唯一来源是 ``agent/memory/prompts.py``：
-# 新用户、以及从未改过提示词的老用户，看到和使用的都是代码里的「大肥鱼」。
+# 新用户、以及从未改过提示词的老用户，看到和使用的都是代码里的「总管」。
 from agent.memory.prompts import system_prompt as CODE_DEFAULT_AGENT_PROMPT
 
 DEFAULT_SYSTEM_PROMPT = CODE_DEFAULT_AGENT_PROMPT.strip()
+
+# 旧版默认角色卡（「大肥鱼」）的首行标记：用于识别从未改过提示词的老档案。
+LEGACY_FISH_PROMPT_MARKER = "# 大肥鱼"
 
 # 早期版本写入数据库的占位提示词；迁移时替换为代码角色卡。
 LEGACY_DEFAULT_SYSTEM_PROMPT = """你是 Harness 的默认主 Agent，一名可靠的通用任务执行者。
@@ -106,11 +109,14 @@ def normalize_model(raw: Any) -> dict[str, Any]:
 
 
 def _needs_default_prompt_migration(profile: dict[str, Any]) -> bool:
-    """判断默认档案是否仍是旧占位提示词（用户改过则保留）。"""
+    """判断默认档案是否仍是旧占位提示词或旧角色卡（用户改过则保留）。"""
     if not bool(profile.get("is_default")):
         return False
     prompt = str(profile.get("system_prompt") or "").strip()
-    return not prompt or prompt == LEGACY_DEFAULT_SYSTEM_PROMPT.strip()
+    if not prompt or prompt == LEGACY_DEFAULT_SYSTEM_PROMPT.strip():
+        return True
+    # 旧版「大肥鱼」角色卡：仅当档案仍以该角色卡开头时视为从未改动。
+    return prompt.startswith(LEGACY_FISH_PROMPT_MARKER)
 
 
 def _normalize_mcp_ids(raw: Any) -> list[str]:

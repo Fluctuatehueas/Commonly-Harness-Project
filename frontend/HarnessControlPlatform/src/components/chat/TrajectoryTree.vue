@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 会话内的单轮轨迹树：默认执行中展开，结束后自动折叠，只保留本轮耗时
-import { computed, ref, watch } from 'vue'
+// 会话内的单轮轨迹树：默认折叠，执行中也需用户手动展开
+import { computed, ref } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { ChatMsg } from '@/stores/chat'
 import TrajectoryNode from './TrajectoryNode.vue'
@@ -12,14 +12,8 @@ const props = defineProps<{
   durationMs?: number
 }>()
 
-// 执行中默认全部展开，对话结束后自动折叠。
-const expanded = ref(props.live)
-watch(
-  () => props.live,
-  (value) => {
-    expanded.value = value
-  },
-)
+// 所有轨迹默认不展开：执行中不自动展开，也不随对话结束自动折叠。
+const expanded = ref(false)
 
 const nodes = computed<TreeNode[]>(() => {
   const all: TreeNode[] = props.items.map((msg) => ({ msg, children: [] }))

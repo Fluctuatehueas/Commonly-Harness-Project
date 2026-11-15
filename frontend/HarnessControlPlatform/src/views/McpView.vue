@@ -17,6 +17,7 @@ import {
 } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
 import HoverDetailCard from '@/components/console/HoverDetailCard.vue'
+import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import {
   deleteMcpServer,
   fetchMcpConfig,
@@ -1235,25 +1236,38 @@ onBeforeUnmount(() => {
                     {{ check.available ? (check.satisfied ? '满足' : `需要 ${check.min_version}+`) : '缺失' }}
                   </span>
                   <a :href="check.download" target="_blank" rel="noreferrer">下载</a>
-                  <el-popover placement="left" trigger="click" :width="320">
-                    <template #reference>
-                      <el-button text circle size="small" title="这个下载是什么？">
-                        <el-icon><InfoFilled /></el-icon>
-                      </el-button>
+                  <el-tooltip
+                    placement="left"
+                    :show-after="120"
+                    popper-class="holo-tooltip"
+                    effect="dark"
+                  >
+                    <template #content>
+                      <div class="holo-tipcard" style="width: 300px">
+                        <span class="holo-tipcard-corner tl"></span>
+                        <span class="holo-tipcard-corner tr"></span>
+                        <span class="holo-tipcard-corner bl"></span>
+                        <span class="holo-tipcard-corner br"></span>
+                        <header class="holo-tipcard-head">
+                          <span class="holo-tipcard-scan"></span>
+                          <strong>下载的是什么</strong>
+                          <code>ENV // PACKAGE</code>
+                        </header>
+                        <p class="holo-tipcard-body">
+                          这是 {{ check.download_target || '该运行环境的官方安装包' }}，不是这个 MCP
+                          的工具或资源。工具、提示词与资源会在服务连通后由服务自己上报，不需要在这里下载。建议：{{
+                            check.advice ||
+                            (check.satisfied ? '当前已满足，不建议重复安装。' : '当前未满足，建议按链接安装。')
+                          }}
+                        </p>
+                        <footer class="holo-tipcard-foot">
+                          <span>HOLOGRAPHIC DRAWER BRIEF</span>
+                          <span>悬停查看说明</span>
+                        </footer>
+                      </div>
                     </template>
-                    <div class="pf-info-pop">
-                      <p>
-                        <strong>下载的是什么</strong>
-                        这是 {{ check.download_target || '该运行环境的官方安装包' }}，
-                        不是这个 MCP 的工具或资源。工具、提示词与资源会在服务连通后由
-                        服务自己上报，不需要在这里下载。
-                      </p>
-                      <p>
-                        <strong>建议不建议</strong>
-                        {{ check.advice || (check.satisfied ? '当前已满足，不建议重复安装。' : '当前未满足，建议按链接安装。') }}
-                      </p>
-                    </div>
-                  </el-popover>
+                    <el-icon class="info-icon"><InfoFilled /></el-icon>
+                  </el-tooltip>
                 </li>
               </ul>
               <p v-if="server.cache_dir" class="pf-text pf-cache">
@@ -2279,23 +2293,16 @@ onBeforeUnmount(() => {
   word-break: break-all;
 }
 
-/* el-popover 内的说明文本 */
-.pf-info-pop p {
-  margin: 0;
-  font-size: 10.5px;
-  line-height: 1.65;
-  color: var(--text-2);
+/* 说明图标：与 FilePanel 一致的全息 Tooltip 触发元素 */
+.info-icon {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: help;
+  transition: color 0.15s ease;
 }
 
-.pf-info-pop p + p {
-  margin-top: 5px;
-}
-
-.pf-info-pop strong {
-  display: block;
-  margin-bottom: 1px;
-  font-size: 9.5px;
-  font-weight: 600;
+.info-icon:hover {
   color: var(--accent-cyan);
 }
 

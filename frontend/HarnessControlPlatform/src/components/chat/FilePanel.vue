@@ -8,16 +8,18 @@ import {
   Download,
   EditPen,
   FolderOpened,
+  InfoFilled,
   Refresh,
   View,
 } from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
+import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import MarkdownView from './MarkdownView.vue'
+import HtmlPreview from './HtmlPreview.vue'
 import FileTreeNode from './FileTreeNode.vue'
 import { buildGroups, type FileGroup } from './fileTree'
 import { useFileStore, type FileMeta } from '@/stores/files'
 import { absoluteWorkspacePath, revealFile } from '@/api/workspace'
-
 const props = defineProps<{ threadId: string | null; refreshKey?: number }>()
 const emit = defineEmits<{ close: [] }>()
 const files = useFileStore()
@@ -35,6 +37,11 @@ const newCount = computed(
 const isMarkdown = computed(() =>
   /\.(?:md|markdown|mdx)$/i.test(files.current?.path || ''),
 )
+// HTML 预览：sandbox iframe 渲染自包含 HTML（图表 / 报告）
+const isHtml = computed(() =>
+  /\.(?:html?|xhtml)$/i.test(files.current?.path || ''),
+)
+const isPreviewable = computed(() => isMarkdown.value || isHtml.value)
 const previewMode = ref(false)
 
 watch(
@@ -46,12 +53,28 @@ watch(
   { immediate: true },
 )
 
+// 消息泡「在右侧打开」：组件挂载后立即消费一次性定位请求
+watch(
+  () => files.requested,
+  (req) => {
+    if (!req) return
+    files.clearRequested()
+    if (!props.threadId) return
+    void files.open(props.threadId, req.path, req.origin)
+  },
+  { immediate: true },
+)
+
 watch(
   () => files.current?.path,
   (path) => {
-    previewMode.value = /\.(?:md|markdown|mdx)$/i.test(path || '')
+    previewMode.value = /\.(?:md|markdown|mdx|html?|xhtml)$/i.test(path || '')
   },
 )
+
+function openInlineFile(file: { path: string; origin: 'project' | 'sandbox' }) {
+  if (props.threadId) void files.open(props.threadId, file.path, file.origin)
+}
 
 function reload() {
   if (props.threadId) void files.list(props.threadId)
@@ -170,9 +193,23 @@ onBeforeUnmount(stopResize)
 
     <div v-if="!files.current" v-loading="files.loading" class="fp-list">
       <p class="fp-hint">
-        {{ files.projectId
-          ? '项目会话同时展示本机项目目录与沙箱工作目录：本机文件可在资源管理器定位，沙箱文件可下载。'
-          : '自由会话的 AI 产物保留在沙箱内，可在这里预览与下载。' }}
+        <span class="fp-hint-text">
+          {{
+            files.projectId
+              ? '项目会话同时展示本机项目目录与沙箱工作目录：本机文件可在资源管理器定位，沙箱文件可下载。'
+              : '自由会话的 AI 产物保留在沙箱内，可在这里预览与下载。'
+          }}
+        </span>
+        <HoloTooltip
+          title="沙箱文件生命周期"
+          code="SANDBOX // LIFECYCLE"
+          content="沙箱内的文件会随沙箱销毁而销毁，如有重要产出物请及时下载。"
+          footer="悬停查看说明"
+          placement="top"
+          :width="280"
+        >
+          <el-icon class="info-icon"><InfoFilled /></el-icon>
+        </HoloTooltip>
       </p>
 
       <el-empty
@@ -202,7 +239,7 @@ onBeforeUnmount(stopResize)
       </section>
     </div>
 
-    <template v-else>
+    <template v-else-if="files.current">
       <div class="fp-editor-head">
         <code class="f-path">{{ files.current.path }}</code>
         <div class="fp-actions">
@@ -213,7 +250,7 @@ onBeforeUnmount(stopResize)
             列表
           </el-button>
           <el-button
-            v-if="isMarkdown"
+            v-if="isPreviewable"
             class="mini"
             :icon="previewMode ? EditPen : View"
             size="small"
@@ -232,7 +269,10 @@ onBeforeUnmount(stopResize)
         </div>
       </div>
       <div v-if="previewMode && isMarkdown" class="fp-preview">
-        <MarkdownView :content="files.current.content" />
+        <MarkdownView :content="files.current.content" @open-file="openInlineFile" />
+      </div>
+      <div v-else-if="previewMode && isHtml" class="fp-preview fp-preview-html">
+        <HtmlPreview :content="files.current.content" />
       </div>
       <pre v-else class="fp-text">{{ files.current.content }}</pre>
     </template>
@@ -333,10 +373,31 @@ onBeforeUnmount(stopResize)
 }
 
 .fp-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
   margin: 2px 6px 4px;
   font-size: 10.5px;
   line-height: 1.6;
   color: var(--text-3);
+}
+
+.fp-hint-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.info-icon {
+  flex: none;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: help;
+  transition: color 0.15s ease;
+}
+
+.info-icon:hover {
+  color: var(--accent-cyan);
 }
 
 .file-group {
@@ -458,6 +519,13 @@ onBeforeUnmount(stopResize)
   min-height: 0;
   overflow-y: auto;
   padding: 14px 16px 24px;
+}
+
+/* HTML 预览占满整个抽屉，不由外层滚动 */
+.fp-preview-html {
+  display: flex;
+  padding: 0;
+  overflow: hidden;
 }
 
 @media (max-width: 1100px) {

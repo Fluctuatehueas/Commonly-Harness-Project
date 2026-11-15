@@ -4,19 +4,25 @@
 withDefaults(
   defineProps<{
     title: string
-    content: string
+    content?: string
     code?: string
     footer?: string
     placement?: 'top' | 'bottom' | 'left' | 'right'
     width?: number
   }>(),
   {
+    content: '',
     code: '',
     footer: '',
     placement: 'top',
     width: 300,
   },
 )
+
+defineSlots<{
+  default?: () => unknown
+  tip?: () => unknown
+}>()
 </script>
 
 <template>
@@ -32,7 +38,9 @@ withDefaults(
           <strong>{{ title }}</strong>
           <code v-if="code">{{ code }}</code>
         </header>
-        <p class="holo-tipcard-body">{{ content }}</p>
+        <p class="holo-tipcard-body">
+          <slot name="tip">{{ content }}</slot>
+        </p>
         <footer v-if="footer" class="holo-tipcard-foot">
           <span>HOLOGRAPHIC DRAWER BRIEF</span>
           <span>{{ footer }}</span>

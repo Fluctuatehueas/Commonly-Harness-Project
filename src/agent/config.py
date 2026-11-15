@@ -46,6 +46,15 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL")
 DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")  # 默认值为 deepseek-v4-flash
 # 模型思考/推理模式开关：true/1/yes/on 视为开启，默认关闭。
 MODEL_THINKING_ENABLED = os.getenv("HARNESS_MODEL_THINKING", "").lower() in {"1", "true", "yes", "on"}
+# 主模型是否支持图片输入。langchain_deepseek 自带的静态 ModelProfile 对较新模型
+# 可能标记为 image_inputs=False，deepagents 会据此把 HumanMessage 里的 image_url
+# 块替换成占位文本，导致模型只能看到文件名。这里显式声明能力覆盖静态档案。
+MODEL_IMAGE_INPUTS = os.getenv("HARNESS_MODEL_IMAGE_INPUTS", "true").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
 
 # ------------------------------------------------------------
 # 模型客户端限流与重试
@@ -211,6 +220,10 @@ def build_model(
     if role == "summary":
         kwargs["temperature"] = 0.3
     client = ChatDeepSeek(**kwargs)
+    if MODEL_IMAGE_INPUTS:
+        # 覆盖静态档案里的 image_inputs=False，否则 deepagents 的 Filesystem 中间件
+        # 会把图片块替换为 “[... does not support image content ...]” 占位文本。
+        client.profile = {**(client.profile or {}), "image_inputs": True}
     _MODEL_CACHE[key] = client
     return client
 
@@ -283,7 +296,7 @@ def reload_model_config() -> None:
     已缓存的 Agent 图仍持有旧模型引用，需同时调用 AgentLoader.reset_agents()。
     """
     global DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL_NAME
-    global MODEL_THINKING_ENABLED, WEB_SEARCH_ENABLED, MODEL_CONTEXT_LIMIT
+    global MODEL_THINKING_ENABLED, MODEL_IMAGE_INPUTS, WEB_SEARCH_ENABLED, MODEL_CONTEXT_LIMIT
     global VISION_MODEL_NAME, VISION_BASE_URL, VISION_API_KEY
     global _MODEL_RATE_LIMITER
     global CONTEXT_COMPACT_ENABLED, CONTEXT_COMPACT_TRIGGER, CONTEXT_COMPACT_HARD
@@ -300,6 +313,12 @@ def reload_model_config() -> None:
     DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL")
     DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
     MODEL_THINKING_ENABLED = os.getenv("HARNESS_MODEL_THINKING", "").lower() in {"1", "true", "yes", "on"}
+    MODEL_IMAGE_INPUTS = os.getenv("HARNESS_MODEL_IMAGE_INPUTS", "true").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
     MODEL_CONTEXT_LIMIT = int(os.getenv("HARNESS_MODEL_CONTEXT_LIMIT", "128000"))
     WEB_SEARCH_ENABLED = os.getenv("HARNESS_WEB_SEARCH", "true").strip().lower() not in {
         "0",

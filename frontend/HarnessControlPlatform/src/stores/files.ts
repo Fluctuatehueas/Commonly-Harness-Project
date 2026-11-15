@@ -26,6 +26,61 @@ function fileKey(file: FileMeta): string {
   return `${file.origin}:${file.path}`
 }
 
+// 临时文件 / 构建缓存 / 依赖目录：不计入「本轮产出」
+const TEMP_DIRS = new Set([
+  '__pycache__',
+  'node_modules',
+  'venv',
+  'env',
+  'dist',
+  'build',
+  'coverage',
+  'target',
+  '.tox',
+  '.eggs',
+  '.gradle',
+  '.mvn',
+  '.husky',
+])
+const TEMP_EXTS = new Set([
+  '.pyc',
+  '.pyo',
+  '.log',
+  '.tmp',
+  '.temp',
+  '.cache',
+  '.swp',
+  '.swo',
+  '.map',
+  '.lock',
+  '.part',
+  '.crdownload',
+  '.class',
+  '.o',
+  '.obj',
+  '.pdb',
+  '.ilk',
+  '.exp',
+  '.tsbuildinfo',
+])
+const TEMP_FILES = new Set(['.ds_store', 'thumbs.db', 'desktop.ini'])
+
+/** 过滤临时文件与缓存产物，只保留对用户有价值的文件。 */
+export function isUsefulArtifact(file: FileMeta): boolean {
+  const parts = file.path.split('/').filter(Boolean)
+  if (!parts.length) return false
+  const dirs = parts.slice(0, -1)
+  // 点开头目录（.git/.venv/.commonharness 等）与已知构建目录一律排除
+  if (dirs.some((dir) => dir.startsWith('.') || TEMP_DIRS.has(dir.toLowerCase()))) {
+    return false
+  }
+  const name = parts[parts.length - 1]!
+  const lower = name.toLowerCase()
+  if (lower.startsWith('.') || TEMP_FILES.has(lower)) return false
+  const dot = lower.lastIndexOf('.')
+  return !(dot > 0 && TEMP_EXTS.has(lower.slice(dot)))
+}
+
 export const useFileStore = defineStore('files', () => {
   const files = ref<FileMeta[]>([])
   const source = ref('')
@@ -35,8 +90,12 @@ export const useFileStore = defineStore('files', () => {
   const loading = ref(false)
   const current = ref<{ path: string; content: string; origin: FileOrigin } | null>(null)
   const error = ref('')
+  // 外部请求定位文件（消息泡里点「在右侧打开」）：nonce 保证同一文件可重复触发
+  const requested = ref<{ path: string; origin: FileOrigin; nonce: number } | null>(null)
   // threadId -> 本轮新增文件 key（origin:path）。每轮结束后整体替换。
   const newKeys = ref<Record<string, Set<string>>>({})
+  // threadId -> 本轮有用产出清单。每轮结束后整体替换，只保留最新一轮。
+  const artifacts = ref<Record<string, FileMeta[]>>({})
 
   let activeThread: string | null = null
   // 上一轮结束时的文件快照；用于判断“本轮新增”。
@@ -115,6 +174,8 @@ export const useFileStore = defineStore('files', () => {
     try {
       const payload = await fetchList(threadId)
       const currentKeys = new Set((payload.files || []).map(fileKey))
+      // 没有基线时无法判断哪些是本轮新增，此时不产出文件卡片，避免把整目录当成产出
+      const hadBaseline = Boolean(baselineByThread[threadId])
       const previous = baselineByThread[threadId] ?? new Set<string>()
       const nextNew = new Set<string>()
       for (const key of currentKeys) {
@@ -122,10 +183,24 @@ export const useFileStore = defineStore('files', () => {
       }
       baselineByThread[threadId] = currentKeys
       newKeys.value = { ...newKeys.value, [threadId]: nextNew }
+      artifacts.value = {
+        ...artifacts.value,
+        [threadId]: hadBaseline
+          ? (payload.files || []).filter(
+              (file) => nextNew.has(fileKey(file)) && isUsefulArtifact(file),
+            )
+          : [],
+      }
       if (activeThread === threadId) apply(payload)
     } catch {
-      // 文件刷新失败不影响对话主流程
+      // 文件刷新失败不影响对话主流程；清空本轮产出，避免展示上一轮旧卡片
+      artifacts.value = { ...artifacts.value, [threadId]: [] }
     }
+  }
+
+  /** 当前会话最近一轮的有用产出。 */
+  function artifactsFor(threadId: string | null): FileMeta[] {
+    return threadId ? artifacts.value[threadId] || [] : []
   }
 
   function isNew(threadId: string | null, file: FileMeta): boolean {
@@ -142,23 +217,30 @@ export const useFileStore = defineStore('files', () => {
       delete next[threadId]
       newKeys.value = next
     }
+    if (threadId in artifacts.value) {
+      const next = { ...artifacts.value }
+      delete next[threadId]
+      artifacts.value = next
+    }
   }
 
   async function open(threadId: string, path: string, origin: FileOrigin = 'sandbox') {
     error.value = ''
     try {
-      const res = await fetch(
-        `${API_BASE}/threads/${threadId}/files/content?user_id=${encodeURIComponent(USER_ID)}&path=${encodeURIComponent(path)}&source=${origin}`,
-      )
-      if (!res.ok) {
-        const detail = (await res.json().catch(() => ({})) as { detail?: string }).detail
-        throw new Error(detail || String(res.status))
-      }
-      const data = await res.json()
-      current.value = { path: data.path, content: data.content, origin }
+      const content = await fetchFileContent(threadId, path, origin)
+      current.value = { path, content, origin }
     } catch (err) {
       error.value = (err as Error).message
     }
+  }
+
+  /** 消息泡等外部入口请求抽屉定位到指定文件。 */
+  function requestOpen(path: string, origin: FileOrigin = 'sandbox') {
+    requested.value = { path, origin, nonce: Date.now() }
+  }
+
+  function clearRequested() {
+    requested.value = null
   }
 
   async function download(threadId: string, path: string, origin: FileOrigin = 'sandbox') {
@@ -190,17 +272,39 @@ export const useFileStore = defineStore('files', () => {
     loading,
     current,
     error,
+    requested,
     newKeys,
+    artifacts,
     list,
     prime,
     markRound,
     isNew,
+    artifactsFor,
     forget,
     open,
+    requestOpen,
+    clearRequested,
     download,
     closePreview,
   }
 })
+
+/** 直接读取会话文件文本，不改变抽屉当前选中文件。 */
+export async function fetchFileContent(
+  threadId: string,
+  path: string,
+  origin: FileOrigin = 'sandbox',
+): Promise<string> {
+  const res = await fetch(
+    `${API_BASE}/threads/${threadId}/files/content?user_id=${encodeURIComponent(USER_ID)}&path=${encodeURIComponent(path)}&source=${origin}`,
+  )
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => ({})) as { detail?: string }).detail
+    throw new Error(detail || String(res.status))
+  }
+  const data = (await res.json()) as { content?: string }
+  return String(data.content ?? '')
+}
 
 export function saveBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob)

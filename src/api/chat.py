@@ -955,7 +955,7 @@ async def _prepare_retry(
     会话一律拒绝，避免重复执行写操作或丢弃后续轮次。
     """
     agent_id = await _resolve_agent_id(user_id, thread_id)  # noqa: F841
-    group_id = await _resolve_group_id(user_id, thread_id, None, agent_id)
+    group_id = await _resolve_group_id(user_id, thread_id, None)
     agent = await agent_loader.get_agent_for_user(
         user_id=user_id,
         username=username,
@@ -1079,7 +1079,7 @@ async def _prepare_withdraw(
 ) -> tuple[Any, WithdrawPlan]:
     """定位「最新用户消息之前」的检查点，并校验可以撤回。"""
     agent_id = await _resolve_agent_id(user_id, thread_id)
-    group_id = await _resolve_group_id(user_id, thread_id, None, agent_id)
+    group_id = await _resolve_group_id(user_id, thread_id, None)
     agent = await agent_loader.get_agent_for_user(
         user_id=user_id,
         username=username,

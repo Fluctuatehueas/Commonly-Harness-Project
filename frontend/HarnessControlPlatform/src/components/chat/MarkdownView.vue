@@ -1,13 +1,14 @@
 <script setup lang="ts">
 // Markdown 渲染：marked 解析 + DOMPurify 消毒
 // 代码块额外带语言标签与一键复制按钮（头部，位于代码上方）
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, render, watch } from 'vue'
 import { marked, Renderer, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
 import { API_BASE } from '@/api/client'
 import { currentUserId } from '@/api/identity'
-import { saveBlob } from '@/stores/files'
+import { fetchFileContent, saveBlob, type FileOrigin } from '@/stores/files'
 import MediaViewer from './MediaViewer.vue'
+import HtmlPreview from './HtmlPreview.vue'
 import type { MediaKind } from './mediaTypes'
 import { normalizeChartOption } from './chartOption'
 
@@ -17,6 +18,11 @@ const props = defineProps<{
   threadId?: string | null
   /** 流式输出中先不渲染图表，避免半截 Mermaid / JSON 反复报错 */
   streaming?: boolean
+}>()
+
+// 气泡里的文件卡片点击「在右侧打开」时交给上层处理
+const emit = defineEmits<{
+  'open-file': [file: { path: string; origin: FileOrigin }]
 }>()
 
 const container = ref<HTMLElement | null>(null)
@@ -123,18 +129,25 @@ interface LocalImage {
   origin: 'project' | 'sandbox'
 }
 
+/** 识别 `sandbox:/path` / `project:/path` 显式协议的会话文件引用。 */
+function resolveSessionProtocol(raw: string): LocalImage | null {
+  const protocol = /^(sandbox|project):(.*)$/i.exec((raw || '').trim())
+  if (!protocol) return null
+  const origin = protocol[1]!.toLowerCase() as 'project' | 'sandbox'
+  let rest = (protocol[2] || '/').trim() || '/'
+  rest = rest.replace(/^\.\//, '')
+  if (!rest.startsWith('/')) rest = `/${rest}`
+  return { path: rest, origin }
+}
+
 function resolveLocalImage(raw: string): LocalImage | null {
   if (!props.threadId) return null
   let value = (raw || '').trim()
   if (!value) return null
   if (/^(https?:|data:|blob:)/i.test(value)) return null
   // 明确协议：![图](sandbox:/chart.png) / ![图](project:/report/chart.png)
-  const protocol = /^(sandbox|project):(.*)$/i.exec(value)
-  if (protocol) {
-    const origin = protocol[1]!.toLowerCase() as 'project' | 'sandbox'
-    const rest = (protocol[2] || '/').trim() || '/'
-    return { path: rest.startsWith('/') ? rest : `/${rest}`, origin }
-  }
+  const protocol = resolveSessionProtocol(value)
+  if (protocol) return protocol
   if (value.startsWith('file://')) {
     try {
       value = decodeURIComponent(value.replace(/^file:\/\//, ''))
@@ -181,8 +194,40 @@ renderer.image = (token: Tokens.Image) => {
   )
 }
 
+const FILE_ICON =
+  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>'
+
+const HTML_FILE = /\.(?:html?|xhtml)$/i
+
+/** 会话文件卡片：AI 用 `[名称](sandbox:/x.html)` 引用产物时渲染。 */
+function renderFileCard(file: LocalImage, label?: string) {
+  const name =
+    file.path.split('/').filter(Boolean).pop() || (label || '').trim() || 'file'
+  const preview = HTML_FILE.test(file.path)
+    ? '<button type="button" class="md-file-action" data-file-action="preview">预览</button>'
+    : ''
+  return (
+    `<span class="md-file-card" data-file-path="${escapeHtml(file.path)}" data-file-origin="${file.origin}">` +
+    `<span class="md-file-head">` +
+    `<span class="md-file-icon">${FILE_ICON}</span>` +
+    `<span class="md-file-name">${escapeHtml(name)}</span>` +
+    `<span class="md-file-origin">${file.origin === 'sandbox' ? '沙箱' : '本机'}</span>` +
+    `<span class="md-file-actions">${preview}` +
+    `<button type="button" class="md-file-action primary" data-file-action="drawer">在右侧打开</button>` +
+    `</span>` +
+    `</span>` +
+    `<span class="md-file-preview"></span>` +
+    `</span>`
+  )
+}
+
 // 链接统一带 target=_blank；点击事件里再交给桌面壳或浏览器新开窗口。
 renderer.link = function (this: Renderer, token: Tokens.Link) {
+  // sandbox: / project: 协议优先当会话文件处理，不离开应用
+  const local = resolveSessionProtocol(token.href || '')
+  if (local) return renderFileCard(local, token.text)
   const url = safeExternalHref(token.href)
   if (!url) return escapeHtml(token.text)
   const label =
@@ -378,6 +423,8 @@ function resizeCharts() {
 watch(
   () => [html.value, props.streaming] as const,
   () => {
+    // v-html 会重建整个 DOM，先卸载内嵌预览组件再重新渲染
+    disposeInlinePreviews()
     void nextTick(() => void renderVisuals())
   },
 )
@@ -389,6 +436,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   vizRun += 1
+  disposeInlinePreviews()
   window.removeEventListener('resize', resizeCharts)
   disposeCharts()
 })
@@ -461,8 +509,69 @@ async function downloadImage(block: HTMLElement) {
   }
 }
 
+// ---------- 气泡内嵌 HTML 预览 ----------
+// 卡片与 Vue 组件实例一一对应；v-html 重建时必须显式卸载，否则会泄漏。
+const inlinePreviews = new Map<HTMLElement, () => void>()
+
+function disposeInlinePreviews() {
+  for (const dispose of inlinePreviews.values()) {
+    try {
+      dispose()
+    } catch {
+      /* ignore */
+    }
+  }
+  inlinePreviews.clear()
+}
+
+async function toggleInlinePreview(card: HTMLElement, path: string, origin: FileOrigin) {
+  const slot = card.querySelector<HTMLElement>('.md-file-preview')
+  if (!slot) return
+  const existing = inlinePreviews.get(card)
+  if (existing) {
+    existing()
+    inlinePreviews.delete(card)
+    card.classList.remove('previewing')
+    slot.innerHTML = ''
+    return
+  }
+  if (!props.threadId) return
+  const trigger = card.querySelector<HTMLButtonElement>('[data-file-action="preview"]')
+  if (trigger) {
+    trigger.disabled = true
+    trigger.textContent = '加载中'
+  }
+  try {
+    const content = await fetchFileContent(props.threadId, path, origin)
+    render(h(HtmlPreview, { content, height: '420px' }), slot)
+    inlinePreviews.set(card, () => render(null, slot))
+    card.classList.add('previewing')
+  } catch (err) {
+    slot.textContent = `预览失败：${(err as Error).message}`
+    slot.classList.add('error')
+  } finally {
+    if (trigger) {
+      trigger.disabled = false
+      trigger.textContent = '预览'
+    }
+  }
+}
+
 async function onBodyClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null
+
+  // 会话文件卡片：预览 / 在右侧打开
+  const fileAction = target?.closest('[data-file-action]') as HTMLElement | null
+  if (fileAction) {
+    const card = fileAction.closest('.md-file-card') as HTMLElement | null
+    if (card) {
+      const path = card.dataset.filePath || ''
+      const origin = (card.dataset.fileOrigin as FileOrigin) || 'sandbox'
+      if (fileAction.dataset.fileAction === 'drawer') emit('open-file', { path, origin })
+      else await toggleInlinePreview(card, path, origin)
+    }
+    return
+  }
 
   // 图表 Header：查看大图 / 全屏
   const vizAction = target?.closest('.viz-action') as HTMLElement | null
@@ -597,6 +706,106 @@ async function onBodyClick(event: MouseEvent) {
   border: 1px solid rgba(53, 224, 255, 0.18);
   border-radius: 5px;
   background: rgba(6, 18, 36, 0.8);
+}
+
+/* ---------- 会话文件卡片 ---------- */
+.markdown-body :deep(.md-file-card) {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(6, 18, 36, 0.72);
+}
+
+.markdown-body :deep(.md-file-head) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.markdown-body :deep(.md-file-icon) {
+  display: inline-flex;
+  flex: none;
+  color: var(--accent-cyan);
+}
+
+.markdown-body :deep(.md-file-name) {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-1);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.markdown-body :deep(.md-file-origin) {
+  flex: none;
+  padding: 1px 7px;
+  font-size: 9.5px;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.markdown-body :deep(.md-file-actions) {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+.markdown-body :deep(.md-file-action) {
+  padding: 3px 9px;
+  font-size: 11px;
+  color: var(--text-2);
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+}
+
+.markdown-body :deep(.md-file-action:hover:not(:disabled)) {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+
+.markdown-body :deep(.md-file-action.primary) {
+  color: var(--accent-cyan);
+  border-color: rgba(53, 224, 255, 0.35);
+  background: rgba(53, 224, 255, 0.08);
+}
+
+.markdown-body :deep(.md-file-action:disabled) {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.markdown-body :deep(.md-file-preview) {
+  display: none;
+  overflow: hidden;
+  border-radius: 7px;
+}
+
+.markdown-body :deep(.md-file-card.previewing .md-file-preview) {
+  display: block;
+  height: 420px;
+  border: 1px solid var(--line);
+  background: #0b1220;
+}
+
+.markdown-body :deep(.md-file-preview.error) {
+  display: block;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: var(--amber);
+  border: 1px solid rgba(255, 182, 72, 0.3);
+  border-radius: 7px;
+  background: rgba(255, 182, 72, 0.05);
 }
 
 /* ---------- 代码块：语言标签 + 复制（顶部） ---------- */

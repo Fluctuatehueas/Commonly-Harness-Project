@@ -9,6 +9,7 @@ import {
   Close,
   CopyDocument,
   Document,
+  Flag,
   Link,
   Paperclip,
   Picture,
@@ -24,6 +25,7 @@ import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
+import ProducedFilesCard from '@/components/chat/ProducedFilesCard.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
 import {
   TRAJECTORY_REGISTRY,
@@ -55,6 +57,7 @@ import { useDisplayStore } from '@/stores/display'
 import { useFileStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
 import { useAgentStore } from '@/stores/agents'
+import { avatarGradient, avatarInitial } from '@/components/myagent/avatar'
 import { fetchSandboxStatus, fetchFeedbackSettings } from '@/api/settings'
 import { withdrawLatestMessage, fetchSessionUsage, type SessionUsage } from '@/api/chat'
 
@@ -69,14 +72,32 @@ const agents = useAgentStore()
 const trajectoryRegistry: TrajectoryRegistry = new Map()
 provide(TRAJECTORY_REGISTRY, trajectoryRegistry)
 
+// Agent 下拉项：补上头像与所属组的组标（队长组带小旗帜）。
+// 组信息以 /agent-groups 为准，/agents 列表不返回组籍。
+const agentOptions = computed(() =>
+  agents.options.map((opt) => ({
+    ...opt,
+    avatar: agents.byId(opt.value)?.avatar || '',
+    groups: agents.groupsOf(opt.value).map((group) => ({
+      group_id: group.group_id,
+      name: group.name,
+      role: group.leader_agent_id === opt.value ? ('leader' as const) : ('member' as const),
+    })),
+  })),
+)
+
 // 当前 Agent 可用的组；只有组长组能作为会话入口（组员由组长委派）。
 const groupOptions = computed(() =>
-  agents
-    .groupsOf(chat.selectedAgentId)
-    .map((group) => ({
+  agents.groupsOf(chat.selectedAgentId).map((group) => {
+    const isLeader = group.leader_agent_id === chat.selectedAgentId
+    return {
       value: group.group_id,
-      label: `${group.name}${group.leader_agent_id === chat.selectedAgentId ? ' · 组长' : ' · 组员'}`,
-    })),
+      name: group.name,
+      role: isLeader ? '组长' : '组员',
+      isLeader,
+      label: `${group.name}${isLeader ? ' · 组长' : ' · 组员'}`,
+    }
+  }),
 )
 
 // 换 Agent 后只清理失效的组选择；不自动选组，新会话默认以独立 Agent 执行。
@@ -117,6 +138,15 @@ const draft = ref('')
 const scroller = ref<HTMLElement | null>(null)
 const inputEl = ref<InputInstance | null>(null)
 const showFiles = ref(false)
+
+/** 消息泡文件卡片入口：打开右侧抽屉并定位到该文件 */
+function openSessionFile(file: { path: string; origin: 'project' | 'sandbox' }) {
+  files.requestOpen(file.path, file.origin)
+  showFiles.value = true
+}
+
+/** 当前会话最近一轮的有用产出，只渲染在最后一条回答下方 */
+const turnArtifacts = computed(() => files.artifactsFor(chat.threadId))
 const fileRefreshKey = ref(0)
 // null=检测中 true=在线 false=离线（离线时提示后端不可达）
 const backendOnline = ref<boolean | null>(null)
@@ -708,6 +738,20 @@ function forgetSession(threadId: string) {
 }
 
 async function removeSession(threadId: string) {
+  const title = sessions.sessions.find((item) => item.thread_id === threadId)?.title
+  try {
+    await ElMessageBox.confirm(
+      `删除后，「${title || '该会话'}」的消息记录、轨迹与文件关联将一并移除，且无法恢复。`,
+      '删除这个会话？',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
   forgetSession(threadId)
   await sessions.removeSession(threadId)
 }
@@ -1657,13 +1701,43 @@ async function submit() {
               :disabled="archivedActive"
             >
               <el-option
-                v-for="opt in agents.options"
+                v-for="opt in agentOptions"
                 :key="opt.value"
                 :label="opt.label"
                 :value="opt.value"
               >
-                <span>{{ opt.label }}</span>
-                <small class="agent-option-role">{{ opt.role }}</small>
+                <div class="agent-option">
+                  <span
+                    class="agent-option-avatar"
+                    :style="{ background: avatarGradient(opt.value) }"
+                  >
+                    {{ avatarInitial(opt.label, opt.avatar) }}
+                  </span>
+                  <span class="agent-option-main">
+                    <strong>{{ opt.label }}</strong>
+                    <small>{{ opt.role }}</small>
+                  </span>
+                  <span v-if="opt.groups.length" class="agent-option-groups">
+                    <HoloTooltip
+                      v-for="group in opt.groups"
+                      :key="group.group_id"
+                      :title="group.name"
+                      :content="`角色：${group.role === 'leader' ? '组长' : '组员'}`"
+                      placement="left"
+                      :width="200"
+                    >
+                      <span
+                        class="group-badge"
+                        :style="{ background: avatarGradient(group.group_id) }"
+                      >
+                        {{ avatarInitial(group.name) }}
+                        <i v-if="group.role === 'leader'" class="group-badge-flag">
+                          <el-icon><Flag /></el-icon>
+                        </i>
+                      </span>
+                    </HoloTooltip>
+                  </span>
+                </div>
               </el-option>
             </el-select>
             <el-select
@@ -1675,13 +1749,44 @@ async function submit() {
               placeholder="独立执行（不使用组）"
               :disabled="archivedActive"
             >
-              <el-option label="独立执行（不使用组）" value="" />
+              <el-option label="独立执行（不使用组）" value="">
+                <div class="agent-option">
+                  <span class="agent-option-avatar agent-option-avatar--none">—</span>
+                  <span class="agent-option-main">
+                    <strong>独立执行</strong>
+                    <small>不使用组</small>
+                  </span>
+                </div>
+              </el-option>
               <el-option
                 v-for="opt in groupOptions"
                 :key="opt.value"
                 :label="opt.label"
                 :value="opt.value"
-              />
+              >
+                <div class="agent-option">
+                  <HoloTooltip
+                    :title="opt.name"
+                    :content="`角色：${opt.role}`"
+                    placement="left"
+                    :width="200"
+                  >
+                    <span
+                      class="group-badge group-badge--lg"
+                      :style="{ background: avatarGradient(opt.value) }"
+                    >
+                      {{ avatarInitial(opt.name) }}
+                      <i v-if="opt.isLeader" class="group-badge-flag">
+                        <el-icon><Flag /></el-icon>
+                      </i>
+                    </span>
+                  </HoloTooltip>
+                  <span class="agent-option-main">
+                    <strong>{{ opt.name }}</strong>
+                    <small>{{ opt.role }}</small>
+                  </span>
+                </div>
+              </el-option>
             </el-select>
             <span v-if="archivedActive" class="chip archived-chip">归档只读</span>
             <span v-if="chat.threadId" class="chip">thread {{ chat.threadId.slice(0, 8) }}…</span>
@@ -1886,9 +1991,20 @@ async function submit() {
                       :content="turn.final.content"
                       :thread-id="chat.threadId"
                       :streaming="Boolean(turn.final.streaming)"
+                      @open-file="openSessionFile"
                     />
                     <span v-if="turn.final.streaming" class="cursor"></span>
                   </div>
+                  <!-- 本轮产出：只渲染在最新一轮回答下方 -->
+                  <ProducedFilesCard
+                    v-if="
+                      turnIndex === turns.length - 1 &&
+                      !turn.final.streaming &&
+                      turnArtifacts.length
+                    "
+                    :files="turnArtifacts"
+                    @open-file="openSessionFile"
+                  />
                   <div v-if="turn.final.content && !turn.final.streaming" class="msg-meta ai">
                     <span
                       v-if="clockOf(turn.final.at)"
@@ -2487,10 +2603,98 @@ async function submit() {
   background: rgba(24, 15, 44, 0.98);
 }
 
-.agent-option-role {
-  margin-left: 8px;
+/* Agent / 组下拉项：头像 + 名称 + 所属组组标（队长组右下角带小旗帜） */
+.agent-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  line-height: 1.2;
+}
+
+.agent-option-avatar {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: #041018;
+  border-radius: 50%;
+}
+
+.agent-option-avatar--none {
+  color: var(--text-3);
+  background: transparent;
+  border: 1px dashed var(--line);
+}
+
+.agent-option-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.agent-option-main strong {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-option-main small {
+  flex: none;
   font-size: 10px;
   color: var(--text-3);
+}
+
+.agent-option-groups {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.group-badge {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: #041018;
+  border-radius: 6px;
+}
+
+.group-badge--lg {
+  width: 32px;
+  height: 32px;
+  font-size: 12px;
+  border-radius: 7px;
+}
+
+.group-badge-flag {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  display: grid;
+  place-items: center;
+  width: 11px;
+  height: 11px;
+  font-size: 7px;
+  font-style: normal;
+  color: #f6c85f;
+  border-radius: 50%;
+  background: #0b1622;
 }
 
 /* Element Plus 给相邻按钮默认加重叠边距，这里统一交给 flex gap */
