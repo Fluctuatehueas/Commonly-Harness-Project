@@ -100,7 +100,14 @@ def main() -> None:
     assert "数据分析组" in prompt
     assert "你的角色：组长" in prompt
     assert "agent_b（小李）" in prompt
-    assert prompt.count("（你）") == 1
+    assert "（你自己，不可委派）" in prompt
+    assert "委派优先" in prompt
+    # 组员视角不出现组长的委派入口说明
+    member_view = context.group_context.render(
+        self_agent_id="agent_b", role=GroupRole.MEMBER
+    )
+    assert "组长执行约束" not in member_view
+    assert "task" not in member_view
 
     # 5. 工具集由角色多态决定
     assert "delegate_to_group_leader" in context.allowed_team_tools()

@@ -277,6 +277,24 @@ function categoryOf(name: string): ToolCategory {
   return 'tool'
 }
 
+// 委派目标只存在于工具参数里（subagent_type / agent_name），而参数是流式
+// 分片到达的；每片都尝试解析一次，拼完整后即可拿到目标，供轨迹显示"派给谁"。
+const DELEGATION_TARGET_KEYS = ['subagent_type', 'agent_name', 'subagent_name'] as const
+
+function delegationTarget(args?: string): string {
+  if (!args) return ''
+  try {
+    const parsed = JSON.parse(args) as Record<string, unknown>
+    for (const key of DELEGATION_TARGET_KEYS) {
+      const value = parsed?.[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+  } catch {
+    return ''
+  }
+  return ''
+}
+
 export { categoryOf }
 
 // HITL 提交内容压成一行，卡片收起后仍能在轨迹树里看到用户回答了什么。
@@ -714,7 +732,14 @@ export const useChatStore = defineStore('chat', () => {
       }
       case 'tool_args': {
         const tool = findTool(state, String(evt.tool_call_id))
-        if (tool) tool.args = (tool.args || '') + String(evt.args || '')
+        if (tool) {
+          tool.args = (tool.args || '') + String(evt.args || '')
+          // 委派节点在 tool_start 时还不知道目标，参数拼全后补上。
+          if (tool.category === 'delegation' && !tool.subagentName) {
+            const target = delegationTarget(tool.args)
+            if (target) tool.subagentName = target
+          }
+        }
         break
       }
       case 'tool_result': {

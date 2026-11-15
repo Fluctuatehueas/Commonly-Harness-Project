@@ -4,6 +4,7 @@ import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { IconName } from '@/components/console/icons'
 import { useDisplayStore } from '@/stores/display'
+import { useAgentStore } from '@/stores/agents'
 import {
   TRAJECTORY_REGISTRY,
   type TrajectoryEntry,
@@ -13,42 +14,37 @@ import TrajectoryNode from './TrajectoryNode.vue'
 
 const props = defineProps<{ node: TreeNode; agentName?: string; level?: number }>()
 const display = useDisplayStore()
+const agents = useAgentStore()
+
+// 事件里只有 agent_id（如 agent_ecf7a6c2），展示层统一换成档案里的名字；
+// 档案未加载或已删除时退回原始标识，避免显示为空。
+function displayAgent(raw?: string): string {
+  const value = String(raw || '').trim()
+  if (!value || value === 'main' || value === 'subagent') return ''
+  const found = agents.items.find((item) => item.id === value)
+  return found?.name || value
+}
 
 // 递归深度：根节点为 L1，用于顶部粘性折叠条展示层级。
 const level = computed(() => props.level ?? 1)
 const registry = inject(TRAJECTORY_REGISTRY, null)
 
 // 委派节点（SubAgent）默认折叠：子 Agent 的推理、工具与输出都收在
-// 折叠行后面，行内只显示最近一步预览。其他节点维持原有展开策略。
+// 折叠行后面，行内只显示最近一步预览。其他节点同样默认折叠。
 const isDelegationNode = computed(
   () => props.node.msg.kind === 'tool' && props.node.msg.category === 'delegation',
 )
-const open = ref(
-  !isDelegationNode.value &&
-    (Boolean(props.node.msg.streaming) || props.node.msg.status === 'calling'),
-)
-watch(
-  () => [props.node.msg.streaming, props.node.msg.status] as const,
-  ([streaming, status]) => {
-    if (isDelegationNode.value) {
-      // 委派节点只由用户点击展开 / 收起，不做流式自动展开。
-      return
-    }
-    // 用户显式开启「参数默认展开」时，结束也不自动折叠。
-    open.value = display.prefs.expandToolArgs
-      ? true
-      : Boolean(streaming) || status === 'calling'
-  },
-)
+// 执行中不随流式自动展开，展开状态完全由用户点击决定。
+const open = ref(false)
 
 const msg = computed(() => props.node.msg)
 
 // 子 Agent 实际名称：后端 source 可能是具体名字，也可能退化成 "subagent"，
-// 后者从父节点继承，保证 UI 上始终显示 "web_researcher" 这类具体名字。
+// 后者从父节点继承，保证 UI 上始终显示具体成员名而不是原始标识。
 const ownAgent = computed(() => {
   const source = String(msg.value.source || '')
-  if (source && source !== 'main' && source !== 'subagent') return source
-  return String(msg.value.subagentName || '')
+  if (source && source !== 'main' && source !== 'subagent') return displayAgent(source)
+  return displayAgent(msg.value.subagentName)
 })
 const effectiveAgent = computed(() => ownAgent.value || props.agentName || '')
 
@@ -93,7 +89,8 @@ const label = computed(() => {
   }
   if (skill.value) return `使用技能 ${value.toolName || 'skill'}`
   if (delegation.value) {
-    return `委派 ${value.subagentName || effectiveAgent.value || value.toolName || '子任务'}`
+    // 委派节点必须点名"派给谁"，不能让用户看到原始的 task 工具名。
+    return `委派 ${displayAgent(value.subagentName) || effectiveAgent.value || '子智能体'}`
   }
   return `调用工具 ${value.toolName || 'tool'}`
 })
@@ -137,7 +134,7 @@ const collapsedPreview = computed(() => {
   if (child.kind === 'tool') {
     const action =
       child.category === 'delegation'
-        ? `委派 ${child.subagentName || child.toolName || '子任务'}`
+        ? `委派 ${displayAgent(child.subagentName) || '子智能体'}`
         : `调用 ${child.toolName || '工具'}`
     const detail = oneLine(child.result || child.args || child.content)
     return `${prefix}${detail ? `${action} · ${detail}` : action}`

@@ -340,6 +340,16 @@ async def create_main_agent(
             extra_local_tools=extra_local_tools
         )
     _assert_unique_subagent_names(sync_subagents)
+    # 委派问题的唯一可观测入口：组员被跳过、没进团队模式、task 未注册，
+    # 都能从这一行日志直接定位，不必再去猜 system prompt。
+    logger.info(
+        "agent_graph_built agent=%s mode=%s group=%s subagents=%s task_tool=%s",
+        context.identity.agent_id,
+        context.mode.value,
+        context.member_context.active_group_id if context.member_context else "",
+        [str(item.get("name") or "") for item in sync_subagents],
+        bool(sync_subagents),
+    )
 
     # 主 Agent 只保留通用能力：MCP 公共工具、异步任务提交、信息补齐和技能管理。
     # MCP 工具在 Agent 构图时才按 scope 懒发现/取代理，不在进程启动时连接。
@@ -467,8 +477,24 @@ async def create_main_agent(
         "- 需要当前日期、时间或时区时，调用 `get_current_time`；不要凭记忆猜测。\n"
         "- 不要复述工具返回的时间格式，也不要在回答正文里写系统时间标记。\n"
     )
+    # 可视化产物统一走 HTML 文件：避免把大段数据/配置塞进回复正文，浪费 token。
+    visual_policy = (
+        "\n\n## 数据可视化\n"
+        "- 需要图表、看板或展示较大数据集时，生成一个自包含 HTML 文件再引用它，"
+        "不要在回复正文里贴 ECharts 配置 JSON、原始数据表或大段绘图代码。\n"
+        "- HTML 必须单文件自包含：样式、脚本、数据全部内联；第三方库只通过 CDN 引入"
+        "（图表用 `https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js`），"
+        "不要引用同目录下的其他 js/css/图片文件。\n"
+        "- HTML 需要自带背景色、文字色和自适应尺寸，前端容器会按父级宽高展示。\n"
+        "- 文件保存为 `.html` 后，用 Markdown 链接引用：自由会话写 "
+        "`[图表名](sandbox:/chart.html)`，项目会话写 `[图表名](project:/chart.html)`。"
+        "前端会把它渲染成文件卡片，用户可直接预览或从右侧抽屉打开。\n"
+        "- 流程图、时序图等简单示意图仍可用 ```mermaid 代码块直接输出；"
+        "ECharts 图表一律走 HTML 文件。\n"
+    )
     base_prompt = (
-        f"{search_policy_prompt}{time_policy}{integration_policy}{execution_policy}"
+        f"{search_policy_prompt}{time_policy}{integration_policy}"
+        f"{execution_policy}{visual_policy}"
     )
     # 并行委派是默认工作方式：独立任务同一条消息里并发开多个子 Agent，
     # 同一类型也可以同时开多个实例；不同实例的状态互不共享。
@@ -506,10 +532,24 @@ async def create_main_agent(
         if scheduler_tools
         else ""
     )
+    # 团队组长：并行策略里"主 Agent 也动手"的条款必须被收窄，否则模型会
+    # 优先自己做完，组员永远得不到委派。这一段放在并行策略之后，优先级更高。
+    team_policy = ""
+    if context.mode is AgentMode.TEAM and context.is_active_leader:
+        team_policy = (
+            "\n\n## 组内委派（覆盖上文的并行策略）\n"
+            "- 上文中“主 Agent 自己也动手”的条目，只适用于没有组员覆盖的工作；"
+            "凡落在任一成员职责范围内的子任务，必须用 `task` 委派。\n"
+            "- 收到任务后先对照组内成员名单拆解：检索、分析、写作、审校等"
+            "分别交给对应成员，主 Agent 负责拆解、汇总与最终决策。\n"
+            "- 只有当任务不需要任何组员能力时，才由自己独立完成。\n"
+            "- 委派后不要自己重复执行同一份工作，等子 Agent 返回结论再整合。\n"
+        )
+    policy_tail = f"{base_prompt}{parallel_policy}{team_policy}{scheduler_policy}"
     harness_policy = (
-        f"{base_prompt}{parallel_policy}{scheduler_policy}\n\n{delegation_instructions}"
+        f"{policy_tail}\n\n{delegation_instructions}"
         if delegation_instructions
-        else f"{base_prompt}{parallel_policy}{scheduler_policy}"
+        else policy_tail
     )
     # 角色提示词已包含组信息段（TeamAgentContext.render()），固定策略紧随其后，
     # 保证自定义风格与组语义不会绕过安全与运行环境约束。

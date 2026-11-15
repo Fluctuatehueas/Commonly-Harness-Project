@@ -7,7 +7,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from agent.agent_profiles import AgentProfileStore
-from agent.agent_team.context import AgentMode, HarnessAgentContextBase, TeamAgentContext
+from agent.agent_team.context import (
+    AgentCard,
+    AgentMode,
+    HarnessAgentContextBase,
+    TeamAgentContext,
+)
 from agent.agent_team.factory import AgentContextFactory
 from agent.agent_team.middleware import TeamPermissionMiddleware
 from agent.agent_team.store import AgentGroupStore
@@ -38,6 +43,11 @@ async def build_member_subagents(
 
     profile_map = {item["id"]: item for item in await AgentProfileStore(store, user_id).list()}
     factory = AgentContextFactory(store, user_id)
+    # 组内职责（duty）只在组记录里，档案描述可能为空；两者都要进 task 描述。
+    duty_by_agent = {
+        str(member.get("agent_id") or ""): str(member.get("duty") or "").strip()
+        for member in (group_record.get("members") or [])
+    }
 
     subagents: list[dict[str, Any]] = []
     for card in context.group_context.members:
@@ -55,9 +65,9 @@ async def build_member_subagents(
             {
                 # 子 Agent 名用 agent_id：稳定、ASCII、task 工具可直接使用
                 "name": card.agent_id,
-                "description": (
-                    f"{profile.get('name')}｜{profile.get('role_title')}："
-                    f"{profile.get('description') or card.description or '组成员'}"
+                # 这行就是模型决定"要不要委派给谁"的唯一依据，不能出现空字段。
+                "description": _member_description(
+                    profile, card, duty_by_agent.get(card.agent_id, "")
                 ),
                 "system_prompt": (
                     f"{member_context.render()}\n\n"
@@ -109,6 +119,19 @@ async def build_team_subagents(
     group_record = await AgentGroupStore(store, user_id).get(
         context.member_context.active_group_id
     )
+    active_group_id = context.member_context.active_group_id
+    if not context.is_active_leader:
+        # 设计 4.5：组员是叶子节点，看不到任何 task 子 Agent，也不能横向委派。
+        logger.info(
+            "团队构图：%s 在组 %s 中是组员，不装配子 Agent",
+            context.identity.agent_id,
+            active_group_id,
+        )
+        return []
+    if not str((group_record or {}).get("leader_agent_id") or "").strip():
+        # 没有组长时任何人都拿不到委派能力，这里必须留痕，否则表现为"组形同虚设"。
+        logger.warning("组 %s 未设置组长，组内无人可以委派", active_group_id)
+
     allowed = set((group_record or {}).get("extra_subagent_names") or [])
 
     globals_ = await load_global_subagents()
@@ -131,6 +154,32 @@ async def build_team_subagents(
         local_tools=local_tools,
     )
     return [*members, *extras]
+
+
+def _member_description(
+    profile: dict[str, Any], card: AgentCard, duty: str
+) -> str:
+    """拼出 ``task`` 工具里该成员的那一行。
+
+    这一行是模型判断"该不该交给谁"的唯一依据，因此不允许出现空角色或
+    空描述；三处信息按 档案描述 → 组内职责 → 岗位名 依次兜底。
+    """
+    name = str(profile.get("name") or card.name or card.agent_id).strip()
+    role_title = str(profile.get("role_title") or card.role_title or "").strip()
+    detail = str(
+        profile.get("description") or card.description or duty or ""
+    ).strip()
+    if duty and duty not in detail:
+        detail = f"{detail}；组内职责：{duty}" if detail else f"组内职责：{duty}"
+    if not detail:
+        detail = f"承担{role_title or '组内'}相关子任务"
+        logger.warning(
+            "组员 %s 缺少职责描述（description / duty），task 描述已退化为通用文案，"
+            "建议补齐档案或在组里填写职责",
+            card.agent_id,
+        )
+    head = "｜".join(part for part in (name, role_title) if part)
+    return f"{head}：{detail}"
 
 
 async def _member_tools(profile: dict[str, Any], local_tools: list[Any]) -> list[Any]:

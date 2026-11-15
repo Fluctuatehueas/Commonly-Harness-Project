@@ -222,13 +222,42 @@ class GroupContext:
 
         shown = self.members[:MAX_MEMBER_CARDS]
         if shown:
-            lines.append("- 组内成员（组长可直接用 task 委派）：")
+            if role is GroupRole.LEADER:
+                lines.append(
+                    "- 组内成员（用 `task` 委派，`subagent_type` 填括号前的 agent_id）："
+                )
+            else:
+                lines.append("- 组内成员：")
             for card in shown:
-                marker = "（你）" if card.agent_id == self_agent_id else ""
+                marker = "（你自己，不可委派）" if card.agent_id == self_agent_id else ""
                 lines.append(f"  {card.as_prompt_line()}{marker}")
         hidden = len(self.members) - len(shown)
         if hidden > 0:
             lines.append(f"  - ……其余 {hidden} 名成员请用 get_group_overview 查询")
+
+        if role is GroupRole.LEADER:
+            lines.append("")
+            lines.append("## 组长执行约束")
+            lines.append(
+                "- 组内任务直接开工：不要向用户确认“我有组员，需要我开工吗”这类问题，"
+                "也不要先征求是否委派；收到任务即拆解并开始执行。"
+            )
+            lines.append(
+                "- **委派优先**：只要子任务落在任一成员的岗位或职责范围内，就必须用 "
+                "`task(subagent_type=<agent_id>, description=...)` 交给该成员；"
+                "主 Agent 只负责拆解、汇总与决策，不得代做组员职责范围内的工作。"
+            )
+            lines.append(
+                "- 委派描述必须写清目标、输入、期望产出与禁止事项；"
+                "委派后不要自己重复执行同一份工作，等子 Agent 返回结论再整合。"
+            )
+            lines.append(
+                "- 需要多步协作时，先调用 `create_work_plan` 产出分工清单，"
+                "再按返回的 wave 同一条消息里并发发出多个 `task`。"
+            )
+            lines.append(
+                "- 仅当目标信息不足、存在不可逆的高风险操作或必须由用户拍板时才提问。"
+            )
 
         discover = self.discoverable_groups[:MAX_DISCOVERABLE_CARDS]
         if discover:
