@@ -197,6 +197,13 @@ class WithdrawChatRequest(BaseModel):
     user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
     username: Optional[str] = Field(None, min_length=1, description="用户名")
     tenant_id: str = Field("", description="部署级租户标识")
+    content: Optional[str] = Field(
+        None,
+        description=(
+            "可选：前端要撤回的用户原文。提供时仅当 head 的最新用户消息与其一致"
+            "才真正撤回，避免把没写入检查点的失败轮误当成上一轮撤回。"
+        ),
+    )
 
     @model_validator(mode="after")
     def set_username(self) -> "WithdrawChatRequest":
@@ -211,6 +218,9 @@ class WithdrawChatResponse(BaseModel):
     thread_id: str
     content: str = ""
     session_usage: Dict[str, Any] = Field(default_factory=dict)
+    removed: bool = Field(
+        True, description="是否真的从会话检查点移除了这一轮；false 表示该轮未写入检查点"
+    )
 
 
 class AsyncTaskStatusResponse(BaseModel):

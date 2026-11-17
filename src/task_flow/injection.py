@@ -10,10 +10,34 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from .compiler import schema_hash
 from .models import TaskFlow, new_execution_id, utcnow
+
+# 执行者前缀："subagent:<角色名>" 指内置 SubAgent；"agent:<id>" 指 MyAgent 档案。
+AGENT_EXECUTOR_PREFIX = "agent:"
+SUBAGENT_EXECUTOR_PREFIX = "subagent:"
+
+
+def agent_executor_ids(flow: TaskFlow) -> list[str]:
+    """收集流程里以 ``agent:<id>`` 指定的 MyAgent id（含并行分支，去重）。"""
+    ids: list[str] = []
+
+    def walk(steps: Iterable[Any]) -> None:
+        for step in steps:
+            if getattr(step, "parallel", None):
+                for sub in step.parallel:
+                    walk(sub.steps)
+                continue
+            value = str(getattr(step, "executor", "") or "")
+            if value.startswith(AGENT_EXECUTOR_PREFIX):
+                agent_id = value[len(AGENT_EXECUTOR_PREFIX) :].strip()
+                if agent_id and agent_id not in ids:
+                    ids.append(agent_id)
+
+    walk(flow.steps)
+    return ids
 
 
 # ============================================================
@@ -78,16 +102,18 @@ def build_task_flow_spec(
     *,
     entry_step: Optional[str] = None,
     user_state: str = "",
+    executor_names: Optional[Mapping[str, str]] = None,
 ) -> str:
     """把任务流渲染成注入用的规范文本。
 
     用户原文由调用方单独作为一条 HumanMessage 发送，这里**不再重复拼接**：
     两者虽然都是 HumanMessage，但前者是用户可见的原话，后者是内部执行规范。
     步骤内容原样写入，只补充执行约定：逐步上报、缺信息必须询问、校验点先自检。
+    ``executor_names`` 把 ``agent:<id>`` 渲染成可读的 Agent 名称与 id。
     """
     sections = [
         "你可以按照如下任务流执行任务：",
-        _render_flow(flow),
+        _render_flow(flow, executor_names or {}),
         _render_conventions(),
     ]
     if entry_step:
@@ -100,24 +126,35 @@ def build_task_flow_spec(
     return "\n\n".join(part for part in sections if part)
 
 
-def _render_flow(flow: TaskFlow) -> str:
+def _render_flow(flow: TaskFlow, executor_names: Mapping[str, str]) -> str:
     lines = [f"# 任务流：{flow.name}"]
     if flow.description:
         lines.append(flow.description)
     lines.append("")
     lines.append("## 步骤")
-    _render_steps(flow.steps, lines, prefix="")
+    _render_steps(flow.steps, lines, prefix="", executor_names=executor_names)
     return "\n".join(lines)
 
 
-def _render_steps(steps, lines: list[str], *, prefix: str) -> None:
+def _render_steps(
+    steps,
+    lines: list[str],
+    *,
+    prefix: str,
+    executor_names: Mapping[str, str],
+) -> None:
     for index, step in enumerate(steps, start=1):
         label = f"{prefix}{index}"
         if step.parallel:
             lines.append(f"{label}. [{step.id}] {step.name}（并行分支，按分支分别执行）")
             for branch in step.parallel:
                 lines.append(f"   - 分支「{branch.name}」：")
-                _render_steps(branch.steps, lines, prefix=f"{label}.")
+                _render_steps(
+                    branch.steps,
+                    lines,
+                    prefix=f"{label}.",
+                    executor_names=executor_names,
+                )
             continue
         lines.append(f"{label}. [{step.id}] {step.name}")
         if step.instruction:
@@ -126,8 +163,14 @@ def _render_steps(steps, lines: list[str], *, prefix: str) -> None:
             lines.append(f"   - 限制条件：{step.constraints}")
         if isinstance(step.skills, list) and step.skills:
             lines.append(f"   - 优先使用技能：{'、'.join(step.skills)}")
-        if step.executor.startswith("subagent:"):
-            role = step.executor.split(":", 1)[1].strip()
+        if step.executor.startswith(AGENT_EXECUTOR_PREFIX):
+            agent_id = step.executor[len(AGENT_EXECUTOR_PREFIX) :].strip()
+            if agent_id:
+                name = executor_names.get(agent_id)
+                target = f"{name}（agent_id：{agent_id}）" if name else agent_id
+                lines.append(f"   - 建议委派子 Agent：{target}")
+        elif step.executor.startswith(SUBAGENT_EXECUTOR_PREFIX):
+            role = step.executor[len(SUBAGENT_EXECUTOR_PREFIX) :].strip()
             if role:
                 lines.append(f"   - 建议委派子 Agent：{role}")
         if step.example:
@@ -156,6 +199,7 @@ def _render_conventions() -> str:
 
 
 __all__ = [
+    "agent_executor_ids",
     "build_flow_state",
     "build_task_flow_spec",
     "flow_steps_view",

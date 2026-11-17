@@ -1,17 +1,21 @@
 <script setup lang="ts">
 // 步骤配置：名称 / 指令 / SKILL / 执行者 / 限制条件 / 示例 / 校验点
 // Element Plus 表单 + 分组式布局：基本信息、能力与执行、约束与验收。
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import {
   Aim,
   Cpu,
   Document,
   EditPen,
+  Flag,
   MagicStick,
   Select,
   Warning,
 } from '@element-plus/icons-vue'
 import type { StepDef } from '@/api/taskflow'
+import { useAgentStore } from '@/stores/agents'
+import { avatarGradient, avatarInitial } from '@/components/myagent/avatar'
+import HoloTooltip from '@/components/console/HoloTooltip.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -57,20 +61,83 @@ const executorModel = computed({
   },
 })
 
-const executorOptions = computed(() => {
-  const base = [
-    { value: 'auto', label: 'Auto · 运行时决定' },
-    { value: 'main', label: '主 Agent' },
+// 执行者候选与聊天页共用同一份 MyAgent 列表：头像、岗位、所属组组标保持一致。
+const agents = useAgentStore()
+onMounted(() => {
+  void agents.load()
+  void agents.loadGroups()
+})
+
+const AGENT_PREFIX = 'agent:'
+
+interface ExecutorGroupBadge {
+  group_id: string
+  name: string
+  role: 'leader' | 'member'
+}
+
+interface ExecutorOption {
+  value: string
+  /** auto / main / agent（MyAgent）/ subagent（历史内置角色） */
+  kind: 'auto' | 'main' | 'agent' | 'subagent'
+  label: string
+  role?: string
+  /** MyAgent 原始 id：头像取色与聊天页保持一致 */
+  agentId?: string
+  avatar?: string
+  groups?: ExecutorGroupBadge[]
+}
+
+const executorOptions = computed<ExecutorOption[]>(() => {
+  const options: ExecutorOption[] = [
+    { value: 'auto', kind: 'auto', label: 'Auto', role: '运行时决定' },
+    { value: 'main', kind: 'main', label: '主 Agent', role: '由当前主 Agent 执行' },
   ]
-  const current = props.step?.executor || 'auto'
-  if (current.startsWith('subagent:')) {
-    base.push({ value: current, label: `子智能体 · ${current.slice('subagent:'.length)}` })
+  for (const opt of agents.options) {
+    options.push({
+      value: `${AGENT_PREFIX}${opt.value}`,
+      kind: 'agent',
+      label: opt.label,
+      role: opt.role,
+      agentId: opt.value,
+      avatar: agents.byId(opt.value)?.avatar || '',
+      groups: agents.groupsOf(opt.value).map((group) => ({
+        group_id: group.group_id,
+        name: group.name,
+        role: group.leader_agent_id === opt.value ? ('leader' as const) : ('member' as const),
+      })),
+    })
   }
-  return base
+  // 历史值兜底：内置流的 subagent 角色、已被删除的 Agent 仍要能显示出来。
+  const current = props.step?.executor || 'auto'
+  if (!options.some((item) => item.value === current)) {
+    if (current.startsWith(AGENT_PREFIX)) {
+      const agentId = current.slice(AGENT_PREFIX.length)
+      const profile = agents.byId(agentId)
+      options.push({
+        value: current,
+        kind: 'agent',
+        label: profile?.name || '已失效 Agent',
+        role: profile?.role_title || agentId,
+        agentId,
+      })
+    } else if (current.startsWith('subagent:')) {
+      options.push({
+        value: current,
+        kind: 'subagent',
+        label: '子智能体',
+        role: current.slice('subagent:'.length),
+      })
+    }
+  }
+  return options
 })
 
 const executorLabel = computed(() => {
   const value = props.step?.executor || 'auto'
+  if (value.startsWith(AGENT_PREFIX)) {
+    return agents.byId(value.slice(AGENT_PREFIX.length))?.name || '已失效 Agent'
+  }
   if (value.startsWith('subagent:')) return `子智能体 ${value.slice('subagent:'.length)}`
   return value === 'main' ? '主 Agent' : 'Auto'
 })
@@ -167,13 +234,62 @@ const executorLabel = computed(() => {
                   执行者
                 </span>
               </template>
-              <el-select v-model="executorModel" :disabled="readonly" class="fill">
+              <el-select
+                v-model="executorModel"
+                :disabled="readonly"
+                popper-class="tf-agent-popper"
+                class="fill executor-select"
+              >
                 <el-option
                   v-for="opt in executorOptions"
                   :key="opt.value"
                   :label="opt.label"
                   :value="opt.value"
-                />
+                >
+                  <div class="agent-option">
+                    <span
+                      v-if="opt.kind === 'agent'"
+                      class="agent-option-avatar"
+                      :style="{ background: avatarGradient(opt.agentId || opt.value) }"
+                    >
+                      {{ avatarInitial(opt.label, opt.avatar) }}
+                    </span>
+                    <span
+                      v-else-if="opt.kind === 'main'"
+                      class="agent-option-avatar"
+                      :style="{ background: avatarGradient('main') }"
+                    >
+                      主
+                    </span>
+                    <span v-else class="agent-option-avatar agent-option-avatar--auto">
+                      <el-icon><MagicStick v-if="opt.kind === 'auto'" /><Cpu v-else /></el-icon>
+                    </span>
+                    <span class="agent-option-main">
+                      <strong>{{ opt.label }}</strong>
+                      <small v-if="opt.role">{{ opt.role }}</small>
+                    </span>
+                    <span v-if="opt.groups?.length" class="agent-option-groups">
+                      <HoloTooltip
+                        v-for="group in opt.groups"
+                        :key="group.group_id"
+                        :title="group.name"
+                        :content="`角色：${group.role === 'leader' ? '组长' : '组员'}`"
+                        placement="left"
+                        :width="200"
+                      >
+                        <span
+                          class="group-badge"
+                          :style="{ background: avatarGradient(group.group_id) }"
+                        >
+                          {{ avatarInitial(group.name) }}
+                          <i v-if="group.role === 'leader'" class="group-badge-flag">
+                            <el-icon><Flag /></el-icon>
+                          </i>
+                        </span>
+                      </HoloTooltip>
+                    </span>
+                  </div>
+                </el-option>
               </el-select>
             </el-form-item>
           </div>
@@ -446,5 +562,134 @@ const executorLabel = computed(() => {
   margin: 6px 0 0;
   font-size: 10.5px;
   color: var(--text-3);
+}
+
+/* ---------- 执行者下拉：与聊天页 Agent 选择器同款 ---------- */
+.executor-select :deep(.el-select__wrapper) {
+  min-height: 32px;
+}
+
+.agent-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  line-height: 1.2;
+}
+
+.agent-option-avatar {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: #041018;
+  border-radius: 50%;
+}
+
+.agent-option-avatar--auto {
+  font-size: 12px;
+  color: var(--text-2);
+  border: 1px dashed var(--line);
+  background: transparent;
+}
+
+.agent-option-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.agent-option-main strong {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-option-main small {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.agent-option-groups {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.group-badge {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: #041018;
+  border-radius: 6px;
+}
+
+.group-badge-flag {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  display: grid;
+  place-items: center;
+  width: 11px;
+  height: 11px;
+  font-size: 7px;
+  font-style: normal;
+  color: #f6c85f;
+  border-radius: 50%;
+  background: #0b1622;
+}
+
+/* 下拉层 teleport 到 body，只能用全局选择器命中 popper-class。 */
+:global(.tf-agent-popper) {
+  overflow: hidden;
+  border: 1px solid rgba(167, 139, 250, 0.42);
+  border-radius: 8px 2px 8px 2px;
+  background:
+    repeating-linear-gradient(
+      116deg,
+      rgba(226, 214, 255, 0.04) 0 1px,
+      transparent 1px 6px
+    ),
+    linear-gradient(160deg, rgba(24, 15, 44, 0.98), rgba(9, 8, 20, 0.98));
+  box-shadow:
+    0 18px 46px rgba(0, 0, 0, 0.62),
+    0 0 26px rgba(167, 139, 250, 0.2);
+  backdrop-filter: blur(14px);
+}
+
+:global(.tf-agent-popper .el-select-dropdown__item) {
+  height: auto;
+  min-height: 38px;
+  padding: 3px 10px;
+  color: #cfc7ea;
+  font-size: 11.5px;
+  line-height: 1.2;
+}
+
+:global(.tf-agent-popper .el-select-dropdown__item.is-hovering) {
+  background: linear-gradient(90deg, rgba(167, 139, 250, 0.16), rgba(244, 114, 182, 0.1));
+  color: #f5efff;
+}
+
+:global(.tf-agent-popper .el-select-dropdown__item.is-selected) {
+  color: #f0abfc;
+  font-weight: 500;
 }
 </style>

@@ -1164,7 +1164,14 @@ async function withdrawLatest(turn: TurnView, index: number) {
   try {
     const threadId = chat.threadId || sessions.activeThreadId
     if (!threadId) throw new Error('会话不存在')
-    const result = await withdrawLatestMessage(threadId, USER_ID, '控制台用户')
+    // 带上这一轮的原文：后端据此确认 head 的最新用户消息就是它，
+    // 避免把没写入检查点的出错轮误撤成上一轮。
+    const result = await withdrawLatestMessage(
+      threadId,
+      USER_ID,
+      '控制台用户',
+      turn.user.sentText ?? turn.user.content,
+    )
     // 重新拉取历史，确保消息、中断与用量都以后端 head 为准。
     await selectSession(threadId)
     // 撤回后如果上一轮的任务流还没走完，把进度卡片重新挂回消息流。
@@ -1181,6 +1188,22 @@ async function withdrawLatest(turn: TurnView, index: number) {
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '撤回失败')
   }
+}
+
+// ---------- 异常终止后重试 ----------
+// 只对最后一轮生效：重试 = 用原提问（含附件）重新发起一轮，不撤回出错轮。
+function canRetryTerminated(turn: TurnView, index: number): boolean {
+  const term = turn.terminated
+  if (!term || term.termReason === 'user') return false
+  if (!turn.user || archivedActive.value || chat.sending || chat.demoMode) return false
+  return index === turns.value.length - 1
+}
+
+function retryTerminated(turn: TurnView) {
+  if (!turn.user || !canRetryTerminated(turn, turns.value.length - 1)) return
+  chat.send(turn.user.content || '', turn.user.attachments || [])
+  stickToBottom.value = true
+  void scrollBottom()
 }
 
 // ---------- 会话 / 本轮 Token 统计 ----------
@@ -2110,9 +2133,20 @@ async function submit() {
               <!-- 终止原因：贴在 AI 回答最底部的一行状态条 -->
               <div v-if="turn.terminated" class="row terminate-row">
                 <div class="msg-col ai">
-                  <div class="terminate-bar" :class="turn.terminated.termReason || 'server'">
-                    <AppIcon :name="terminateIcon(turn.terminated)" :size="12" />
-                    <span>{{ terminateText(turn.terminated) }}</span>
+                  <div class="terminate-line">
+                    <div class="terminate-bar" :class="turn.terminated.termReason || 'server'">
+                      <AppIcon :name="terminateIcon(turn.terminated)" :size="12" />
+                      <span>{{ terminateText(turn.terminated) }}</span>
+                    </div>
+                    <button
+                      v-if="canRetryTerminated(turn, turnIndex)"
+                      class="terminate-retry"
+                      aria-label="重试这一轮"
+                      title="重试这一轮"
+                      @click="retryTerminated(turn)"
+                    >
+                      <AppIcon name="refresh" :size="13" />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -3440,10 +3474,20 @@ async function submit() {
   padding-left: 38px;
 }
 
+.terminate-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
 .terminate-bar {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
   max-width: 100%;
   padding: 5px 10px;
   border: 1px solid var(--line);
@@ -3454,6 +3498,30 @@ async function submit() {
   line-height: 1.5;
   word-break: break-word;
   animation: fadein 0.2s ease;
+}
+
+/* 异常终止后的重试：红色/黄色状态条右侧的黄色图标按钮 */
+.terminate-retry {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--amber);
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.terminate-retry:hover {
+  border-color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 22%, transparent);
 }
 
 .terminate-bar.user {

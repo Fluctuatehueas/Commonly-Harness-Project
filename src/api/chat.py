@@ -87,7 +87,11 @@ from api.scheduler import router as scheduler_router
 from api.session_files import router as session_files_router
 from api.task_flow import router as task_flow_router
 from task_flow.agent_bridge import route_task_flow
-from task_flow.injection import build_flow_state, build_task_flow_spec
+from task_flow.injection import (
+    agent_executor_ids,
+    build_flow_state,
+    build_task_flow_spec,
+)
 from task_flow.models import Execution, StepTrace, new_execution_id, utcnow
 from api.message_utils import (
     content_to_text,
@@ -656,6 +660,32 @@ class FlowTurn:
     state: dict[str, Any]
 
 
+async def _flow_executor_names(flow: Any, user_id: str) -> dict[str, str]:
+    """把任务流执行者引用的 MyAgent id 解析成名称，注入规范时给出可读目标。
+
+    解析失败不阻断执行：名称缺失时注入层退化为只写 agent_id。
+    """
+    ids = agent_executor_ids(flow)
+    if not ids:
+        return {}
+    try:
+        from agent.agent_profiles import AgentProfileStore
+
+        await agent_loader.initialize()
+        store = agent_loader.store
+        if store is None:
+            return {}
+        profiles = await AgentProfileStore(store, user_id).list()
+        names = {
+            str(item.get("id") or ""): str(item.get("name") or "")
+            for item in profiles
+        }
+        return {agent_id: names[agent_id] for agent_id in ids if names.get(agent_id)}
+    except Exception:
+        logger.exception("任务流执行者名称解析失败")
+        return {}
+
+
 async def _prepare_flow_turn(request: ChatRequest) -> FlowTurn | None:
     """路由命中则构造注入消息与图状态；未命中返回 None。"""
     if _skip_task_flow_route(request):
@@ -675,6 +705,7 @@ async def _prepare_flow_turn(request: ChatRequest) -> FlowTurn | None:
         flow,
         entry_step=decision.entry_step,
         user_state=decision.user_state,
+        executor_names=await _flow_executor_names(flow, request.user_id),
     )
     return FlowTurn(flow_id=flow.id, flow_name=flow.name, content=content, state=state)
 
@@ -957,6 +988,9 @@ class WithdrawPlan:
     message_id: str
     # 撤回首条用户消息时直接重置 checkpoint，物理移除该会话的全部正文。
     reset_thread: bool = False
+    # 前端要撤回的这一轮并没有写进检查点（例如请求在建图/注册会话阶段就失败了）：
+    # 此时 head 的最新用户消息其实是上一轮，必须原地返回，不能回退。
+    skipped: bool = False
 
 
 def _state_value(message: Any, name: str, default: Any = None) -> Any:
@@ -974,6 +1008,20 @@ def _state_role(message: Any) -> str:
 
 def _state_text(message: Any) -> str:
     return content_to_text(_state_value(message, "content", ""))
+
+
+def _is_internal_human(message: Any) -> bool:
+    """任务流规范等内部 HumanMessage 不算用户发来的那一轮。"""
+    kwargs = _state_value(message, "additional_kwargs", {}) or {}
+    return (
+        isinstance(kwargs, dict)
+        and kwargs.get("harness_internal") == TASK_FLOW_INTERNAL_MARKER
+    )
+
+
+def _normalize_user_text(text: str) -> str:
+    """比较用户原文时忽略空白差异，避免前端 trim 后对不上。"""
+    return " ".join(str(text or "").split())
 
 
 def _retry_denied(detail: str) -> HTTPException:
@@ -1109,13 +1157,31 @@ def _user_display_text(message: Any) -> str:
     return content_to_text(content)
 
 
+def _skipped_withdraw_plan(expected_content: str) -> WithdrawPlan:
+    """这一轮不在检查点里：不碰 head，只把原文还给前端回填。"""
+    return WithdrawPlan(
+        checkpoint_config={},
+        as_node="",
+        content=expected_content,
+        cutoff="",
+        message_id="",
+        skipped=True,
+    )
+
+
 async def _prepare_withdraw(
     *,
     user_id: str,
     username: str,
     thread_id: str,
+    expected_content: str | None = None,
 ) -> tuple[Any, WithdrawPlan]:
-    """定位「最新用户消息之前」的检查点，并校验可以撤回。"""
+    """定位「最新用户消息之前」的检查点，并校验可以撤回。
+
+    ``expected_content`` 是前端点击撤回的那一轮用户原文：只有 head 的最新
+    用户消息与之匹配才真的回退，否则说明这一轮压根没写进检查点（例如请求
+    在建图阶段就失败了），必须原样返回，不能把上一轮当成目标撤掉。
+    """
     agent_id = await _resolve_agent_id(user_id, thread_id)
     group_id = await _resolve_group_id(user_id, thread_id, None)
     agent = await agent_loader.get_agent_for_user(
@@ -1133,19 +1199,28 @@ async def _prepare_withdraw(
     state = await agent.aget_state(config)
     messages = list((getattr(state, "values", {}) or {}).get("messages", []) or [])
     if not messages:
+        if expected_content is not None:
+            return agent, _skipped_withdraw_plan(expected_content)
         raise _retry_denied("当前会话还没有可撤回的用户消息")
 
     last_human_index = -1
     for index, message in enumerate(messages):
-        if _state_role(message) == "user":
+        if _state_role(message) == "user" and not _is_internal_human(message):
             last_human_index = index
     if last_human_index < 0:
+        if expected_content is not None:
+            return agent, _skipped_withdraw_plan(expected_content)
         raise _retry_denied("当前会话还没有可撤回的用户消息")
 
     human = messages[last_human_index]
     human_id = str(_state_value(human, "id", "") or "")
     if not human_id:
         raise _retry_denied("用户消息缺少稳定 ID，请刷新后再试")
+
+    if expected_content is not None and _normalize_user_text(
+        _user_display_text(human)
+    ) != _normalize_user_text(expected_content):
+        return agent, _skipped_withdraw_plan(expected_content)
 
     # 撤回首条用户消息：没有「上一轮」可回退，直接重置该会话正文。
     if last_human_index == 0:
@@ -1940,13 +2015,19 @@ async def withdraw_chat(
             user_id=request.user_id,
             username=username,
             thread_id=thread_id,
+            expected_content=request.content,
         )
         config = agent_loader.create_config(
             thread_id=thread_id,
             user_id=request.user_id,
             username=username,
         )
-        if plan.reset_thread:
+        if plan.skipped:
+            # 要撤回的这一轮没有写进检查点：head 保持不动，避免误撤上一轮。
+            logger.info(
+                "撤回跳过：该轮未写入检查点 thread=%s", thread_id
+            )
+        elif plan.reset_thread:
             # 首条消息撤回：物理删除本会话 checkpoint，保留用量账本。
             await agent_loader.reset_thread_checkpoint(thread_id)
             await agent_loader.update_session(
@@ -1996,7 +2077,9 @@ async def withdraw_chat(
         session_usage = dict(usage_data.get("session", {}))
         # 上下文占用回退到剩余会话的口径：首条撤回为 0，其余取上一轮输入。
         rounds = list(usage_data.get("rounds", []))
-        if plan.reset_thread:
+        if plan.skipped:
+            pass
+        elif plan.reset_thread:
             session_usage["context_used"] = 0
         elif len(rounds) >= 2:
             session_usage["context_used"] = int(rounds[-2].get("input") or 0)
@@ -2004,6 +2087,7 @@ async def withdraw_chat(
             thread_id=thread_id,
             content=plan.content,
             session_usage=session_usage,
+            removed=not plan.skipped,
         )
 
 

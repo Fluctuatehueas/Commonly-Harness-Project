@@ -17,7 +17,7 @@ export interface StepDef {
   instruction: string
   /** "auto"（Agent 自行选择）或技能名数组 */
   skills: StepSkills
-  /** main | auto | subagent:<角色名> */
+  /** main | auto | subagent:<角色名> | agent:<AgentProfile id> */
   executor: string
   constraints: string
   checkpoint: boolean

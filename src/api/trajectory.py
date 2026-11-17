@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from api.agent_loader import agent_loader
 from agent.config import COMPACTION_SIGNING_KEY
+from agent.evolution.read_view import attach_atdp_views
 
 
 router = APIRouter(prefix="/trajectory", tags=["trajectory"])
@@ -160,7 +161,11 @@ def _sort_time(event: dict[str, Any]) -> str:
     return str(event.get("start") or "")
 
 
-def _build_run(run_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_run(
+    run_id: str,
+    events: list[dict[str, Any]],
+    atdp_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """把同一 run 的事件聚合成前端可直接渲染的结构。"""
     ordered = sorted(events, key=_sort_time)
     start_event = next(
@@ -186,7 +191,7 @@ def _build_run(run_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     summary = _run_summary(ordered)
     summary["duration_ms"] = _duration_ms(started_at, ended_at)
     summary["event_count"] = len(ordered)
-    return {
+    payload = {
         "run_id": run_id,
         "started_at": started_at,
         "ended_at": ended_at,
@@ -194,6 +199,9 @@ def _build_run(run_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         "events": ordered,
         "summary": summary,
     }
+    if atdp_summary:
+        payload["atdp_summary"] = atdp_summary
+    return payload
 
 
 @router.get("/{thread_id}")
@@ -206,6 +214,13 @@ async def get_trajectory(
         raise HTTPException(status_code=404, detail="会话不存在或无权访问")
 
     events = await agent_loader.list_trajectory(user_id, thread_id)
+    store = await agent_loader.get_store()
+    atdp_summaries = await attach_atdp_views(
+        store,
+        user_id=user_id,
+        thread_id=thread_id,
+        events=events,
+    )
     _attach_retrieval_cost(events)
     _attach_integrity_check(events)
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -214,7 +229,7 @@ async def get_trajectory(
         grouped.setdefault(run_id, []).append(event)
 
     runs = [
-        _build_run(run_id, run_events)
+        _build_run(run_id, run_events, atdp_summaries.get(run_id))
         for run_id, run_events in grouped.items()
     ]
     runs.sort(key=lambda item: item["started_at"])

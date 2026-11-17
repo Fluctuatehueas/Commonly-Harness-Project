@@ -13,6 +13,8 @@ export interface SessionUsage {
 export interface WithdrawResult {
   thread_id: string
   content: string
+  /** false 表示这一轮从未写入检查点，后端没有回退任何轮次。 */
+  removed?: boolean
 }
 
 /** 补拉会话累计用量；用于旧前端状态缺少 spent 时校正统计。 */
@@ -41,11 +43,13 @@ export async function withdrawLatestMessage(
   threadId: string,
   userId: string,
   username: string,
+  content?: string,
 ): Promise<WithdrawResult> {
   const res = await fetch(`${API_BASE}/chat/${threadId}/withdraw`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_id: userId, username }),
+    // content 用于让后端确认 head 的最新用户消息就是前端点的这一轮。
+    body: JSON.stringify({ user_id: userId, username, content }),
   })
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}))

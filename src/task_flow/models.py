@@ -37,7 +37,8 @@ class Step(BaseModel):
     instruction: str = ""
     # "auto" 由 Agent 自行选择；否则为显式技能名列表。
     skills: Literal["auto"] | list[str] = "auto"
-    # "main" 主 Agent；"auto" 运行时决定；"subagent:<角色名>" 指定 SubAgent。
+    # "main" 主 Agent；"auto" 运行时决定；"subagent:<角色名>" 指定内置 SubAgent；
+    # "agent:<id>" 指定 MyAgent 档案（注入规范时作为委派建议）。
     executor: str = "auto"
     constraints: str = ""
     checkpoint: bool = False

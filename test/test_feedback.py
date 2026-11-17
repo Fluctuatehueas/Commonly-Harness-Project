@@ -345,6 +345,63 @@ async def test_prepare_withdraw_skips_pending_start_checkpoint() -> None:
     assert plan.checkpoint_config["configurable"]["checkpoint_id"] == "c2"
 
 
+async def test_prepare_withdraw_skips_when_target_turn_missing() -> None:
+    """出错轮没写进检查点时，head 的最新用户消息是上一轮，绝不能当目标撤回。"""
+    h1 = message("human", "u1", "h1")
+    a1 = message("ai", "a1", "a1")
+    agent = FakeAgent(
+        SimpleNamespace(values={"messages": [h1, a1]}, interrupts=()),
+        [snapshot([h1, a1], "c2", ())],
+    )
+    await install_agent(agent)
+    _, plan = await chat_api._prepare_withdraw(
+        user_id="u1",
+        username="u1",
+        thread_id="t1",
+        expected_content="这一轮根本没写进去",
+    )
+    assert plan.skipped is True
+    assert plan.message_id == ""
+    assert plan.content == "这一轮根本没写进去"
+
+    # 原文一致时仍按正常路径撤回这一轮。
+    _, matched = await chat_api._prepare_withdraw(
+        user_id="u1",
+        username="u1",
+        thread_id="t1",
+        expected_content="u1",
+    )
+    assert matched.skipped is False
+    assert matched.message_id == "h1"
+    assert matched.reset_thread is True
+
+
+async def test_prepare_withdraw_ignores_internal_human_message() -> None:
+    """任务流规范等内部 HumanMessage 不能当成用户那一轮。"""
+    h1 = message("human", "u1", "h1")
+    spec = message("human", "任务流规范", "s1")
+    spec.additional_kwargs = {"harness_internal": "task_flow_spec"}
+    a1 = message("ai", "a1", "a1")
+    agent = FakeAgent(
+        SimpleNamespace(values={"messages": [h1, spec, a1]}, interrupts=()),
+        [
+            snapshot([h1, spec, a1], "c3", ()),
+            snapshot([h1, spec], "c2", ("agent",)),
+            snapshot([h1], "c1", ()),
+        ],
+    )
+    await install_agent(agent)
+    _, plan = await chat_api._prepare_withdraw(
+        user_id="u1",
+        username="u1",
+        thread_id="t1",
+        expected_content="u1",
+    )
+    assert plan.skipped is False
+    assert plan.message_id == "h1"
+    assert plan.reset_thread is True
+
+
 async def main_async() -> None:
     tests = [
         test_feedback_idempotent_and_truncate,
@@ -357,6 +414,8 @@ async def main_async() -> None:
         test_prepare_withdraw_targets_previous_turn,
         test_prepare_withdraw_first_or_pending,
         test_prepare_withdraw_skips_pending_start_checkpoint,
+        test_prepare_withdraw_skips_when_target_turn_missing,
+        test_prepare_withdraw_ignores_internal_human_message,
     ]
     for test in tests:
         await test()

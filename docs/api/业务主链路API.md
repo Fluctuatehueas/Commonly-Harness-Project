@@ -278,6 +278,7 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
 | 字段 | 类型 | 必填 |
 | :-- | :-- | :--: |
 | `user_id` / `username` / `tenant_id` | string | 否 |
+| `content` | string | 否，前端点击撤回的那一轮用户原文 |
 
 **响应**
 
@@ -285,6 +286,7 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
 {
   "thread_id": "th-001",
   "content": "被撤回的用户原文",
+  "removed": true,
   "session_usage": {"input": 0, "output": 300, "total": 300, "spent": 5400, "rounds": 2}
 }
 ```
@@ -292,6 +294,7 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
 语义：
 
 - 撤回最新一条用户消息及其之后的回答与轨迹。
+- 传入 `content` 时，仅当 head 的最新用户消息与其一致才真正撤回；若该轮在写入检查点前就失败了（如服务端内部错误），返回 `removed=false` 且不回退任何轮次，避免误撤上一轮。
 - Token 计费与磁盘文件不回滚。
 - 首条消息撤回时重置会话，标题回到「新会话」。
 
@@ -680,6 +683,15 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
         "tokens_saved": 4200,
         "duration_ms": 4000,
         "event_count": 42
+      },
+      "atdp_summary": {
+        "r_t": {"value": 0.1, "count": 2, "sources": ["tool_outcome", "verification"]},
+        "y_t": {
+          "trust": "rejected",
+          "action": "dislike",
+          "message_id": "msg-9",
+          "at": "2026-11-11T08:01:12Z"
+        }
       }
     }
   ]
@@ -689,11 +701,16 @@ data: {"type":"token","message_id":"assistant-1","content":"你好","source":"ma
 | 字段 | 说明 |
 | :-- | :-- |
 | `runs[].status` | `done` / `running` / `interrupted` |
+| `runs[].atdp_summary` | 读取时聚合的本轮奖励合计与反馈结论；无数据时不返回该字段 |
 | `events[]` | 中间件写入的结构化事件，按时间排序 |
+| `events[].atdp.r_t` | 写入时为占位（`source=pending`）；读取轨迹时按事件聚合奖励账本，`resolved` 表示是否拿到奖励 |
+| `events[].atdp.y_t.trust` | `unknown` / `accepted` / `rejected` / `corrected`，只落在本轮最后一条模型事件上 |
 | `summary.duration_ms` | 本轮耗时 |
 | `summary.tokens_saved` | 上下文压缩节省的 Token |
 
 事件类型包括 `run`、`model`、`tool`、`skill`、`delegation`、`hitl`、`compaction`。可直接用于审计视图。
+
+`atdp` 相关字段是演进模块的读取视图：`HARNESS_EVOLUTION_ENABLED` 关闭时，事件保持写入时的原值，接口行为与未接入时一致。
 
 ---
 

@@ -54,6 +54,8 @@ export interface ChatMsg {
     // 本轮终止原因，仅本地展示，不写入历史
     | 'terminated'
   content?: string
+  /** 实际发给后端的用户原文：仅附件时与气泡展示文本不同，撤回校验要用它。 */
+  sentText?: string
   attachments?: ContextFile[]
   streaming?: boolean
   tokens?: MessageTokens
@@ -1543,6 +1545,7 @@ export const useChatStore = defineStore('chat', () => {
       id: uid('u'),
       kind: 'user',
       content: trimmed,
+      sentText: message,
       attachments,
       at: Date.now(),
     }

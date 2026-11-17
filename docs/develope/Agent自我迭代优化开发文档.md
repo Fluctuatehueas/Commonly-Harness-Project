@@ -7,6 +7,7 @@
 > 范围：完整四层方案。所有演进模块默认开启，作为系统底层规则引擎运行；仅在需要做效果对比或排障时通过环境变量关闭。按阶段落地，不以“一次性大重构”交付。
 >
 > 实现状态（P0–P4 已落地）：`src/agent/evolution/`、`src/agent/middlewares/{evolution,experience_injection,self_judge}.py`、`src/api/evolution.py`、轨迹页“经验库”分页。P5 跨 Agent 联邦共享仍为后续项。
+> 2026-11-17 补：`r_t` 与 `y_t.trust` 改为**读取时聚合**（`agent/evolution/read_view.py`），历史轨迹不回写；写入侧仍是占位值。
 
 ---
 
@@ -133,6 +134,12 @@
 | `m_t` | 元数据 | `run_id`、`thread_id`、`tokens`、`duration_ms`、`graph`、`source` | 部分覆盖，缺版本快照与工具 Schema 版本 |
 
 结论：**ATDP v2 应作为现有事件的增量字段，而不是新表**。旧字段继续保留，前端轨迹页不需要同步改造。
+
+**读取时视图（2026-11-17 补）**：`r_t` 与 `y_t.trust` 采用“写入占位、读取聚合”的口径，实现见 `agent/evolution/read_view.py`，由 `GET /trajectory/{thread_id}` 调用。
+
+- `r_t`：按事件标识聚合奖励账本（同事件多条奖励求和，run 级虚拟标识不入事件），未命中奖励的事件标 `resolved=false`；
+- `y_t.trust`：把消息反馈归到 run 后落到该 run 最后一条模型事件，`like→accepted`、`dislike→rejected`、`retry→corrected`；无法确定归属时维持 `unknown`；
+- run 级另给 `atdp_summary`（奖励合计与反馈结论），历史事件仍保持 `r_t=pending`、`trust=unknown`，**不回写 Store**。
 
 #### 1.2.5 Data Proxy
 
@@ -1287,6 +1294,7 @@ EVOLUTION_BUILD_VERSION = os.getenv("HARNESS_BUILD_VERSION", "dev")
 | :-- | :-- | :-- |
 | 奖励账本 | `reward.py` + `("reward", ...)` | 工具成功/失败、HITL 拒绝可写入 |
 | 延迟回填 API | `api/evolution.py` | 下一轮纠正、工单重开可回填 |
+| 读取时视图 | `read_view.py` + `GET /trajectory` | `r_t` 与 `y_t.trust` 在轨迹读取时聚合，不回写历史事件 |
 | 工具健康聚合 | `tool_health.py` | 按用户/服务/工具统计；低频用置信下限 |
 | 只读 API | `/evolution/tool-health` | 可看到错误分类与 P95；本期不做独立页面 |
 | 不自动禁用 | 控制面规则 | `critical` 工具只告警 |
