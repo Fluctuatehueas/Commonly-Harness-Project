@@ -71,6 +71,11 @@ class TierConfig:
     # 检查点打分：p >= p_replan 重规划；p_reorder <= p < p_replan 只允许排序。
     p_replan: float = 0.70
     p_reorder: float = 0.45
+    # 上下文占用达到该比例后进入收尾模式：不再展开新阶段
+    wrapup_ratio: float = 0.80
+    # 节流：同一阶段最多重规划次数、两次重规划之间的最少完成节点数
+    phase_replan_limit: int = 1
+    replan_min_nodes: int = 2
     beta: tuple[float, float, float, float] = (0.35, 0.25, 0.20, 0.20)
     bias: dict[str, float] = field(
         default_factory=lambda: {"EZ": -0.8, "MD": 0.0, "HD": 0.5}
@@ -100,6 +105,10 @@ class TierConfig:
             raise ValueError("max_items / max_parallel 必须 >= 1，max_replan 必须 >= 0")
         if self.max_attempts < 1 or self.checkpoint_every < 1:
             raise ValueError("max_attempts / checkpoint_every 必须 >= 1")
+        if not (0.0 < self.wrapup_ratio <= 1.0):
+            raise ValueError(f"wrapup_ratio 必须在 (0, 1]，当前 {self.wrapup_ratio}")
+        if self.phase_replan_limit < 0 or self.replan_min_nodes < 0:
+            raise ValueError("phase_replan_limit / replan_min_nodes 不能为负")
 
 
 def build_config() -> TierConfig:
@@ -123,6 +132,9 @@ def build_config() -> TierConfig:
         checkpoint_every=_env_int("HARNESS_SCHEDULER_CHECKPOINT_EVERY", 3),
         p_replan=_env_float("HARNESS_SCHEDULER_P_REPLAN", 0.70),
         p_reorder=_env_float("HARNESS_SCHEDULER_P_REORDER", 0.45),
+        wrapup_ratio=_env_float("HARNESS_SCHEDULER_WRAPUP_RATIO", 0.80),
+        phase_replan_limit=_env_int("HARNESS_SCHEDULER_PHASE_REPLANS", 1),
+        replan_min_nodes=_env_int("HARNESS_SCHEDULER_REPLAN_MIN_NODES", 2),
     )
     if cfg.validate_on_load:
         cfg.validate()

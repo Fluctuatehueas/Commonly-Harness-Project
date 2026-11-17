@@ -83,6 +83,7 @@ from api.skills import router as skills_router
 from api.mcp import router as mcp_router
 from api.projects import router as projects_router
 from api.rag import router as rag_router
+from api.scheduler import router as scheduler_router
 from api.session_files import router as session_files_router
 from api.task_flow import router as task_flow_router
 from task_flow.agent_bridge import route_task_flow
@@ -106,6 +107,20 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """在 FastAPI 生命周期中初始化并清理 Agent 加载器。"""
     # 持久化连接属于应用级资源，不能在每个请求中重复创建。
     await agent_loader.initialize()
+    # 后台调度只存在于进程内：重启后把上一进程遗留的 created/running
+    # 运行标记为中断，避免前端一直等待一个不会再推进的 run。
+    try:
+        from scheduler.store import SchedulerStore
+
+        store = SchedulerStore()
+        try:
+            interrupted = await store.mark_runs_interrupted()
+        finally:
+            await store.close()
+        if interrupted:
+            logger.warning("已将 %s 个未完成的调度运行标记为中断", interrupted)
+    except Exception:
+        logger.warning("清理遗留调度运行失败，已忽略", exc_info=True)
     try:
         yield
     finally:
@@ -182,6 +197,25 @@ async def _bind_async_tasks_from_result(
     消息列表，因此必须在客户端开始轮询任务状态前完成同样的登记。
     """
     messages = result.get("messages", []) if isinstance(result, dict) else []
+    # 先从 AI 消息的工具调用里建立 call_id -> 子 Agent 名称映射，
+    # 任务栏需要用它展示「异步子任务 · researcher」而不是裸 UUID。
+    names: dict[str, str] = {}
+    for message in messages:
+        tool_calls = getattr(message, "tool_calls", None)
+        if isinstance(message, dict):
+            tool_calls = message.get("tool_calls", tool_calls)
+        for call in tool_calls or []:
+            if not isinstance(call, dict) or call.get("name") != START_ASYNC_TASK_TOOL_NAME:
+                continue
+            args = call.get("args") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            name = args.get("subagent_type") if isinstance(args, dict) else ""
+            if name:
+                names[str(call.get("id") or "")] = str(name)
     for message in messages:
         tool_name = getattr(message, "name", None)
         content = getattr(message, "content", None)
@@ -194,11 +228,15 @@ async def _bind_async_tasks_from_result(
             continue
         task_id = extract_async_task_id(content)
         if task_id:
+            tool_call_id = getattr(message, "tool_call_id", None)
+            if isinstance(message, dict):
+                tool_call_id = message.get("tool_call_id", tool_call_id)
             await agent_loader.bind_async_task(
                 task_id,
                 user_id=user_id,
                 username=username,
                 thread_id=thread_id,
+                agent_name=names.get(str(tool_call_id or ""), ""),
             )
 
 
@@ -1546,6 +1584,7 @@ async def _stream_response_unlocked(
                             user_id=request.user_id,
                             username=username,
                             thread_id=thread_id,
+                            agent_name=tool_subagent_names.get(tool_call_id, ""),
                         )
                 result_event = {
                     "type": "tool_result",
@@ -1981,6 +2020,7 @@ app.include_router(evolution_router)
 app.include_router(skills_router)
 app.include_router(mcp_router)
 app.include_router(rag_router)
+app.include_router(scheduler_router)
 app.include_router(projects_router)
 app.include_router(session_files_router)
 app.include_router(history_sessions_router)

@@ -7,7 +7,7 @@ PostgreSQL Store 的 ``("agent_profiles", user_id)`` 命名空间，与会话、
 一个档案决定三件事：
 
 * 角色系统提示词（叠加在 Harness 固定的执行/安全策略之上）；
-* 可选的独立 LLM 配置（未配置时继承该用户的模型设置）；
+* 可选的独立 LLM 配置（未配置时使用系统设置里的全局模型）；
 * 允许主 Agent 连接的 MCP 服务集合（空表示全部公共 MCP）。
 """
 
@@ -229,7 +229,7 @@ class AgentProfileStore:
                 raise ValueError("系统提示词不能为空")
             updated["system_prompt"] = prompt[:MAX_SYSTEM_PROMPT]
         if "model" in patch:
-            # 前端回传空字符串表示“沿用用户默认模型”，不保存空键。
+            # 前端回传空字符串表示“沿用全局模型”，不保存空键。
             updated["model"] = normalize_model(patch.get("model"))
         if "mcp_server_ids" in patch:
             updated["mcp_server_ids"] = _normalize_mcp_ids(
@@ -252,7 +252,7 @@ class AgentProfileStore:
 
     @staticmethod
     def merge_model(profile: dict[str, Any], user_model: dict[str, Any]) -> dict[str, Any]:
-        """档案模型配置覆盖用户默认值；未配置的字段继续继承。"""
+        """档案模型配置覆盖全局模型；未配置的字段继续继承。"""
         merged = dict(user_model)
         override = normalize_model(profile.get("model"))
         merged.update(override)

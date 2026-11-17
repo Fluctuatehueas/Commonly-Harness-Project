@@ -113,6 +113,21 @@ export const useSessionStore = defineStore('sessions', () => {
     }
   }
 
+  /** 进入对话页时清除归档超期的会话，返回本次清除数量。 */
+  async function autoPurge(): Promise<number> {
+    try {
+      const res = await fetch(
+        `${API_BASE}/history/auto-purge?user_id=${USER_ID}`,
+        { method: 'POST', signal: AbortSignal.timeout(6000) },
+      )
+      if (!res.ok) return 0
+      const data = (await res.json()) as { purged?: number }
+      return Number(data.purged || 0)
+    } catch {
+      return 0
+    }
+  }
+
   function isArchived(threadId: string | null | undefined): boolean {
     if (!threadId) return false
     return archivedSessions.value.some((item) => item.thread_id === threadId)
@@ -281,6 +296,7 @@ export const useSessionStore = defineStore('sessions', () => {
     refresh,
     refreshArchived,
     autoArchive,
+    autoPurge,
     createSession,
     removeSession,
     renameSession,

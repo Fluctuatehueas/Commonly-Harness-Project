@@ -18,6 +18,13 @@ const props = defineProps<{
   hasApiKey: boolean
   thinkingEnabled: boolean
   contextLimit: number
+  /** 系统设置里的全局模型；「沿用全局」时只读展示。 */
+  globalModel: {
+    model_name: string
+    base_url: string
+    has_api_key: boolean
+    context_limit: number
+  } | null
 }>()
 
 const emit = defineEmits<{
@@ -89,7 +96,7 @@ function apply() {
     v-model="visible"
     title="模型配置"
     kicker="AGENT DOCK // MODEL"
-    subtitle="不启用独立配置时继承当前用户的默认模型；启用后留空的字段仍会逐级回落。"
+    subtitle="「沿用全局」直接使用系统设置里的全局模型；「独立配置」只覆盖该 Agent。"
   >
     <div class="drawer-body">
       <SegmentedSwitch
@@ -147,6 +154,32 @@ function apply() {
           当前窗口 {{ formatContext(draft.contextLimit) }}，用于压缩阈值与占用展示。
         </p>
       </template>
+
+      <div v-else class="global-model">
+        <div class="global-row">
+          <span>来源</span>
+          <strong>系统设置 · 全局模型（.env）</strong>
+        </div>
+        <div class="global-row">
+          <span>模型</span>
+          <strong>{{ globalModel?.model_name || '未配置' }}</strong>
+        </div>
+        <div class="global-row">
+          <span>Base URL</span>
+          <span>{{ globalModel?.base_url || '未配置' }}</span>
+        </div>
+        <div class="global-row">
+          <span>API Key</span>
+          <span>{{ globalModel?.has_api_key ? '已配置' : '未配置' }}</span>
+        </div>
+        <div class="global-row">
+          <span>上下文窗口</span>
+          <span>{{ formatContext(globalModel?.context_limit || 128000) }}</span>
+        </div>
+        <p class="drawer-hint">
+          该 Agent 未单独配置模型，直接使用全局模型；需要覆盖时切到「独立配置」。
+        </p>
+      </div>
     </div>
 
     <template #footer>
@@ -172,6 +205,36 @@ function apply() {
 
 .model-mode {
   padding-bottom: 4px;
+}
+
+.global-model {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px dashed var(--line-strong, rgba(126, 154, 198, 0.3));
+  border-radius: var(--radius-md, 6px);
+  background: var(--bg-elevated, #101a2c);
+}
+
+.global-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.global-row strong {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.global-row > span:last-child {
+  color: var(--text-1);
+  word-break: break-all;
+  text-align: right;
 }
 
 label {

@@ -10,11 +10,23 @@ const props = withDefaults(
     goal?: string
     tier?: string
     mode?: string
-    status: 'running' | 'done' | 'failed' | 'paused'
+    status: 'running' | 'done' | 'failed' | 'paused' | 'cancelled'
     items?: SchedulerPlanItem[]
     planVersion?: number
     summary?: string
     note?: string
+    /** 最近一次检查点：分数、动作与实测维度。 */
+    checkpoint?: {
+      score: number
+      action: string
+      impact?: string
+      uncertainty?: string
+      reason?: string
+    }
+    /** 执行期可读事件：换方法、节流、验收失败、重做快照。 */
+    events?: string[]
+    /** 降级警告：验收异常、落库失败等。 */
+    warnings?: string[]
     /** 顶部常驻卡片：默认折叠，只显示标题与进度条。 */
     collapsible?: boolean
     /** 归档态：位于轨迹底部，直接展示全部条目。 */
@@ -28,6 +40,8 @@ const props = withDefaults(
     planVersion: 1,
     summary: '',
     note: '',
+    events: () => [],
+    warnings: () => [],
     collapsible: false,
     archived: false,
   },
@@ -45,6 +59,7 @@ const statusLabel: Record<string, string> = {
   done: '已完成',
   failed: '失败',
   paused: '待介入',
+  cancelled: '已终止',
 }
 
 const itemStatusLabel: Record<string, string> = {
@@ -63,6 +78,20 @@ const itemIcon: Record<string, 'clock' | 'play' | 'check' | 'close' | 'wrench'> 
   failed: 'close',
   skipped: 'wrench',
   needs_hitl: 'wrench',
+}
+
+const verdictLabel: Record<string, string> = {
+  passed: '通过',
+  failed: '未通过',
+  unverified: '未验收',
+  waived: '免验收',
+}
+
+const actionLabel: Record<string, string> = {
+  continue: '继续',
+  reorder: '轻量重排',
+  replan: '重规划',
+  hitl: '待人工',
 }
 
 const doneCount = computed(
@@ -138,7 +167,15 @@ function showPhase(index: number): boolean {
     <header class="sched-head" :class="{ clickable: collapsible }" @click="toggle">
       <span class="sched-icon">
         <AppIcon
-          :name="status === 'done' ? 'check' : status === 'failed' ? 'close' : 'target'"
+          :name="
+            status === 'done'
+              ? 'check'
+              : status === 'failed'
+                ? 'close'
+                : status === 'cancelled'
+                  ? 'stop'
+                  : 'target'
+          "
           :size="13"
         />
       </span>
@@ -180,6 +217,14 @@ function showPhase(index: number): boolean {
             <span v-if="item.status === 'running'" class="plan-cursor"></span>
           </span>
           <em v-if="item.detail" class="plan-detail" :title="item.detail">{{ item.detail }}</em>
+          <span
+            v-if="item.verdict"
+            class="plan-verdict"
+            :class="item.verdict"
+            :title="item.acceptance?.join('；') || verdictLabel[item.verdict]"
+          >
+            {{ verdictLabel[item.verdict] || item.verdict }}
+          </span>
           <span class="plan-state" :title="itemStatusLabel[item.status] || item.status">
             <AppIcon :name="itemIcon[item.status] || 'clock'" :size="13" />
           </span>
@@ -194,7 +239,23 @@ function showPhase(index: number): boolean {
       </li>
     </ul>
 
-    <footer v-if="note || summary" class="sched-foot">
+    <footer
+      v-if="note || summary || checkpoint || events.length || warnings.length"
+      class="sched-foot"
+    >
+      <p v-if="checkpoint" class="sched-checkpoint">
+        检查点 {{ checkpoint.score.toFixed(2) }} ·
+        {{ actionLabel[checkpoint.action] || checkpoint.action }}
+        <template v-if="checkpoint.impact || checkpoint.uncertainty">
+          · 影响 {{ checkpoint.impact || '-' }} / 不确定性 {{ checkpoint.uncertainty || '-' }}
+        </template>
+      </p>
+      <p v-for="(line, index) in events" :key="`ev-${index}`" class="sched-event">
+        {{ line }}
+      </p>
+      <p v-for="(line, index) in warnings" :key="`warn-${index}`" class="sched-warning">
+        {{ line }}
+      </p>
       <p v-if="note" class="sched-note">{{ note }}</p>
       <p v-if="summary" class="sched-summary">{{ summary }}</p>
     </footer>
@@ -222,6 +283,10 @@ function showPhase(index: number): boolean {
 
 .sched-card.paused {
   border-color: rgba(242, 176, 60, 0.42);
+}
+
+.sched-card.cancelled {
+  border-color: rgba(150, 160, 175, 0.35);
 }
 
 .sched-card.archived {
@@ -263,6 +328,11 @@ function showPhase(index: number): boolean {
 .sched-card.paused .sched-icon {
   color: var(--amber);
   background: rgba(242, 176, 60, 0.12);
+}
+
+.sched-card.cancelled .sched-icon {
+  color: var(--text-3);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .sched-title {
@@ -331,6 +401,10 @@ function showPhase(index: number): boolean {
 
 .sched-card.failed .sched-progress i {
   background: var(--danger);
+}
+
+.sched-card.cancelled .sched-progress i {
+  background: var(--text-3);
 }
 
 .plan-list {
@@ -428,8 +502,7 @@ function showPhase(index: number): boolean {
 }
 
 .plan-state {
-  display: grid;
-  place-items: center;
+  display: grid;  place-items: center;
   flex: none;
   width: 18px;
   height: 18px;
@@ -475,6 +548,52 @@ function showPhase(index: number): boolean {
   gap: 3px;
   padding-top: 2px;
   border-top: 1px solid var(--line);
+}
+
+.plan-verdict {
+  flex: none;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-style: normal;
+  font-size: 9px;
+  color: var(--text-3);
+}
+
+.plan-verdict.passed {
+  color: var(--green);
+  border-color: rgba(55, 201, 164, 0.45);
+}
+
+.plan-verdict.failed {
+  color: var(--danger);
+  border-color: rgba(226, 96, 94, 0.45);
+}
+
+.plan-verdict.waived {
+  color: var(--amber);
+  border-color: rgba(242, 176, 60, 0.45);
+}
+
+.sched-checkpoint,
+.sched-event,
+.sched-warning {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.sched-checkpoint {
+  color: var(--accent-cyan);
+}
+
+.sched-event {
+  color: var(--text-3);
+}
+
+.sched-warning {
+  color: var(--amber);
 }
 
 .sched-note,

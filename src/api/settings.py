@@ -1,9 +1,11 @@
 """模型与沙箱配置读写接口：支持 .env 热更新。
 
-- GET  /settings/model   返回当前模型配置（API Key 只回传是否已设置）
-- PUT  /settings/model   更新 .env（api_key 留空则保留原值），并热更新运行中的模型
-- GET  /settings/sandbox 返回沙箱配置、执行模式与本机运行时探测结果
-- PUT  /settings/sandbox 更新沙箱配置并重建沙箱管理器
+- GET  /settings/model         返回当前用户生效的模型配置（API Key 只回传是否已设置）
+- PUT  /settings/model         更新用户级运行开关（思考 / 联网）并热更新
+- GET  /settings/model/global  返回全局 LLM 配置（.env，所有用户共享）
+- PUT  /settings/model/global  写入 .env 并热更新，清空所有用户的 Agent 缓存
+- GET  /settings/sandbox       返回沙箱配置、执行模式与本机运行时探测结果
+- PUT  /settings/sandbox       更新沙箱配置并重建沙箱管理器
 - POST /settings/sandbox/check 检测沙箱服务端口是否可达
 """
 
@@ -64,14 +66,21 @@ DEFAULT_ARCHIVE_DAYS = 30
 
 
 class ModelSettingsUpdate(BaseModel):
-    """PUT /settings/model 请求体；None 字段不改动，api_key 空串视为不改动。"""
+    """PUT /settings/model 请求体：仅用户级运行开关；None 字段不改动。
+
+    模型名 / 端点 / 密钥 / 上下文窗口已收归全局模型（.env），不再接受用户级写入。
+    """
+
+    thinking_enabled: bool | None = None
+    web_search_enabled: bool | None = None
+
+
+class GlobalModelSettingsUpdate(BaseModel):
+    """PUT /settings/model/global 请求体；None 字段不改动，api_key 空串视为不改动。"""
 
     model_name: str | None = Field(None, min_length=1, max_length=120)
     base_url: str | None = Field(None, max_length=300)
     api_key: str | None = Field(None, max_length=300)
-    thinking_enabled: bool | None = None
-    web_search_enabled: bool | None = None
-    # 上下文窗口（tokens）。只影响监控 / 压缩阈值展示，不改变模型实际能力。
     context_limit: int | None = Field(None, ge=16000, le=2000000)
 
 
@@ -110,29 +119,68 @@ async def get_feedback_settings() -> dict[str, Any]:
     return {"enabled": bool(agent_config.FEEDBACK_ENABLED)}
 
 
+def _global_model_state() -> dict[str, Any]:
+    """全局模型状态（密钥只回传是否已设置）。"""
+    settings = user_data.global_model_settings()
+    return {
+        "model_name": settings["model_name"],
+        "base_url": settings["base_url"],
+        "has_api_key": bool(settings["api_key"]),
+        "context_limit": settings["context_limit"],
+        "env_path": str(ENV_PATH),
+    }
+
+
+@router.get("/settings/model/global")
+async def get_global_model_settings() -> dict[str, Any]:
+    """返回系统设置里的全局 LLM 配置（.env，所有用户共享）。"""
+    return _global_model_state()
+
+
+@router.put("/settings/model/global")
+async def update_global_model_settings(
+    body: GlobalModelSettingsUpdate,
+) -> dict[str, Any]:
+    """写入 .env 并热更新；全局模型变化需要清空所有用户的 Agent 缓存。"""
+    updates: dict[str, str] = {}
+    if body.model_name:
+        updates[ENV_KEY_MODEL] = body.model_name.strip()
+    if body.base_url is not None:
+        value = body.base_url.strip()
+        if value and not value.startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="base_url 必须以 http:// 或 https:// 开头")
+        updates[ENV_KEY_BASE_URL] = value
+    if body.api_key:
+        updates[ENV_KEY_API] = body.api_key.strip()
+    if body.context_limit is not None:
+        updates[ENV_KEY_CONTEXT_LIMIT] = str(int(body.context_limit))
+    if not updates:
+        raise HTTPException(status_code=422, detail="没有需要更新的字段")
+
+    try:
+        _update_env_file(updates)
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"写入 .env 失败: {error}") from error
+
+    reload_model_config()
+    from api.agent_loader import agent_loader
+
+    await agent_loader.reset_agents()
+    return {"ok": True, "updated": sorted(updates), "current": _global_model_state()}
+
+
 @router.put("/settings/model")
 async def update_model_settings(
     body: ModelSettingsUpdate,
     user_id: str = Query("", max_length=64),
 ) -> dict[str, Any]:
-    """写入当前用户的模型配置并热更新；API Key 仅在显式提供非空值时更新。"""
+    """写入当前用户的运行开关（思考 / 联网）并热更新该用户的 Agent 图。"""
     uid = effective_user_id(user_id)
     patch: dict[str, Any] = {}
-    if body.model_name:
-        patch["model_name"] = body.model_name.strip()
-    if body.base_url is not None:
-        value = body.base_url.strip()
-        if value and not value.startswith(("http://", "https://")):
-            raise HTTPException(status_code=422, detail="base_url 必须以 http:// 或 https:// 开头")
-        patch["base_url"] = value
-    if body.api_key:
-        patch["api_key"] = body.api_key.strip()
     if body.thinking_enabled is not None:
         patch["thinking_enabled"] = bool(body.thinking_enabled)
     if body.web_search_enabled is not None:
         patch["web_search_enabled"] = bool(body.web_search_enabled)
-    if body.context_limit is not None:
-        patch["context_limit"] = int(body.context_limit)
     if not patch:
         raise HTTPException(status_code=422, detail="没有需要更新的字段")
 

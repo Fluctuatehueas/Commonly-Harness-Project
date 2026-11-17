@@ -37,6 +37,36 @@ logger = logging.getLogger(__name__)
 # 子进程日志回调：(server_id, message, level)
 LogSink = Callable[[str, str, str], None]
 
+# MCP 规范：客户端携带服务端不认识的 mcp-session-id 时，服务端返回 404；
+# SDK 会把它转换成 JSON-RPC 32600，消息固定为 "Session terminated"。
+SESSION_LOST_JSONRPC_CODE = 32600
+_SESSION_LOST_TOKENS = (
+    "session terminated",
+    "session not found",
+    "session expired",
+    "session closed",
+    "invalid session",
+    "unknown session",
+    "no valid session",
+    "404",
+)
+
+
+def is_session_lost(error: BaseException) -> bool:
+    """判断异常是否表示「服务端已不再认识当前 MCP 会话」。
+
+    典型来源：MCP Server 重启后内存里的会话表被清空（鉴权模式下会话
+    还与凭据绑定，重启 / 轮换后必然失配），客户端仍携带旧的
+    ``mcp-session-id``，服务端按规范返回 404，SDK 再转换成
+    ``Session terminated``。这类错误可以安全地淘汰旧连接后重连重放。
+    """
+    payload = getattr(error, "error", None)
+    if getattr(payload, "code", None) == SESSION_LOST_JSONRPC_CODE:
+        return True
+    text = str(error).lower()
+    return any(token in text for token in _SESSION_LOST_TOKENS)
+
+
 # 当前正在建立/持有连接的 server_id；stdio 客户端在自己的 task 里读 stdout
 # 报错时，靠它把日志归到正确的服务上（子 task 会继承创建时的 context）。
 _current_server: ContextVar[str] = ContextVar("mcp_current_server", default="")
@@ -342,6 +372,16 @@ class MCPClientRegistry:
                 except BaseException as exc:  # noqa: BLE001
                     if not request.future.done():
                         request.future.set_exception(exc)
+                    if is_session_lost(exc):
+                        # 会话已失效：退出 worker，由 finally 关闭本地传输并
+                        # 标记 closed。池中的失效连接不会被再次复用，下一次
+                        # acquire 会重新 initialize 并拿到新的 mcp-session-id。
+                        logger.warning(
+                            "MCP 会话已失效，淘汰旧连接: server=%s pool_key=%s",
+                            entry.server_id,
+                            entry.pool_key[:23],
+                        )
+                        break
         except BaseException as exc:  # noqa: BLE001
             if not entry.ready.done():
                 entry.ready.set_exception(exc)
@@ -382,15 +422,16 @@ class MCPClientRegistry:
         lock = await self._key_lock(key)
         async with lock:
             entry = self._entries.get(key)
-            if entry is not None and not entry.closed:
+            if entry is not None and (entry.closed or entry.worker.done()):
+                # worker 已退出（会话失效 / 被远端关闭）：失效连接绝不能复用。
+                self._entries.pop(key, None)
+                entry = None
+            if entry is not None:
                 entry.ref_count += 1
                 entry.touch()
                 entry.reused = True
                 self._hits += 1
                 return entry
-
-            if entry is not None and entry.closed:
-                self._entries.pop(key, None)
 
             loop = asyncio.get_running_loop()
             entry = PooledSession(
@@ -425,6 +466,19 @@ class MCPClientRegistry:
         async with self._global_lock:
             entry.ref_count = max(0, entry.ref_count - 1)
             entry.touch()
+
+    async def discard(self, entry: PooledSession) -> None:
+        """把调用途中被判定失效的会话从池中摘除并关闭。
+
+        只在池里仍是同一个对象时摘除，避免误伤同一 pool_key 上刚建好的
+        新会话；随后 ``acquire`` 会重新 initialize 并生成新的会话 ID。
+        """
+        async with self._global_lock:
+            if self._entries.get(entry.pool_key) is entry:
+                self._entries.pop(entry.pool_key, None)
+            entry.ref_count = 0
+            entry.touch()
+        await self._close_entry(entry)
 
     def peek(self, config: ServerConfig) -> PooledSession | None:
         """查看池中是否已有该连接签名的会话（不增加引用计数）。"""

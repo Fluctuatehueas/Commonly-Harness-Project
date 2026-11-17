@@ -9,6 +9,7 @@ export type TrajectoryEventType =
   | 'delegation'
   | 'hitl'
   | 'compaction'
+  | 'verification'
 
 export interface TrajectoryTokens {
   input?: number
@@ -61,6 +62,27 @@ export interface TrajectoryCompactionBudget {
   hard_pct?: number
 }
 
+export interface TrajectoryVerificationIssue {
+  dimension?: string
+  severity?: string
+  message?: string
+  evidence_ref?: string
+  suggestion?: string
+}
+
+export interface TrajectoryVerification {
+  point?: string
+  level?: string
+  verdict?: string
+  source?: string
+  judge_model?: string
+  blocking?: number
+  degraded?: boolean
+  issues?: TrajectoryVerificationIssue[]
+  scores?: Record<string, number>
+  evidence_refs?: string[]
+}
+
 export interface TrajectoryEvent {
   id: string
   run_id: string
@@ -79,8 +101,10 @@ export interface TrajectoryEvent {
   tool_call_id?: string
   subagent_name?: string
   source?: string
-  summary?: Record<string, number>
+  summary?: Record<string, unknown>
   tool_names?: string[]
+  // 验证事件附加字段
+  verification?: TrajectoryVerification
   // 压缩事件附加字段
   compaction_id?: string
   budget?: TrajectoryCompactionBudget

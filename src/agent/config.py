@@ -59,9 +59,9 @@ MODEL_IMAGE_INPUTS = os.getenv("HARNESS_MODEL_IMAGE_INPUTS", "true").strip().low
 # ------------------------------------------------------------
 # 模型客户端限流与重试
 # ------------------------------------------------------------
-# requests_per_second=0 表示关闭限流；默认 1 次/秒、最多 3 个突发。
+# requests_per_second=0 表示关闭限流；默认 1 次/秒、突发 1，避免瞬时并发打满厂商连接。
 MODEL_REQUESTS_PER_SECOND = float(os.getenv("HARNESS_MODEL_REQUESTS_PER_SECOND", "1"))
-MODEL_RATE_LIMIT_BURST = int(os.getenv("HARNESS_MODEL_RATE_LIMIT_BURST", "3"))
+MODEL_RATE_LIMIT_BURST = int(os.getenv("HARNESS_MODEL_RATE_LIMIT_BURST", "1"))
 # OpenAI 兼容客户端的 429 重试次数（指数退避，服务端有 Retry-After 时优先遵循）。
 MODEL_MAX_RETRIES = int(os.getenv("HARNESS_MODEL_MAX_RETRIES", "5"))
 # 默认为开启：主 Agent 需要在一条消息里并发委派多个子 Agent 实例。
@@ -194,6 +194,9 @@ def build_model(
     base_url = str(settings.get("base_url") or "")
     api_key = str(settings.get("api_key") or "")
     thinking = bool(settings.get("thinking_enabled"))
+    if role == "judge" and not JUDGE_THINKING:
+        # 判官只做局部比对：默认关闭思考，避免回退主模型时也走重推理。
+        thinking = False
     _require_model_credentials(api_key)
     key = ":".join(
         [
@@ -219,6 +222,10 @@ def build_model(
     }
     if role == "summary":
         kwargs["temperature"] = 0.3
+    elif role == "judge":
+        # 判官只做局部比对：低温、短输出，避免自由发挥与成本失控。
+        kwargs["temperature"] = JUDGE_TEMPERATURE
+        kwargs["max_tokens"] = JUDGE_MAX_TOKENS
     client = ChatDeepSeek(**kwargs)
     if MODEL_IMAGE_INPUTS:
         # 覆盖静态档案里的 image_inputs=False，否则 deepagents 的 Filesystem 中间件
@@ -258,6 +265,22 @@ def get_summary_model(user_id: str | None = None) -> ChatDeepSeek:
         role="summary",
         user_id=resolved_user,
     )
+
+
+def get_judge_model(user_id: str | None = None) -> ChatDeepSeek:
+    """返回验证判官模型；未配置独立模型时回退当前用户的主模型配置。"""
+    from agent.user_data import model_settings
+
+    resolved_user = _user_id_or_current(user_id)
+    settings = model_settings(resolved_user)
+    if JUDGE_MODEL_NAME:
+        settings = {
+            **settings,
+            "model_name": JUDGE_MODEL_NAME,
+            "base_url": JUDGE_BASE_URL or settings.get("base_url", ""),
+            "api_key": JUDGE_API_KEY or settings.get("api_key", ""),
+        }
+    return build_model(settings, role="judge", user_id=resolved_user)
 
 
 def get_vision_model(user_id: str | None = None) -> ChatDeepSeek:
@@ -884,6 +907,52 @@ EVOLUTION_EXPERIENCE_INJECTION_ENABLED = _env_flag(
     "HARNESS_EVOLUTION_EXPERIENCE_INJECTION", True
 )
 EVOLUTION_JUDGE_ENABLED = _env_flag("HARNESS_EVOLUTION_JUDGE", True)
+# ============================================================
+# 验证（纯观测）
+# ============================================================
+# 验证只写轨迹与信号，不阻断、不改写、不驱动重做。
+VERIFICATION_ENABLED = _env_flag("HARNESS_VERIFICATION_ENABLED", True)
+# 默认三个验证点全开：V1 只做 L0（零模型），V2 的 L1 默认 10% 抽样。
+VERIFICATION_POINTS = frozenset(
+    item.strip()
+    for item in os.getenv(
+        "HARNESS_VERIFICATION_POINTS",
+        "v1_tool,v2_subagent,v3_final",
+    ).split(",")
+    if item.strip()
+)
+# V3 在回答放行后后台执行；关闭时在 after_agent 内同步执行（仅调试用）。
+VERIFICATION_ASYNC = _env_flag("HARNESS_VERIFICATION_ASYNC", True)
+VERIFICATION_MAX_LEVEL = os.getenv("HARNESS_VERIFICATION_MAX_LEVEL", "l2").lower()
+VERIFICATION_L1_SAMPLE_RATE = float(
+    os.getenv("HARNESS_VERIFICATION_L1_SAMPLE_RATE", "0.1")
+)
+VERIFICATION_MAX_JUDGE_CALLS = int(
+    os.getenv("HARNESS_VERIFICATION_MAX_JUDGE_CALLS", "3")
+)
+VERIFICATION_MAX_DELEGATIONS = int(
+    os.getenv("HARNESS_VERIFICATION_MAX_DELEGATIONS", "1")
+)
+# L2 自动深评：默认对 V3 最终产出开启；V1/V2 仍只在 fail 时触发。
+VERIFICATION_L2_ENABLED = _env_flag("HARNESS_VERIFICATION_L2_ENABLED", True)
+# 只有达到该风险等级的最终产出才自动跑 L2，避免闲聊也调用模型。
+VERIFICATION_L2_RISK_TIER = os.getenv("HARNESS_VERIFICATION_L2_RISK_TIER", "t1")
+VERIFICATION_BLOCKING_SCORE = float(
+    os.getenv("HARNESS_VERIFICATION_BLOCKING_SCORE", "0.6")
+)
+VERIFICATION_MAX_EVIDENCE = int(
+    os.getenv("HARNESS_VERIFICATION_MAX_EVIDENCE", "20")
+)
+
+# 判官独立配置；未配置模型名时回退当前用户的摘要模型配置。
+JUDGE_MODEL_NAME = (os.getenv("HARNESS_JUDGE_MODEL_NAME") or "").strip()
+JUDGE_BASE_URL = (os.getenv("HARNESS_JUDGE_BASE_URL") or "").strip()
+JUDGE_API_KEY = (os.getenv("HARNESS_JUDGE_API_KEY") or "").strip()
+JUDGE_TEMPERATURE = float(os.getenv("HARNESS_JUDGE_TEMPERATURE", "0.1"))
+JUDGE_MAX_TOKENS = int(os.getenv("HARNESS_JUDGE_MAX_TOKENS", "800"))
+JUDGE_TIMEOUT = float(os.getenv("HARNESS_JUDGE_TIMEOUT", "6"))
+# 判官默认关闭思考模式；需要更强推理时显式开启。
+JUDGE_THINKING = _env_flag("HARNESS_JUDGE_THINKING", False)
 # PDCA 闭环：最终回答未通过自检时，带反馈重做的最大轮次（不含首次执行）。
 PDCA_ENABLED = _env_flag("HARNESS_PDCA_ENABLED", True)
 PDCA_MAX_ROUNDS = int(os.getenv("HARNESS_PDCA_MAX_ROUNDS", "2"))

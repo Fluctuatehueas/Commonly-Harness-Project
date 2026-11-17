@@ -11,7 +11,11 @@ from typing import Any, Callable
 
 import mcp.types as mcp_types
 
-from agent.mcp.client_registry import MCPClientRegistry, PooledSession
+from agent.mcp.client_registry import (
+    MCPClientRegistry,
+    PooledSession,
+    is_session_lost,
+)
 from agent.mcp.observer import McpObserver
 from agent.mcp.registry import ToolRegistry
 from agent.mcp.types import (
@@ -41,6 +45,15 @@ def classify_exception(error: BaseException, *, server_id: str = "") -> McpError
             retryable=True,
             http_status=504,
         )
+    if is_session_lost(error):
+        return McpError(
+            "MCP 会话已失效（服务可能已重启或凭据已轮换），将自动重连",
+            code="MCP_SESSION_LOST",
+            category=ErrorCategory.TRANSIENT,
+            server_id=server_id,
+            retryable=True,
+            http_status=502,
+        )
     text = f"{type(error).__name__}: {error}".lower()
     if any(token in text for token in ("401", "403", "unauthorized", "forbidden", "auth")):
         return McpError(
@@ -66,6 +79,12 @@ def classify_exception(error: BaseException, *, server_id: str = "") -> McpError
             "temporarily",
             "process exited",
             "broken pipe",
+            "closedresource",
+            "closed resource",
+            "brokenresource",
+            "stream closed",
+            "connection closed",
+            "end of file",
         )
     ):
         return McpError(
@@ -93,6 +112,13 @@ def classify_exception(error: BaseException, *, server_id: str = "") -> McpError
         retryable=False,
         http_status=502,
     )
+
+
+def _is_recoverable_session_error(error: BaseException) -> bool:
+    """是否为「旧会话已失效」且可通过重连重放恢复的错误。"""
+    if isinstance(error, McpError):
+        return error.code == "MCP_SESSION_CLOSED"
+    return is_session_lost(error)
 
 
 def _content_block_text(block: Any) -> str:
@@ -204,12 +230,41 @@ class CallRouter:
         try:
             entry = await self._pool.acquire(config)
             pool_reused = entry.reused
-            result = await self._pool.call_tool(
-                entry,
-                remote_name,
-                args,
-                timeout_ms=config.call_timeout_ms,
-            )
+            try:
+                result = await self._pool.call_tool(
+                    entry,
+                    remote_name,
+                    args,
+                    timeout_ms=config.call_timeout_ms,
+                )
+            except Exception as exc:
+                if not _is_recoverable_session_error(exc):
+                    raise
+                # 服务端重启后内存会话表被清空，旧 mcp-session-id 已失效。
+                # 请求在服务端未被处理，淘汰旧连接后重连重放是安全的。
+                await self._pool.discard(entry)
+                entry = None
+                self._observer.record(
+                    "mcp.session_lost",
+                    server_id=server_id,
+                    level="warning",
+                    tool=remote_name,
+                    request_id=request_id,
+                    message="会话已失效，淘汰旧连接并重连重试",
+                )
+                logger.warning(
+                    "MCP 会话已失效，重连后重试: server=%s tool=%s",
+                    server_id,
+                    remote_name,
+                )
+                entry = await self._pool.acquire(config)
+                pool_reused = entry.reused
+                result = await self._pool.call_tool(
+                    entry,
+                    remote_name,
+                    args,
+                    timeout_ms=config.call_timeout_ms,
+                )
             duration_ms = int((time.monotonic() - started) * 1000)
             text = self._format_result(result)
             if result.isError:

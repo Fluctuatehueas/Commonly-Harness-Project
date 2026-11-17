@@ -87,6 +87,8 @@ def _layer(value: Any, fallback: InterventionLayer) -> InterventionLayer:
 
 
 def rule_based_layer(signals: RunSignals) -> tuple[InterventionLayer, str]:
+    if signals.verification_blocking:
+        return InterventionLayer.HARNESS, "verification_blocking"
     if signals.verification_failed or signals.hitl_rejected:
         return InterventionLayer.HARNESS, "verification_or_hitl_failure"
     if signals.tool_errors:
@@ -106,6 +108,9 @@ def _signal_payload(signals: RunSignals) -> str:
             "hitl_rejected": signals.hitl_rejected,
             "user_correction": signals.user_correction,
             "repeated_steps": signals.repeated_steps,
+            "verification_blocking": signals.verification_blocking,
+            "verification_degraded": signals.verification_degraded,
+            "verification_issues": signals.verification_issues[-3:],
         },
         ensure_ascii=False,
     )

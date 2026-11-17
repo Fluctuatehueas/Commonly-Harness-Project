@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from .models import PlanItem, ReplanScope, SchedulePlan
+from .models import PlanItem, ReplanScope, SchedulePlan, Tier
 from .planner import _link_phases_sequential, topological_waves
 
 
@@ -39,14 +39,26 @@ def _downstream(plan: SchedulePlan, item_id: str) -> set[str]:
     return seen
 
 
-def reorder(plan: SchedulePlan) -> tuple[SchedulePlan, list[str], str]:
-    """只重算波次，不改结构。"""
+def reorder(
+    plan: SchedulePlan, item_id: str | None = None, reason: str = ""
+) -> tuple[SchedulePlan, list[str], str]:
+    """只调整同波次内顺序：给定 item_id 时把它提前到所在波次最前。
+
+    不改依赖、不重算波次，否则排序会被 depends_on 覆盖回去。
+    """
     updated = plan.model_copy(deep=True)
-    before = [list(wave) for wave in updated.waves]
-    _refresh_waves(updated)
-    changed = sorted({item for wave in updated.waves for item in wave}) if updated.waves != before else []
+    changed: list[str] = []
+    if item_id:
+        for wave in updated.waves:
+            if item_id in wave and wave[0] != item_id:
+                wave.remove(item_id)
+                wave.insert(0, item_id)
+                changed = list(wave)
+                break
+    if not changed:
+        return updated, [], reason or "没有可调整的同波次条目"
     updated.plan_version += 1
-    return updated, changed, "重新计算波次，未改变条目依赖"
+    return updated, changed, reason or f"将 {item_id} 提前到波次最前"
 
 
 def subtree(plan: SchedulePlan, item_id: str, reason: str = "") -> tuple[SchedulePlan, list[str], str]:
@@ -101,6 +113,87 @@ def promote_pending(plan: SchedulePlan) -> tuple[SchedulePlan, list[str], str]:
     return updated, changed, f"展开阶段 {phase.id}：{phase.title}"
 
 
+def _drop_dangling_deps(plan: SchedulePlan) -> None:
+    """换方法后清理指向已删除条目的依赖，避免波次计算报错。"""
+    ids = {item.id for item in _all_items(plan)}
+    for item in _all_items(plan):
+        item.depends_on = [dep for dep in item.depends_on if dep in ids]
+
+
+def has_untried_method(plan: SchedulePlan, phase_id: str) -> bool:
+    phase = next((p for p in plan.phases if p.id == phase_id), None)
+    if phase is None:
+        return False
+    return any(method.id not in phase.tried_methods for method in phase.methods)
+
+
+def switch_method(
+    plan: SchedulePlan, phase_id: str, *, reason: str = ""
+) -> tuple[SchedulePlan, list[str], str, bool]:
+    """切到该阶段下一个未试过的方法：已完成叶子保留，其余条目被替换。"""
+    updated = plan.model_copy(deep=True)
+    phase = next((p for p in updated.phases if p.id == phase_id), None)
+    if phase is None:
+        return plan, [], f"阶段 {phase_id} 不存在", False
+    candidate = next(
+        (method for method in phase.methods if method.id not in phase.tried_methods),
+        None,
+    )
+    if candidate is None:
+        return plan, [], f"阶段 {phase_id} 没有可用方法", False
+
+    done_items = [item for item in phase.items if item.status == "done"]
+    done_ids = {item.id for item in done_items}
+    new_items = [
+        blueprint.model_copy(deep=True)
+        for blueprint in candidate.items
+        if blueprint.id not in done_ids
+    ]
+    phase.items = done_items + new_items
+    phase.active_method_id = candidate.id
+    phase.tried_methods.append(candidate.id)
+
+    _drop_dangling_deps(updated)
+    if updated.mode == "reference" or updated.tier is Tier.MD:
+        _link_phases_sequential(updated.phases)
+    waves, errors = topological_waves(_all_items(updated))
+    if not errors:
+        updated.waves = [[item.id for item in wave] for wave in waves]
+    updated.plan_version += 1
+    detail = reason or f"阶段 {phase.id} 换方法：{candidate.title or candidate.id}"
+    return updated, [item.id for item in new_items], detail, True
+
+
+def revision_targets(plan: SchedulePlan, item_id: str) -> list[str]:
+    """会被 revise 重开的条目：目标本身与状态不是 pending 的下游。"""
+    targets = _downstream(plan, item_id)
+    return [
+        item.id
+        for item in _all_items(plan)
+        if item.id in targets and item.status != "pending"
+    ]
+
+
+def revise(
+    plan: SchedulePlan, item_id: str, *, reason: str = ""
+) -> tuple[SchedulePlan, list[str], str]:
+    """验收失败后重开条目及其全部下游；已完成的下游也要重新验收。"""
+    updated = plan.model_copy(deep=True)
+    targets = _downstream(updated, item_id)
+    changed: list[str] = []
+    for item in _all_items(updated):
+        if item.id not in targets or item.status == "pending":
+            continue
+        item.status = "pending"
+        item.error = ""
+        item.summary = ""
+        item.finished_at = None
+        changed.append(item.id)
+    _refresh_waves(updated)
+    updated.plan_version += 1
+    return updated, changed, reason or f"重开 {item_id} 及其下游"
+
+
 def apply_scope(
     plan: SchedulePlan,
     scope: ReplanScope,
@@ -113,13 +206,17 @@ def apply_scope(
         return subtree(plan, item_id, reason)
     if scope == "full":
         return full(plan, reason)
-    return reorder(plan)
+    return reorder(plan, item_id, reason)
 
 
 __all__ = [
     "apply_scope",
     "full",
+    "has_untried_method",
     "promote_pending",
     "reorder",
+    "revise",
+    "revision_targets",
     "subtree",
+    "switch_method",
 ]

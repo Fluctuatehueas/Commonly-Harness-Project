@@ -409,6 +409,19 @@ async def auto_archive_sessions(
     return {"archived": archived, "days": days}
 
 
+@router.post("/auto-purge")
+async def auto_purge_sessions(
+    user_id: str = Query("anonymous", min_length=1),
+) -> dict[str, Any]:
+    """清除归档超过保留天数的会话；保留天数与自动归档配置一致。
+
+    前端进入对话页时调用一次，与 ``/auto-archive`` 成对执行。
+    """
+    days = _archive_days(user_id)
+    purged = await agent_loader.purge_archived_sessions(user_id, days)
+    return {"purged": purged, "days": days}
+
+
 @router.get("/{thread_id}/usage")
 async def get_session_usage(
     thread_id: str,

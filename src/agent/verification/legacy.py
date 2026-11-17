@@ -1,9 +1,7 @@
-"""PDCA 闭环与任务流共用的产出校验。
+"""任务流与主链路共用的旧版产出校验。
 
-- ``rule_check``：不调用模型的确定性检查；
-- ``review_against_example``：有参考样例时，用摘要模型对照格式与结构。
-
-任务流步骤校验与主 Agent 的最终回答自检都复用这里，避免两套规则漂移。
+保留原有函数签名，避免 ``agent.verification`` 从模块升级为包时
+破坏现有 import。
 """
 
 from __future__ import annotations

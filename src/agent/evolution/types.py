@@ -317,3 +317,7 @@ class RunSignals:
     repeated_steps: int = 0
     injected_experience_ids: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
+    # 验证（纯观测）结论：只作为信号，不参与回答放行。
+    verification_blocking: int = 0
+    verification_degraded: bool = False
+    verification_issues: list[dict[str, Any]] = field(default_factory=list)

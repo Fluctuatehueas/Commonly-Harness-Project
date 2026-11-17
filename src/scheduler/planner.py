@@ -14,6 +14,8 @@ from .config import TierConfig
 from .models import (
     PlanItem,
     PlanItemInput,
+    PlanMethod,
+    PlanMethodInput,
     PlanPhase,
     PlanPhaseInput,
     SchedulePlan,
@@ -50,6 +52,35 @@ def _item_status_default(item: PlanItemInput, phase_id: str) -> PlanItem:
 
 def _all_items(phases: list[PlanPhase]) -> list[PlanItem]:
     return [item for phase in phases for item in phase.items]
+
+
+def _normalize_phase(phase: PlanPhaseInput) -> PlanPhase:
+    """把阶段入参转成计划模型：没有 methods 时合成一个默认方法。"""
+    methods_input = list(phase.methods)
+    if not methods_input:
+        methods_input = [
+            PlanMethodInput(id=f"{phase.id}.m0", title=phase.title, items=list(phase.items))
+        ]
+    methods = [
+        PlanMethod(
+            id=method.id,
+            title=method.title or phase.title,
+            reason=method.reason,
+            precondition=method.precondition,
+            items=[_item_status_default(item, phase.id) for item in method.items],
+        )
+        for method in methods_input
+    ]
+    active = methods[0]
+    return PlanPhase(
+        id=phase.id,
+        title=phase.title,
+        goal=phase.goal,
+        items=[item.model_copy(deep=True) for item in active.items],
+        methods=methods,
+        active_method_id=active.id,
+        tried_methods=[active.id],
+    )
 
 
 def topological_waves(items: list[PlanItem]) -> tuple[list[list[PlanItem]], list[str]]:
@@ -126,6 +157,12 @@ def _validate(phases: list[PlanPhase], cfg: TierConfig) -> list[str]:
     for phase in phases:
         if not phase.items:
             errors.append(f"阶段 {phase.id} 没有条目")
+        method_ids = [method.id for method in phase.methods]
+        if len(method_ids) != len(set(method_ids)):
+            errors.append(f"阶段 {phase.id} 的方法 ID 存在重复")
+        for method in phase.methods:
+            if not method.items:
+                errors.append(f"阶段 {phase.id} 的方法 {method.id} 没有条目")
     return errors
 
 
@@ -153,15 +190,7 @@ def build_plan(
     if tier is Tier.EZ:
         raise PlanError(["EZ 档不需要调度计划，直接执行主 Agent ReAct 循环"])
 
-    normalized = [
-        PlanPhase(
-            id=phase.id,
-            title=phase.title,
-            goal=phase.goal,
-            items=[_item_status_default(item, phase.id) for item in phase.items],
-        )
-        for phase in phases
-    ]
+    normalized = [_normalize_phase(phase) for phase in phases]
     if not normalized:
         raise PlanError(["阶段列表为空"])
 
@@ -278,6 +307,11 @@ def build_reference_plan(
 
 def plan_warnings(plan: SchedulePlan, cfg: TierConfig) -> list[str]:
     warnings: list[str] = []
+    alternatives = sum(
+        max(0, len(phase.methods) - 1) for phase in plan.phases + plan.pending_phases
+    )
+    if alternatives:
+        warnings.append(f"共 {alternatives} 个候选方法，失败时会按顺序换方法")
     if len(plan.waves) > cfg.wave_depth_warn:
         warnings.append(
             f"依赖深度 {len(plan.waves)} 超过 {cfg.wave_depth_warn}，建议重新划分阶段"

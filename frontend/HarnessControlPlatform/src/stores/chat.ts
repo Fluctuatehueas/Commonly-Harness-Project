@@ -4,6 +4,7 @@ import { defineStore, acceptHMRUpdate } from 'pinia'
 import { computed, ref } from 'vue'
 import { API_BASE } from '@/api/client'
 import { submitFeedback } from '@/api/feedback'
+import { subscribeSchedulerRun } from '@/api/scheduler'
 import { USER_ID } from '@/stores/sessions'
 import { currentUser } from '@/api/identity'
 import type { ContextFile } from '@/api/context'
@@ -31,6 +32,9 @@ export interface SchedulerPlanItem {
   phaseTitle?: string
   status: 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'needs_hitl'
   detail?: string
+  // 验收结论与条件，来自 item_done 事件与 plan_items 快照
+  verdict?: 'passed' | 'failed' | 'unverified' | 'waived'
+  acceptance?: string[]
 }
 
 export interface ChatMsg {
@@ -83,12 +87,24 @@ export interface ChatMsg {
   schedGoal?: string
   schedTier?: string
   schedMode?: string
-  schedStatus?: 'running' | 'done' | 'failed' | 'paused'
+  schedStatus?: 'running' | 'done' | 'failed' | 'paused' | 'cancelled'
   schedPlanVersion?: number
   schedItems?: SchedulerPlanItem[]
   schedSummary?: string
   schedReplans?: number
   schedNote?: string
+  // 最近一次检查点打分与实测维度
+  schedCheckpoint?: {
+    score: number
+    action: string
+    impact?: string
+    uncertainty?: string
+    reason?: string
+  }
+  // 执行期的可读事件（换方法、节流、验收失败、重做快照）
+  schedEvents?: string[]
+  // 降级警告（验收异常、落库失败等）
+  schedWarnings?: string[]
   // 用户对这条最终回答的最新反馈；刷新后由历史接口回填
   feedback?: 'like' | 'dislike' | null
   // ---------- 仅渲染的流程标记 ----------
@@ -342,6 +358,8 @@ export const useChatStore = defineStore('chat', () => {
   // threadId -> 最近一次未完成任务流的卡片快照。
   // 历史重新拉取（撤回）会丢掉本地卡片，这里用于把未完成的进度卡挂回去。
   const flowSnapshots = ref<Record<string, ChatMsg>>({})
+  // run_id -> 后台调度事件流订阅；工具返回后用它继续接收进度。
+  const schedulerSubs = new Map<string, { close: () => void }>()
   const threadId = ref<string | null>(null)
   const demoMode = ref(true)
   const lastError = ref('')
@@ -492,8 +510,15 @@ export const useChatStore = defineStore('chat', () => {
         status?: string
         summary?: string
         error?: string
+        verdict?: string
+        acceptance?: unknown
       }
       const status = String(record.status || 'pending')
+      const verdict = ['passed', 'failed', 'unverified', 'waived'].includes(
+        String(record.verdict || ''),
+      )
+        ? (String(record.verdict) as SchedulerPlanItem['verdict'])
+        : undefined
       return {
         id: String(record.id || ''),
         title: String(record.title || record.id || '条目'),
@@ -501,8 +526,21 @@ export const useChatStore = defineStore('chat', () => {
         phaseTitle: record.phase_title ? String(record.phase_title) : undefined,
         status: (allowed.has(status) ? status : 'pending') as SchedulerPlanItem['status'],
         detail: record.summary || record.error || undefined,
+        verdict,
+        acceptance: Array.isArray(record.acceptance)
+          ? record.acceptance.map((entry) => String(entry))
+          : undefined,
       }
     })
+  }
+
+  /** 卡片内的可读事件：只留最近 6 条，重复内容不重复追加。 */
+  function pushSchedEvent(card: ChatMsg, text: string) {
+    if (!text) return
+    const list = card.schedEvents ? [...card.schedEvents] : []
+    if (list[list.length - 1] === text) return
+    list.push(text)
+    card.schedEvents = list.slice(-6)
   }
 
   /** 记录/清理任务流快照：整条流走完后删除，保证卡片不再出现。 */
@@ -592,6 +630,187 @@ export const useChatStore = defineStore('chat', () => {
       termDetail: detail,
       at: Date.now(),
     })
+  }
+
+  /** 后台调度卡片可能已随 thread 迁移，按 run_id 找到当前承载它的会话状态。 */
+  function threadStateForSchedulerRun(runId: string): ThreadChat | undefined {
+    for (const state of Object.values(threads.value)) {
+      if (
+        state.messages.some(
+          (message) => message.kind === 'scheduler' && message.schedRunId === runId,
+        )
+      ) {
+        return state
+      }
+    }
+    return undefined
+  }
+
+  /** 工具返回后本轮 SSE 会关闭，用独立事件流继续接收后台调度进度。 */
+  function ensureSchedulerSubscription(runId: string) {
+    if (!runId || schedulerSubs.has(runId)) return
+    const subscription = subscribeSchedulerRun(
+      runId,
+      (event) => {
+        const target = threadStateForSchedulerRun(runId)
+        if (!target) return
+        applySchedulerEvent({ type: 'scheduler_progress', ...event }, target, true)
+      },
+      () => {
+        schedulerSubs.delete(runId)
+      },
+    )
+    schedulerSubs.set(runId, subscription)
+  }
+
+  function closeSchedulerSubscription(runId: string) {
+    const subscription = schedulerSubs.get(runId)
+    if (!subscription) return
+    schedulerSubs.delete(runId)
+    subscription.close()
+  }
+
+  function applySchedulerEvent(evt: SseEvent, state: ThreadChat, background = false) {
+    // 任务规划卡片：planned 创建，item_* 更新条目状态，run_finished 归档。
+    // 恢复执行（run_started / plan_revised）会把已归档卡片重新置为 running。
+    const phase = String(evt.event || '')
+    const runId = String(evt.run_id || '')
+    if (!runId) return
+    if (!background) state.thinking = false
+    // 只有真正后台执行的 run 才订阅事件流；execute=false 的计划生成不订阅。
+    const backgroundRun =
+      evt.background === true || phase === 'run_started' || phase === 'item_started'
+    if (['planned', 'run_started', 'plan_revised'].includes(phase) && backgroundRun) {
+      ensureSchedulerSubscription(runId)
+    } else if (phase === 'run_finished') {
+      closeSchedulerSubscription(runId)
+    }
+    let card = findSchedulerMsg(state, runId)
+    const planItems = parseSchedulerItems(evt.plan_items)
+
+    if (!card) {
+      if (!['planned', 'run_started', 'plan_revised'].includes(phase)) return
+      card = {
+        id: uid('sc'),
+        kind: 'scheduler',
+        schedRunId: runId,
+        schedGoal: String(evt.goal || ''),
+        schedTier: String(evt.tier || ''),
+        schedMode: String(evt.mode || ''),
+        schedPlanVersion: Number(evt.plan_version || 1),
+        schedItems: planItems,
+        schedStatus: 'running',
+        at: Date.now(),
+      }
+      state.messages.push(card)
+      return
+    }
+
+    card.schedRunId = card.schedRunId || runId
+    if (evt.goal) card.schedGoal = String(evt.goal)
+    if (evt.tier) card.schedTier = String(evt.tier)
+    if (evt.mode) card.schedMode = String(evt.mode)
+    if (planItems.length) {
+      // plan_items 不带验收结论，按 id 把已有 verdict 合并回来
+      const previous = new Map((card.schedItems || []).map((entry) => [entry.id, entry]))
+      card.schedItems = planItems.map((entry) => ({
+        ...entry,
+        verdict: entry.verdict || previous.get(entry.id)?.verdict,
+      }))
+    }
+
+    if (phase === 'planned' || phase === 'run_started' || phase === 'plan_revised') {
+      card.schedStatus = 'running'
+      card.at = Date.now()
+      if (evt.plan_version) card.schedPlanVersion = Number(evt.plan_version)
+      if (evt.reason) card.schedNote = String(evt.reason)
+    } else if (phase === 'item_started') {
+      const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+      if (item) item.status = 'running'
+      card.schedStatus = 'running'
+      card.at = Date.now()
+    } else if (phase === 'item_done') {
+      const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+      if (item) {
+        item.status = 'done'
+        const verdict = String(evt.verdict || '')
+        if (['passed', 'failed', 'unverified', 'waived'].includes(verdict)) {
+          item.verdict = verdict as SchedulerPlanItem['verdict']
+        }
+      }
+    } else if (phase === 'verification_failed') {
+      const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+      if (item) {
+        item.verdict = 'failed'
+        item.detail = '验收未通过'
+      }
+      pushSchedEvent(card, `验收未通过：${String(evt.item_id || '')}`)
+    } else if (phase === 'checkpoint') {
+      card.schedCheckpoint = {
+        score: Number(evt.score || 0),
+        action: String(evt.action || ''),
+        impact: evt.impact ? String(evt.impact) : undefined,
+        uncertainty: evt.uncertainty ? String(evt.uncertainty) : undefined,
+        reason: evt.reason ? String(evt.reason) : undefined,
+      }
+      pushSchedEvent(
+        card,
+        `检查点 ${Number(evt.score || 0).toFixed(2)} · ${String(evt.action || '')}`,
+      )
+    } else if (phase === 'method_switched') {
+      pushSchedEvent(card, `换方法：${String(evt.reason || evt.phase_id || '')}`)
+    } else if (phase === 'replan_blocked') {
+      pushSchedEvent(card, `重规划被节流：${String(evt.reason || '')}`)
+    } else if (phase === 'revision_snapshot') {
+      const ids = Array.isArray(evt.item_ids) ? evt.item_ids.join(', ') : ''
+      pushSchedEvent(card, `已保存重做快照：${ids}`)
+    } else if (phase === 'scheduler_error') {
+      const text = `${String(evt.code || 'error')}：${String(evt.message || '')}`
+      card.schedWarnings = [...(card.schedWarnings || []), text].slice(-4)
+    } else if (phase === 'item_failed') {
+      const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+      if (item) {
+        item.status = 'failed'
+        item.detail = String(evt.error || '')
+      }
+    } else if (phase === 'item_skipped') {
+      const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+      if (item) {
+        item.status = 'skipped'
+        item.detail = String(evt.reason || '')
+      }
+    } else if (phase === 'item_needs_hitl') {
+      const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
+      if (item) {
+        item.status = 'needs_hitl'
+        item.detail = String(evt.reason || '')
+      }
+      card.schedStatus = 'paused'
+      card.at = Date.now()
+    } else if (phase === 'phase_failed') {
+      card.schedStatus = 'paused'
+      pushSchedEvent(
+        card,
+        `阶段 ${String(evt.phase_id || '')} 失败：${String(evt.reason || '')}`,
+      )
+      card.at = Date.now()
+    } else if (phase === 'run_finished') {
+      const status = String(evt.status || 'done')
+      card.schedStatus =
+        status === 'failed'
+          ? 'failed'
+          : status === 'paused'
+            ? 'paused'
+            : status === 'cancelled'
+              ? 'cancelled'
+              : 'done'
+      card.schedSummary = String(evt.summary || '')
+      card.schedReplans = Number(evt.replans || 0)
+      const warnings = Array.isArray(evt.warnings) ? evt.warnings.map(String) : []
+      if (warnings.length) card.schedWarnings = warnings.slice(-4)
+      // 完成后归档：时间戳后移，落到本轮轨迹的最底部。
+      card.at = Date.now()
+    }
   }
 
   // 单个 SSE 事件 → 指定 thread 的消息列表变更
@@ -1061,81 +1280,7 @@ export const useChatStore = defineStore('chat', () => {
         break
       }
       case 'scheduler_progress': {
-        // 任务规划卡片：planned 创建，item_* 更新条目状态，run_finished 归档。
-        // 恢复执行（run_started / plan_revised）会把已归档卡片重新置为 running。
-        const phase = String(evt.event || '')
-        const runId = String(evt.run_id || '')
-        if (!runId) break
-        state.thinking = false
-        let card = findSchedulerMsg(state, runId)
-        const planItems = parseSchedulerItems(evt.plan_items)
-
-        if (!card) {
-          if (!['planned', 'run_started', 'plan_revised'].includes(phase)) break
-          card = {
-            id: uid('sc'),
-            kind: 'scheduler',
-            schedRunId: runId,
-            schedGoal: String(evt.goal || ''),
-            schedTier: String(evt.tier || ''),
-            schedMode: String(evt.mode || ''),
-            schedPlanVersion: Number(evt.plan_version || 1),
-            schedItems: planItems,
-            schedStatus: 'running',
-            at: Date.now(),
-          }
-          state.messages.push(card)
-          break
-        }
-
-        card.schedRunId = card.schedRunId || runId
-        if (evt.goal) card.schedGoal = String(evt.goal)
-        if (evt.tier) card.schedTier = String(evt.tier)
-        if (evt.mode) card.schedMode = String(evt.mode)
-        if (planItems.length) card.schedItems = planItems
-
-        if (phase === 'planned' || phase === 'run_started' || phase === 'plan_revised') {
-          card.schedStatus = 'running'
-          card.at = Date.now()
-          if (evt.plan_version) card.schedPlanVersion = Number(evt.plan_version)
-          if (evt.reason) card.schedNote = String(evt.reason)
-        } else if (phase === 'item_started') {
-          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
-          if (item) item.status = 'running'
-          card.schedStatus = 'running'
-          card.at = Date.now()
-        } else if (phase === 'item_done') {
-          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
-          if (item) item.status = 'done'
-        } else if (phase === 'item_failed') {
-          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
-          if (item) {
-            item.status = 'failed'
-            item.detail = String(evt.error || '')
-          }
-        } else if (phase === 'item_skipped') {
-          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
-          if (item) {
-            item.status = 'skipped'
-            item.detail = String(evt.reason || '')
-          }
-        } else if (phase === 'item_needs_hitl') {
-          const item = card.schedItems?.find((entry) => entry.id === String(evt.item_id || ''))
-          if (item) {
-            item.status = 'needs_hitl'
-            item.detail = String(evt.reason || '')
-          }
-          card.schedStatus = 'paused'
-          card.at = Date.now()
-        } else if (phase === 'run_finished') {
-          const status = String(evt.status || 'done')
-          card.schedStatus =
-            status === 'failed' ? 'failed' : status === 'paused' ? 'paused' : 'done'
-          card.schedSummary = String(evt.summary || '')
-          card.schedReplans = Number(evt.replans || 0)
-          // 完成后归档：时间戳后移，落到本轮轨迹的最底部。
-          card.at = Date.now()
-        }
+        applySchedulerEvent(evt, state)
         break
       }
       case 'done': {
@@ -1853,6 +1998,20 @@ export const useChatStore = defineStore('chat', () => {
     demoDone(state, key, false, { input: 6122, output: 58, total: 6180 })
   }
 
+  // 后台任务栏终止任务后同步本地卡片；paused 的卡片已没有 SSE 订阅。
+  function markSchedulerRunStatus(runId: string, status: 'cancelled') {
+    for (const state of Object.values(threads.value)) {
+      const card = state.messages.find(
+        (message) => message.kind === 'scheduler' && message.schedRunId === runId,
+      )
+      if (!card) continue
+      card.schedStatus = status
+      card.at = Date.now()
+      pushSchedEvent(card, '后台任务已终止')
+      return
+    }
+  }
+
   return {
     messages,
     threadId,
@@ -1888,6 +2047,7 @@ export const useChatStore = defineStore('chat', () => {
     retryLast,
     retryCountFor,
     addNote,
+    markSchedulerRunStatus,
   }
 })
 

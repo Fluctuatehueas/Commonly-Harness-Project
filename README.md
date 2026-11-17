@@ -1,249 +1,433 @@
-***
+# Common Harness
 
-## Harness智能体架构通用服务
+> 业务无关、可源码交付、可嵌入既有后端系统的通用 Agent 运行时。
+> 用 Harness Engineering 的方法，把大模型的概率性生成能力约束成**可操作、可恢复、可审计、可持续改进**的任务执行能力。
 
-Time: 2026/11/5\
-Author: GuiQiHueas
-------------------
+| 项目 | 内容 |
+| :-- | :-- |
+| 版本 | v1.0（2026-11） |
+| 内核 | Python 3.12+ · FastAPI · LangGraph · deepagents |
+| 前端 | Vue 3 · TypeScript · Element Plus · Pinia · ECharts · Electron |
+| 部署 | [项目部署说明书](./项目部署说明书.docx) |
+| 文档 | [设计文档索引](./docs/core_design/README.md) · [接口文档](./docs/api/README.md) · [使用指南](./docs/for_use/) |
 
-## 如何使用
+---
 
-### 一、关于Harness FastAPI后端服务的启动方式以及相关配置
+## 目录
 
-均在项目根目录下执行如下命令
+- [1. 项目简述](#1-项目简述)
+- [2. 快速使用](#2-快速使用)
+- [3. 前端使用说明](#3-前端使用说明)
+- [4. 平台接入开发建议](#4-平台接入开发建议)
+- [5. 文档索引](#5-文档索引)
+- [6. 已知限制](#6-已知限制)
 
-1. 创建Python虚拟环境
+---
 
-```bash
+## 1. 项目简述
+
+### 1.1 它是什么
+
+直接调用大模型 API 只能得到「一次生成」，得不到「一次可靠执行」。两者之间的差距，就是 Harness 要补的部分：
+
+| 层 | 解决的问题 | 本项目的实现 |
+| :-- | :-- | :-- |
+| 上下文 | 每轮该看到什么、太长怎么办 | 上下文注入、渐进式披露、工具结果卸载、自动摘要、主动压缩 |
+| 工具 | 工具从哪来、在哪执行、怎么隔离 | MCP 工具、内置工具、子 Agent 工具、OpenSandbox 隔离执行 |
+| 编排 | 先做什么、何时委派、何时停 | LangGraph 主图、`write_todos`、同步/异步子 Agent、HITL 审批 |
+| 记忆 | 会话到哪了、重启后还在不在 | PostgreSQL Checkpointer + Store、用户偏好、项目与会话索引 |
+| 观测 | 中间做了什么、为什么失败 | 轨迹事件、Token 统计、上下文占用监控、调度检查点 |
+| 约束 | 调错工具、越权、循环、沙箱挂掉 | 调用上限、路径校验、HITL、沙箱代理热替换、重试与降级 |
+
+### 1.2 它不是什么
+
+| 不是 | 原因 |
+| :-- | :-- |
+| 不是行业业务系统 | 仓库内不编写任何外部项目的业务工具、业务提示词或业务子 Agent |
+| 不是 RAG 产品或向量库 | 知识、切片、嵌入、索引归甲方 RAG 后端；本项目只做适配与编排 |
+| 不是 MCP Server | 集成模式下由甲方实现 MCP Server，本项目只做 MCP Host / Client |
+| 不是账号与权限中心 | 登录、租户、角色由甲方网关负责；本项目只做权限执行点 |
+| 不是低代码平台 | 编排以代码、YAML、中间件与工具注册为主，不提供拖拽式编排 |
+
+### 1.3 核心能力
+
+| 能力 | 状态 | 说明 |
+| :-- | :-- | :-- |
+| 对话与 SSE 流式 | 已具备 | `/chat`、`/chat/stream`、中断恢复、历史、附件 |
+| HITL 中断与审批 | 已具备 | 补充信息、工具审批、参数编辑、拒绝 |
+| 沙箱与热替换 | 已具备 | 代理模式、按用户生命周期、预热池、降级 |
+| 技能管理 | 已具备 | 下载、分配、更新、删除、双端同步 |
+| MCP 客户端 | 可用待完善 | 配置声明、代理工具、热更新；生产化生命周期在演进中 |
+| 同步 / 异步子 Agent | 已具备 | YAML 注册、独立上下文、Agent Protocol 异步任务 |
+| 上下文工程 | 已具备 | 注入、卸载、摘要、压缩、评估与自动调参 |
+| 长期记忆 | 已具备 | 用户偏好写回 Store，按 `user_id` 隔离 |
+| 项目工作区 | 已具备 | 项目登记、文件域、产物发布 |
+| 轨迹与用量 | 已具备 | 轨迹事件、甘特图、上下文占用、会话 Token |
+| 模型热更新 | 已具备 | `/settings/model` 写 `.env` 并重建图 |
+| 任务调度（分档 / 计划 / 检查点） | 部分具备 | 两级计划、依赖波次、检查点打分；HTN 方法层未落地，见[设计文档 §16](./docs/core_design/任务调度模块设计.md) |
+
+### 1.4 技术栈与目录结构
+
+```text
+CommonProject/
+├── main.py                 FastAPI 入口（含 Windows 事件循环策略）
+├── langgraph.json          Agent Protocol 图声明（异步子 Agent）
+├── requirements.txt        Python 依赖
+├── .env.example            环境变量模板
+├── src/
+│   ├── api/                HTTP / SSE 接口层
+│   ├── agent/              主 Agent、子 Agent、中间件、上下文、记忆
+│   ├── task_flow/          任务流
+│   ├── scheduler/          任务调度（分档 / 计划 / 检查点 / 重规划）
+│   ├── utils/              日志、完整性、模型 Web 服务
+│   └── mcp/ rag/           协议适配
+├── frontend/
+│   ├── HarnessControlPlatform/   Web 控制台（Vue 3 + Vite）
+│   └── Desktop/HarnessDesktop/   Electron 桌面端
+├── sandbox/                沙箱镜像与 OpenSandbox 配置
+├── docs/                   设计、开发、接口、使用文档
+└── tests/                  单元测试
+```
+
+### 1.5 两种工作模式
+
+| 维度 | 个人模式 | 集成模式（Embedded） |
+| :-- | :-- | :-- |
+| 部署位置 | 用户本机 | 甲方服务器 / 内网 |
+| 工作区 | 本机真实项目目录 | 服务端受管工作区，按 `user_id` 隔离 |
+| 业务能力来源 | 本地工具、技能、MCP、沙箱 | 甲方后端提供的 MCP Server |
+| 身份 | 前端演示用户 `X-User-Id` | 甲方网关注入可信身份 |
+| 数据边界 | 数据留在本机 | 业务数据留在甲方；本服务只存会话、记忆、轨迹 |
+
+---
+
+## 2. 快速使用
+
+> 这一节是「本机最快跑起来」。生产部署、Nginx、systemd、备份与回滚见 [项目部署说明书](./项目部署说明书.docx)。
+
+### 2.1 前置条件
+
+| 依赖 | 要求 |
+| :-- | :-- |
+| Python | 3.12+（仓库验证 3.14） |
+| Node.js | 20+（仓库验证 24.x） |
+| PostgreSQL | 13+（推荐 16） |
+| Docker | 可构建镜像；用于 PostgreSQL 与沙箱镜像 |
+| OpenSandbox Server | 可访问地址 + API Key |
+| 模型服务 | DeepSeek 兼容接口 |
+
+### 2.2 五步启动
+
+**① 创建虚拟环境并装依赖**
+
+```powershell
 python -m venv .venv
-```
-
-2. 激活虚拟环境
-
-```bash
-.venv\Source\activate
-```
-
-3. 安装依赖
-
-```bash
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-4. 启动服务
+Linux / macOS 激活命令为 `source .venv/bin/activate`。
+
+**② 准备配置**
+
+```powershell
+Copy-Item .env.example .env
+```
+
+至少填写这 6 项，其余可先用默认值：
+
+```dotenv
+DEEPSEEK_API_KEY=sk-xxx
+DB_HOST=127.0.0.1
+DB_PASSWORD=你的数据库密码
+OPEN_SANDBOX_HOST=127.0.0.1
+OPEN_SANDBOX_PORT=18083
+OPEN_SANDBOX_API_KEY=sk-harness-local-7c1a9e4b2d8f6a35
+```
+
+**③ 启动 PostgreSQL**
+
+```powershell
+docker run -d --name harness-postgres `
+  -e POSTGRES_USER=harness -e POSTGRES_PASSWORD=123456 -e POSTGRES_DB=harness_db `
+  -p 5432:5432 -v harness_pgdata:/var/lib/postgresql/data postgres:16
+```
+
+相应地设置 `DB_USER=harness`、`DB_NAME=harness_db`。表结构由各模块在首次使用时自动创建，不需要手工建表。
+
+**④ 部署沙箱服务（Linux 宿主机）**
+
+沙箱镜像必须由宿主机上的 Dockerfile 构建，所以先把三个文件拷过去（它们不会随依赖自动同步）：
 
 ```bash
-python main.py 
-```
+# 开发机（仓库根目录）
+tar czf sandbox-deploy.tar.gz sandbox/Dockerfile sandbox/setup-runtime.sh sandbox/sandbox.toml
+scp sandbox-deploy.tar.gz root@<Linux主机IP>:/opt/opensandbox/
 
-启动后，控制台应能看到：
+# Linux 宿主机
+mkdir -p /opt/opensandbox && cd /opt/opensandbox
+tar xzf sandbox-deploy.tar.gz && mv sandbox/sandbox.toml sandbox.toml
+chmod +x sandbox/setup-runtime.sh
+sed -i 's/\r$//' sandbox/setup-runtime.sh        # Windows 拷贝过来是 CRLF，必须转换
+sed -i '1s/^\xEF\xBB\xBF//' sandbox.toml          # 清除 BOM
 
-### 二、关于内置前端UI的启动方式
-
-本项目拥有两种前端UI模式，可以根据自己喜欢的模式启动。
-
-1. 基于Web Server的前端项目。(VUE)
-2. 基于Desktop App的前端项目.(VUE + Electron)
-
-他们的启动方式完全一致
-
-```bash
-npm install
-npm run dev
-```
-
-如缺少相关依赖，使用npm install等命令安装依赖
-
-
-
-值得一提的
-
-:
-
-- 基于Web Server的前端项目，需要在当前项目目录  /frontend/Desktop/HarnessDesktop  下执行
-- 基于Desktop App的前端项目，需要在当前项目目录  /frontend/HarnessControlPlatform  下执行
-
-### 三、关于 PostgreSQL 数据库的启动方式
-
-
-
-在docker中启动PostgreSQL数据库
-
-\
-Image:
-
-```docker
- docker pull postgres:16
-```
-
-Container:
-
-```docker
- docker run -d --name harness-postgres -e POSTGRES_USER=your_user_name -e POSTGRES_PASSWORD=123456 -e POSTGRES_DB=your_db_name -p 5432:5432 -v harness_pgdata:/var/lib/postgresql/data postgres:16
-```
-
-该数据库将会存储绝大多数的数据：
-
-### 四、关于 本地及其的沙箱服务的启动方式
-
-应该有很多种方法，这里介绍在Linux下的部署方式
-
-首先确保你的linux也支持docker。
-
-你需要在   /opt   目录下创建一个子目录（不是强制，你可以在任何地方新建）opensandbox作为你的沙箱服务目录。
-
-整体目录结构如下
-
-```text
-/opt/opensandbox/
-├── sandbox/
-    |——Dockerfile
-    |——setup-runtime-runtime.sh
-|——sandbox.toml
-```
-
-[Dockerfile](./sandbox/Dockerfile)文件与[setup-runtime.sh](./sandbox/setup-runtime.sh)文件在本项目目录已提供。
-
-将他们全部拷贝到Linux中
-
-关于toml文件，不需要你手动编写配置。你可以直接拷贝本项目提供的[sandbox.toml](./sandbox/sandbox.toml)文件。
-
-- 也可以通过命令自动生成
-
-1. 先创建镜像
-
-```bash
-docker build -t myagent-sandbox:1 sandbox
-```
-
-> 该命令将读取sandbox子目录下的Dockerfile，该过程可能需要很久，耐心等待或者使用国内镜像源
-
-测试镜像创建成功
-
-```bash
-docker run --rm myagent-sandbox:1 python -c "import yaml; print('sandbox ok')"
-```
-
-2. 安装uv，如果你的宿主机有uv，可以略过这一步
-
-```bash
-# 示例：安装到 /usr/local/bin 目录
-curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
-# 然后安装opensandbox-server
-# 1. 装服务端，必须锁 0.1.14 —— 客户端是 opensandbox 0.1.16
+DOCKER_BUILDKIT=1 docker build -t myagent-sandbox:1 sandbox
 uv tool install 'opensandbox-server==0.1.14'
-# 已装过的话先看一眼： opensandbox-server --version
-```
-
-3. 生成toml配置文件（可选）\
-   回到 /opt/opensandbox/ 目录下执行
-
-```bash
-# 可选，也可以直接把该项目的./sandbox/sandbox.toml文件复制到Linux中
-uvx opensandbox-server init-config ~/.sandbox.toml --example docker
-```
-
-然后就拥有了一个默认的toml配置文件。
-
-4. 配置你的toml文件。一般来说，只需要配置如下参数即可
-
-```text
-[server]
-host = "0.0.0.0"
-port = 18083   <---  这里要和你的.env中一致
-max_sandbox_timeout_seconds = 86400
-
-# Optional: Uncomment to enable API key authentication
-api_key = "sk-harness-local-7c1a9e4b2d8f6a35"  <---  默认是注释掉的。这里要和你的.env中一致。这样才可以连接到linux的沙箱服务。
-# If api_key stays empty, startup requires explicit acknowledgment:
-# - Interactive TTY: type YES when prompted
-# - Non-interactive: set OPENSANDBOX_INSECURE_SERVER=YES
-```
-
-5. 启动opensandbox服务\
-   回到 /opt/opensandbox/ 目录下执行启动
-
-```bash
-# 清除BOM头
-sed -i '1s/^\xEF\xBB\xBF//' /opt/opensandbox/sandbox.toml
-# 启动
 opensandbox-server --config /opt/opensandbox/sandbox.toml
 ```
 
-6. 启动后，控制台应能看到：
+目录关系：`sandbox/Dockerfile` 通过 `COPY setup-runtime.sh` 引用同目录脚本，二者必须放在同一个构建上下文里；`sandbox.toml` 放在 `sandbox/` 的上一层。
 
-```text
+`sandbox/sandbox.toml` 中的 `api_key` 必须与 `.env` 的 `OPEN_SANDBOX_API_KEY` 一致，`port` 必须与 `OPEN_SANDBOX_PORT` 一致。
 
-INFO:     2026-11-05 17:10:21+0800 [-] opensandbox_server.config: Loaded configuration from /opt/opensandbox/sandbox.toml
-INFO:     2026-11-05 17:10:21+0800 [-] opensandbox_server.services.factory: Creating sandbox service with type: docker
-INFO:     2026-11-05 17:10:21+0800 [-] opensandbox_server.services.docker.docker_service: Docker service initialized from environment
-INFO:     2026-11-05 17:10:21+0800 [-] opensandbox_server.services.docker.docker_service: Sandbox 29273975-8781-40f6-a561-3ac9698e7ffc already expired; terminating now.
-INFO:     2026-11-05 17:10:21+0800 [-] opensandbox_server.services.docker.docker_service: Sandbox 0430cce0-b8cc-430b-a698-b243f652c408 already expired; terminating now.
-INFO:     2026-11-05 17:10:21+0800 [-] opensandbox_server.services.docker.docker_service: Sandbox 9eda4332-aa1c-4691-beda-566c87d2b914 already expired; terminating now.
-INFO:     2026-11-05 17:10:21+0800 [-] uvicorn.error: Started server process [2074]
-INFO:     2026-11-05 17:10:21+0800 [-] uvicorn.error: Waiting for application startup.
-INFO:     2026-11-05 17:10:22+0800 [-] opensandbox_server.main: Validating secure runtime for Docker backend
-INFO:     2026-11-05 17:10:22+0800 [-] opensandbox_server.services.runtime_resolver: Secure runtime is not configured.
-INFO:     2026-11-05 17:10:22+0800 [-] uvicorn.error: Application startup complete.
-INFO:     2026-11-05 17:10:22+0800 [-] uvicorn.error: Uvicorn running on http://0.0.0.0:18083 (Press CTRL+C to quit)
+**⑤ 启动后端**
 
-
+```powershell
+.\.venv\Scripts\python.exe main.py
 ```
 
-如果遇到构建失败的情况，建议同步时间
+### 2.3 验证
+
+| 检查项 | 命令 | 期望 |
+| :-- | :-- | :-- |
+| 存活探针 | `curl http://127.0.0.1:8000/health` | `{"status":"ok",...}` |
+| 接口文档 | 浏览器打开 `http://127.0.0.1:8000/docs` | Swagger 页面可加载 |
+| 沙箱可达 | `curl http://127.0.0.1:18083/health` | 200 |
+| 一条对话 | `POST /chat`，body `{"message":"你好","user_id":"alice"}` | 返回模型回答 |
+
+### 2.4 常见问题
+
+| 现象 | 原因 | 处理 |
+| :-- | :-- | :-- |
+| `error while attempting to bind on address` | 端口被占用 | 换 `HARNESS_API_PORT`，或停止占用进程 |
+| 日志出现「用户数据目录不可写」 | 默认目录无写权限 | 设置 `HARNESS_USER_DATA_DIR` 到可写路径 |
+| 启动即报 `未配置 DEEPSEEK_API_KEY` | `.env` 未填 Key | 填写后重启 |
+| 沙箱创建失败 | 服务端未启动 / API Key 不一致 / 时间不同步 | 检查 18083、比对 Key、同步时间 |
+| 前端请求被浏览器拦截 | 跨域未放行 | 把前端地址加入 `HARNESS_CORS_ORIGINS` |
+
+---
+
+## 3. 前端使用说明
+
+### 3.1 两个前端
+
+| 形态 | 目录 | 技术栈 | 适用 |
+| :-- | :-- | :-- | :-- |
+| Web 控制台 | `frontend/HarnessControlPlatform` | Vue 3 + Vite + Element Plus | 浏览器访问、服务端部署、可嵌入门户 |
+| 桌面端 | `frontend/Desktop/HarnessDesktop` | Electron + Vue 3 | 本机常驻、需要访问本地目录 |
+
+两者共用同一套后端接口，切换用户、会话、项目的语义一致。
+
+### 3.2 启动与构建
 
 ```bash
-timedatectl set-timezone Asia/Shanghai
+# Web 控制台
+cd frontend/HarnessControlPlatform
+npm install
+npm run dev            # 开发，默认 5173
+npm run build           # 产物在 dist/
 
-yum install -y chrony
-
-systemctl restart chronyd
-
-chronyc -a makestep
-
-date
+# 桌面端
+cd frontend/Desktop/HarnessDesktop
+npm install
+npm run dev             # electron-vite 开发
+npm run build:win       # 打包 Windows 安装包，另有 build:mac / build:linux
 ```
 
-***
+前端默认请求 `http://127.0.0.1:8000`。后端不在同源时，用环境变量覆盖：
 
-## 项目介绍
+```bash
+# frontend/HarnessControlPlatform/.env.production
+VITE_API_BASE_URL=https://harness.example.com
+```
 
-本项目涵盖多种基础通用的Agent客户端的功能
+### 3.3 页面导览
 
-### 一、基础对话与项目
+| 页面 | 用途 | 关键操作 |
+| :-- | :-- | :-- |
+| 对话 | 主入口，SSE 流式输出 | 新建会话、附件上传、中断后继续、审批卡片、轨迹下钻 |
+| 项目 / 工作区 | 绑定一个可读写目录 | 新建项目、切换当前项目、查看文件与产物 |
+| 技能 | `SKILL.md` 为入口的能力包 | 下载、分配、启停、更新 |
+| MCP | 外部工具接入 | 新增服务、测试连通、启停、查看工具清单 |
+| 轨迹 | 执行过程记录 | 按轮查看思考、工具参数、结果、耗时、Token |
+| 我的任务流 | 可复用的执行流程 | 复制内置流、可视化编辑、发布、回放 |
+| 设置 | 模型与环境 | 填写模型 Key / Base URL、思考模式、沙箱参数、上下文阈值 |
 
-### 二、SKILL模块
+### 3.4 多用户与隔离
 
-### 三、MCP模块
+前端通过 `X-User-Id` 头识别用户，后端据此隔离记忆、沙箱、工作区、会话索引。内置 4 个演示用户，可在 [identity.ts](./frontend/HarnessControlPlatform/src/api/identity.ts) 中增删：
 
-### 四、轨迹
+`console_user`（默认）、`alice`、`bob`、`carol`。
 
-是AI与你对话和执行任务期间产生的日志与记录。你可以查看AI的思考过程，以及执行任务的详细步骤。
-也可以看到AI的执行结果，每一步的参数等信息。
+真实接入时把「从 localStorage 读用户」换成「从网关注入的身份读用户」即可，其余逻辑不变。
 
-本系统的Agent自我优化与迭代能力大部分也基于轨迹的充分发掘来实现。\
+### 3.5 前端部署
 
+构建产物是纯静态文件，放到 Nginx 即可：
 
-详见  [文档-Agent自我迭代优化机制]()
+```nginx
+server {
+    listen 80;
+    server_name harness.example.com;
 
+    root /srv/harness-web;
+    index index.html;
 
+    location / {
+        try_files $uri $uri/ /index.html;   # 前端路由回退
+    }
+}
+```
 
-### 五、我的任务流
+注意三件事：`VITE_API_BASE_URL` 指向真实后端；后端 `HARNESS_CORS_ORIGINS` 包含前端域名；SSE 需要关闭代理缓冲（见部署说明书 5.6）。
 
-定义任务执行流程，Agent 命中后按统一方法执行；支持内置流只读复制、可视化编辑、发布与执行回放。
+---
 
-### 六、模型配置
+## 4. 平台接入开发建议
 
-该模块提供一些模型配置卡片信息，便于你快速LLM模型API KYE 与 厂商服务URL等参数。
+### 4.1 先划清边界
 
-> 是静态前端页面提供，后端没有提供这些模型配置信息。
+| 角色 | 负责 | 不负责 |
+| :-- | :-- | :-- |
+| 甲方业务后端 | 业务数据、业务 API、RAG 服务、MCP Server、业务权限 | Agent 编排、上下文、沙箱 |
+| 甲方网关 | 登录、租户识别、角色、请求签名、审计入口 | Agent 运行时 |
+| Harness | Agent 图、上下文、记忆、HITL、沙箱、MCP Host、RAG 适配、轨迹 | 业务数据、业务规则、向量存储 |
 
-### 七、环境变量介绍
+一句话：**甲方提供「MCP 服务 + 子 Agent YAML + 技能」，Harness 负责把它们组织成可靠执行。**
 
-***
+### 4.2 建议的四阶段
 
-## 关于演示用户
+不建议一次性把业务全量接进来。按下面顺序推进，每阶段都有可验收信号：
 
-系统提供了4个用户id，你可以在
-[用户id预设代码配置](./frontend/HarnessControlPlatform/api/identity.ts#L10-L17)
-新增你的用户id，主要是为了验证多用户隔离的功能。
+| 阶段 | 做什么 | 验收信号 |
+| :-- | :-- | :-- |
+| ① 打通链路 | 网关注入身份，跑通一轮对话 + 一个只读 MCP 工具 | 客户端自报身份被忽略；工具调用出现在轨迹里 |
+| ② 只读业务 | 接入 3–5 个只读工具（查询、检索），配好工具描述与错误码 | 模型能选对工具；错误码可通过 `category`/`retryable` 分类处理 |
+| ③ 受控写入 | 接入写操作，全部支持 `idempotency_key`，破坏性操作走 HITL | 重复调用结果一致；删除类操作必须人工确认 |
+| ④ 知识与观测 | 接 RAG（`rag_manifest` + `rag_retrieve`），建立评估集与回归 | 回答带引用；同一问题在评估集上稳定复现 |
+
+### 4.3 MCP 契约要点
+
+传输：JSON-RPC 2.0，Streamable HTTP 优先；入口 `POST /mcp`，健康检查 `GET /health`；鉴权只放 Header。
+
+最小必选集合：
+
+- 协议方法：`initialize`、`tools/list`、`tools/call`、`ping`
+- 业务工具：至少 1 个
+- 做知识库时额外要求：`rag_manifest` + `rag_retrieve`
+
+工具结果必须可被结构化消费：
+
+```json
+{
+  "content": [{"type": "text", "text": "给人与模型看的文本"}],
+  "structuredContent": {"customer_id": "C1001"},
+  "isError": false
+}
+```
+
+错误必须统一，否则无法区分「重试有用」和「重试也没用」：
+
+```json
+{"code":"NOT_FOUND","message":"客户不存在","category":"business","retryable":false,"details":{}}
+```
+
+`category` 取 `tool|business|security|runtime`；`retryable` 必须如实填写，调用方只对 `true` 重试。
+
+三条硬约定：
+
+1. **幂等**：有副作用的工具必须接受 `idempotency_key`，同键重复调用返回同一结果，建议保留 24h。
+2. **超时**：连接 15s，单次工具 120s；收到取消通知后停止执行，已产生的副作用必须可查询、可补偿。
+3. **描述即契约**：`description` 写清「用途 / 何时使用 / 副作用」，`inputSchema` 用 `additionalProperties: false` 收敛参数。模型选错工具，八成是描述没写清，不是模型不行。
+
+完整字段、示例与自测清单见 [MCP 服务接入 API](./docs/api/MCP服务接入API.md)。
+
+### 4.4 RAG 接入
+
+两种方式二选一，数据结构完全一致：
+
+| 方式 | 做法 | 适用 |
+| :-- | :-- | :-- |
+| MCP 工具（推荐） | 在同一 MCP 服务上暴露 `rag_manifest` / `rag_retrieve` | 已有 MCP Server |
+| HTTP 接口 | 提供 `/retrieve`、`/knowledge/*` | 已有独立检索服务 |
+
+`rag_manifest` 供发现，必须把 JSON 放进 `content[].text`：
+
+```json
+{
+  "provider_id": "rag_crm",
+  "name": "CRM 知识库",
+  "protocol": "mcp",
+  "capabilities": ["retrieve", "ingest", "health"],
+  "knowledge_domains": ["contract", "product"],
+  "citation_format": "chunk",
+  "limits": {"top_k_max": 20, "max_chars_per_chunk": 2000, "qps": 10}
+}
+```
+
+`rag_retrieve` 出参要带可引用的来源：
+
+```json
+{
+  "chunks": [
+    {
+      "citation_id": "c1",
+      "content": "合同续签需在到期前 30 天发起……",
+      "score": 0.82,
+      "source": {"title": "合同管理办法", "uri": "kb://contract/001", "page": 3}
+    }
+  ],
+  "provider_id": "rag_crm"
+}
+```
+
+建议：`content` 单条不超过 8KB，超长截断并标 `truncated: true`；无结果返回 `chunks: []`，不要报错；`user_scope`（租户、用户、角色）必须透传到检索侧，权限过滤在 RAG 后端做，不要交给模型。
+
+### 4.5 身份与隔离
+
+- 网关必须先**剥离**客户端自带的身份头，再注入可信的 `tenant_id` / `user_id` / `roles`。
+- 隔离键：`tenant_id`（部署级）、`user_id`（记忆/沙箱/工作区）、`thread_id`（会话）、`project_id`（工作区）。
+- 工作区只做持久文件，**命令只在沙箱执行**；集成模式下项目根必须限制在受管工作区根内，禁止 attach 任意服务器路径。
+- 有副作用的工具默认走 HITL：批准、编辑参数、拒绝三种结果都要在前端可表达。
+
+### 4.6 接入验收清单
+
+| # | 检查项 | 通过标准 |
+| :-- | :-- | :-- |
+| 1 | 身份注入 | 客户端伪造 `X-User-Id` 无效；越权请求返回 403 |
+| 2 | MCP 连通 | 启动零连接，首次调用才建连；单服务故障不影响其他工具 |
+| 3 | 工具契约 | 每个工具有描述、约束 schema、统一错误码与 `retryable` |
+| 4 | 幂等与审批 | 同键重复写入结果一致；破坏性操作必须人工确认 |
+| 5 | RAG 引用 | 回答里的引用可回溯到文档与页码；无结果不报错 |
+| 6 | 隔离 | 两个用户互相看不到对方的会话、记忆、工作区文件 |
+| 7 | 可观测 | 一次失败能在轨迹里定位到工具、参数、错误原因 |
+| 8 | 恢复 | 中断、重启后可以从检查点继续，不重复已完成的副作用 |
+
+---
+
+## 5. 文档索引
+
+| 文档 | 内容 |
+| :-- | :-- |
+| [项目部署说明书](./项目部署说明书.docx) | Linux 生产部署、systemd、Nginx、备份升级、故障排查、环境变量总表 |
+| [项目描述](./docs/core_design/项目描述.md) | 产品定位、两种模式、接入拓扑、演进路线 |
+| [接口文档](./docs/api/README.md) | 业务主链路 API、管理与配置 API、MCP 服务接入 API |
+| [接入全流程示例与避坑指南](./docs/for_use/接入全流程示例与避坑指南.md) | 从零跑到流式对话 + 工具 + HITL + 异步任务 |
+| [如何编写 SubAgent](./docs/for_use/如何编写SubAgent.md) | 子 Agent YAML 结构与注册 |
+| [拓展技能与工具的流程](./docs/for_use/拓展技能与工具的流程.md) | 技能包与工具接入 |
+| [任务调度模块设计](./docs/core_design/任务调度模块设计.md) | 分档、计划、检查点、重规划，含实现现状与待办 |
+| [架构图与核心时序](./docs/core_design/架构图与核心时序.md) | 组件关系与关键链路 |
+
+---
+
+## 6. 已知限制
+
+1. **会话互斥仅单进程有效**：多 worker 部署需要额外设计。
+2. **外部 Trace 与评估集未接入**：目前依赖内置轨迹，Langfuse / LangSmith / DeepEval 为演进项。
+3. **MCP 生产化未完成**：懒连接、熔断、命名空间、管理 UI 仍在推进。
+4. **任务调度未达 HTN**：当前是「两级任务表 + 依赖 DAG + 拓扑波次 + 检查点打分」，方法层与 `(S,R,D)` 闭环未落地。
+5. **Linux 项目路径校验需复核**：当前校验以 Windows 本机为基线，服务端场景需按部署说明书 8.5 加固。
+
+---
+
+Author: GuiQiHueas · License: 内部交付，未经许可请勿外传

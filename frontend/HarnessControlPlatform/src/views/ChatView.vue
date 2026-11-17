@@ -33,6 +33,7 @@ import {
 } from '@/components/chat/trajectoryTypes'
 import ExecutionCard from '@/components/taskflow/ExecutionCard.vue'
 import SchedulerPlanCard from '@/components/scheduler/SchedulerPlanCard.vue'
+import BackgroundTasksBar from '@/components/scheduler/BackgroundTasksBar.vue'
 import RoundLimitToast from '@/components/chat/RoundLimitToast.vue'
 import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import { API_BASE } from '@/api/client'
@@ -58,7 +59,8 @@ import { useFileStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
 import { useAgentStore } from '@/stores/agents'
 import { avatarGradient, avatarInitial } from '@/components/myagent/avatar'
-import { fetchSandboxStatus, fetchFeedbackSettings } from '@/api/settings'
+import { formatContext } from '@/stores/models'
+import { fetchSandboxStatus, fetchFeedbackSettings, fetchGlobalModelSettings, type GlobalModelSettings } from '@/api/settings'
 import { withdrawLatestMessage, fetchSessionUsage, type SessionUsage } from '@/api/chat'
 
 const chat = useChatStore()
@@ -355,11 +357,17 @@ onMounted(async () => {
     chat.demoMode = false
     // 进入对话页时做一次自动归档检查，不在后台常驻计时器。
     await sessions.autoArchive()
+    // 归档超过保留天数的会话在这里真正删除（保留天数与归档配置一致）。
+    const purged = await sessions.autoPurge()
+    if (purged > 0) {
+      ElMessage.info(`已自动清除 ${purged} 个超过保留期的归档会话`)
+    }
     // 启动恢复需要先拿到会话列表，才能校验上次的会话是否仍然存在。
     await sessions.refresh()
     void sessions.refreshArchived()
     formats.value = await fetchContextFormats()
     void settings.load()
+    void loadGlobalModel()
     void fetchFeedbackSettings()
       .then((config) => {
         feedbackEnabled.value = config.enabled
@@ -1427,17 +1435,43 @@ function toggleWebSearch(value: boolean) {
 
 // ---------- 上下文窗口圆环 ----------
 const DONUT_CIRC = 2 * Math.PI * 15.5
-// 分母跟随当前选择的 Agent 模型配置；Agent 未配置时回退到会话用量里的窗口值。
+// 当前生效模型：Agent 独立配置 > 组模型 > 系统全局模型，与后端 resolve_model 一致。
+const globalModel = ref<GlobalModelSettings | null>(null)
+const agentProfileModel = computed(
+  () => agents.byId(chat.selectedAgentId)?.model || null,
+)
+const selectedGroup = computed(
+  () => agents.groups.find((group) => group.group_id === chat.selectedGroupId) || null,
+)
+const groupProfileModel = computed(() => selectedGroup.value?.model || null)
+const ctxModelName = computed(
+  () =>
+    agentProfileModel.value?.model_name ||
+    groupProfileModel.value?.model_name ||
+    globalModel.value?.model_name ||
+    '',
+)
+const ctxModelSource = computed(() => {
+  const agentModel = agentProfileModel.value
+  if (agentModel?.model_name || agentModel?.context_limit) return 'Agent 独立配置'
+  const groupModel = groupProfileModel.value
+  if (groupModel?.model_name || groupModel?.context_limit) {
+    return `组模型 · ${selectedGroup.value?.name || selectedGroup.value?.group_id || ''}`.trim()
+  }
+  return '系统全局'
+})
 const agentContextLimit = computed(() =>
-  Number(agents.byId(chat.selectedAgentId)?.model?.context_limit || 0),
+  Number(
+    agentProfileModel.value?.context_limit ||
+      groupProfileModel.value?.context_limit ||
+      globalModel.value?.context_limit ||
+      0,
+  ),
 )
 const ctxWindow = computed(() => {
   if (agentContextLimit.value > 0) return agentContextLimit.value
   return sessionUsage.value?.contextWindow || 0
 })
-const ctxModelName = computed(
-  () => agents.byId(chat.selectedAgentId)?.model?.model_name || '',
-)
 const ctxUsed = computed(
   () => sessionUsage.value?.contextUsed ?? sessionUsage.value?.input ?? 0,
 )
@@ -1453,6 +1487,14 @@ const ctxTone = computed(() =>
 const ctxDash = computed(
   () => `${(ctxPct.value / 100) * DONUT_CIRC} ${DONUT_CIRC}`,
 )
+
+async function loadGlobalModel() {
+  try {
+    globalModel.value = await fetchGlobalModelSettings()
+  } catch {
+    globalModel.value = null
+  }
+}
 
 // ---------- 消息复制 ----------
 const copiedId = ref('')
@@ -1839,6 +1881,9 @@ async function submit() {
               :plan-version="activeScheduler.schedPlanVersion || 1"
               :summary="activeScheduler.schedSummary || ''"
               :note="activeScheduler.schedNote || ''"
+              :checkpoint="activeScheduler.schedCheckpoint"
+              :events="activeScheduler.schedEvents || []"
+              :warnings="activeScheduler.schedWarnings || []"
               collapsible
             />
           </div>
@@ -1977,6 +2022,9 @@ async function submit() {
                     :plan-version="card.schedPlanVersion || 1"
                     :summary="card.schedSummary || ''"
                     :note="card.schedNote || ''"
+                    :checkpoint="card.schedCheckpoint"
+                    :events="card.schedEvents || []"
+                    :warnings="card.schedWarnings || []"
                     archived
                   />
                 </div>
@@ -2123,6 +2171,9 @@ async function submit() {
 
         <!-- 正常会话显示输入框；归档会话改为只读提示，明确区分两种状态 -->
         <footer v-if="!archivedActive" class="input-bar">
+          <!-- 后台任务栏：默认收起，展开后可查看并终止当前会话的后台调度 -->
+          <BackgroundTasksBar />
+
           <!-- 发送框顶部：快速切换后端的思考模式与联网搜索 -->
           <div class="input-head">
             <div class="mode-toggles">
@@ -2318,8 +2369,8 @@ async function submit() {
               <HoloTooltip
                 v-if="ctxWindow > 0"
                 title="上下文窗口"
-                :code="ctxModelName"
-                :content="`已占用 ${formatExact(ctxUsed)} tok，上限 ${formatExact(ctxWindow)} tok（${ctxPct}%）。`"
+                :code="ctxModelName || '未指定模型'"
+                :content="`模型 ${ctxModelName || '未知'}（${ctxModelSource}）；上下文上限 ${formatExact(ctxWindow)} tok · ${formatContext(ctxWindow)}。已占用 ${formatExact(ctxUsed)} tok（${ctxPct}%）。`"
                 :footer="
                   ctxTone === 'danger'
                     ? '接近上限，建议压缩'

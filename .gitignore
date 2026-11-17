@@ -72,3 +72,6 @@ readme.backup.md
 useless/*
 
 .trae/
+
+# 本地交付文档（不入库）
+/项目部署说明书.docx

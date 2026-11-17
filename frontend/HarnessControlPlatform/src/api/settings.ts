@@ -13,6 +13,48 @@ export type ModelSettingsPatch = Partial<
   Pick<ModelSettings, 'thinking_enabled' | 'web_search_enabled'>
 >
 
+/** 全局 LLM 配置：写在 .env，所有未独立配置的 Agent 共用。 */
+export interface GlobalModelSettings {
+  model_name: string
+  base_url: string
+  has_api_key: boolean
+  context_limit: number
+  env_path: string
+}
+
+export interface GlobalModelSettingsPatch {
+  model_name?: string
+  base_url?: string
+  api_key?: string
+  context_limit?: number
+}
+
+export async function fetchGlobalModelSettings(): Promise<GlobalModelSettings> {
+  const res = await fetch(`${API_BASE}/settings/model/global`, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(6000),
+  })
+  if (!res.ok) throw new Error(`读取全局模型失败: HTTP ${res.status}`)
+  return (await res.json()) as GlobalModelSettings
+}
+
+export async function updateGlobalModelSettings(
+  patch: GlobalModelSettingsPatch,
+): Promise<GlobalModelSettings> {
+  const res = await fetch(`${API_BASE}/settings/model/global`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  const data = (await res.json().catch(() => ({}))) as {
+    detail?: string
+    current?: GlobalModelSettings
+  }
+  if (!res.ok) throw new Error(data.detail || `保存全局模型失败: HTTP ${res.status}`)
+  if (!data.current) throw new Error('后端未返回最新全局模型配置')
+  return data.current
+}
+
 /** 消息反馈开关：关闭时前端隐藏赞同/不赞同/重试按钮。 */
 export async function fetchFeedbackSettings(): Promise<{ enabled: boolean }> {
   const res = await fetch(`${API_BASE}/settings/feedback`)

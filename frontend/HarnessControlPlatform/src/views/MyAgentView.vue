@@ -7,6 +7,7 @@ import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import { fetchMcpServers, type McpServerItem } from '@/api/mcp'
+import { fetchGlobalModelSettings, type GlobalModelSettings } from '@/api/settings'
 import { useAgentStore } from '@/stores/agents'
 import AgentGroupsDrawer from '@/components/myagent/AgentGroupsDrawer.vue'
 import AgentListRow from '@/components/myagent/AgentListRow.vue'
@@ -19,6 +20,7 @@ const viewMode = ref<'agent' | 'group'>('agent')
 const selectedId = ref('default')
 const mcpServers = ref<McpServerItem[]>([])
 const mcpLoading = ref(false)
+const globalModel = ref<GlobalModelSettings | null>(null)
 const recruitOpen = ref(false)
 const modelOpen = ref(false)
 const groupsOpen = ref(false)
@@ -93,8 +95,16 @@ async function loadMcp() {
   }
 }
 
+async function loadGlobalModel() {
+  try {
+    globalModel.value = await fetchGlobalModelSettings()
+  } catch {
+    globalModel.value = null
+  }
+}
+
 function refresh() {
-  void Promise.all([load(), loadMcp()])
+  void Promise.all([load(), loadMcp(), loadGlobalModel()])
 }
 
 function applyModel(payload: {
@@ -187,7 +197,7 @@ async function recruit() {
 }
 
 onMounted(async () => {
-  await Promise.all([load(), loadMcp()])
+  await Promise.all([load(), loadMcp(), loadGlobalModel()])
 })
 </script>
 
@@ -298,7 +308,7 @@ onMounted(async () => {
                   <HoloTooltip
                     title="模型配置"
                     code="DRAWER // MODEL"
-                    content="为该 Agent 单独指定模型、上下文窗口与思考能力。留空的字段会先继承组模型，再回落到用户默认模型。"
+                    content="为该 Agent 单独指定模型、上下文窗口与思考能力；不配置时直接使用系统设置里的全局模型。"
                     footer="点击打开右侧抽屉"
                   >
                     <button type="button" class="dock-btn" @click="modelOpen = true">
@@ -445,6 +455,7 @@ onMounted(async () => {
       :has-api-key="Boolean(current?.model?.has_api_key)"
       :thinking-enabled="form.thinking_enabled"
       :context-limit="form.context_limit"
+      :global-model="globalModel"
       @apply="applyModel"
     />
     <AgentGroupsDrawer

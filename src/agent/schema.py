@@ -47,6 +47,12 @@ class HarnessContext:
     pdc_max_rounds: int = 2
     pdc_feedback: str = ""
     pdc_outcome: str = ""
+    # 验证（纯观测）：每轮预算计数与结论摘要，进程内上下文，不落库。
+    verification_judge_calls: int = 0
+    verification_delegations: int = 0
+    verification_blocking: int = 0
+    verification_degraded: bool = False
+    verification_issues_json: str = ""
     # L2 确定性验证配置；由 API 层从请求透传，未配置时对应验证器不启用。
     evolution_output_schema: dict[str, Any] | None = None
     evolution_numeric_ranges: dict[str, Any] | None = None

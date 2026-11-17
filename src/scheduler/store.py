@@ -31,6 +31,7 @@ DDL_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_scheduler_run_user ON scheduler_run(user_id, updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_scheduler_run_thread ON scheduler_run(thread_id, updated_at DESC)",
     """
     CREATE TABLE IF NOT EXISTS scheduler_plan (
         run_id        TEXT NOT NULL,
@@ -75,32 +76,91 @@ class SchedulerStore:
     def __init__(self, dsn: Optional[str] = None) -> None:
         self._dsn = dsn
         self._conn: Any = None
+        self._ready = False
 
     async def _get_conn(self):
         if self._conn is None or self._conn.closed:
             if self._dsn is None:
-                from agent.config import POSTGRES_URI
+                from agent.config import DB_CONNECT_TIMEOUT, POSTGRES_URI
 
                 self._dsn = POSTGRES_URI
+            else:
+                from agent.config import DB_CONNECT_TIMEOUT
             from psycopg import AsyncConnection
             from psycopg.rows import dict_row
 
+            # DSN 已写 connect_timeout 时以 DSN 为准；否则显式传入，
+            # 避免数据库不可达时后台任务无限等待建连。
+            kwargs: dict[str, Any] = {}
+            if "connect_timeout" not in str(self._dsn):
+                kwargs["connect_timeout"] = DB_CONNECT_TIMEOUT
             self._conn = await AsyncConnection.connect(
-                self._dsn, autocommit=True, prepare_threshold=None, row_factory=dict_row
+                self._dsn,
+                autocommit=True,
+                prepare_threshold=None,
+                row_factory=dict_row,
+                **kwargs,
             )
         return self._conn
 
     async def setup(self) -> None:
+        if self._ready:
+            return
         conn = await self._get_conn()
         async with conn.cursor() as cur:
             for statement in DDL_STATEMENTS:
                 await cur.execute(statement)
+        self._ready = True
         logger.info("scheduler 表结构就绪")
 
     async def close(self) -> None:
         if self._conn is not None and not self._conn.closed:
             await self._conn.close()
         self._conn = None
+        self._ready = False
+
+    async def mark_cancelled(
+        self, run_id: str, summary: str = "后台调度已由用户终止"
+    ) -> None:
+        """把没有进程内任务的运行（created/paused）直接落成取消终态。"""
+        conn = await self._get_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE scheduler_run
+                SET status = 'cancelled',
+                    state = jsonb_set(
+                        jsonb_set(
+                            jsonb_set(state, '{status}', '"cancelled"'::jsonb, true),
+                            '{summary}', to_jsonb(%s::text), true
+                        ),
+                        '{finished_at}', to_jsonb(now()::text), true
+                    ),
+                    updated_at = now()
+                WHERE run_id = %s
+                """,
+                (summary, run_id),
+            )
+
+    async def mark_runs_interrupted(self) -> int:
+        """启动时把上一进程遗留的 created/running 运行标记为中断。
+
+        后台任务只存在于进程内；进程重启后它们不会再被推进，
+        必须显式落成终态，避免前端一直等待。
+        """
+        await self.setup()
+        conn = await self._get_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE scheduler_run
+                SET status = 'interrupted',
+                    state = jsonb_set(state, '{status}', '"interrupted"'::jsonb, true),
+                    updated_at = now()
+                WHERE status IN ('created', 'running')
+                """
+            )
+            return int(cur.rowcount or 0)
 
     async def create_run(self, state: RunState) -> None:
         conn = await self._get_conn()
@@ -138,6 +198,25 @@ class SchedulerStore:
         async with conn.cursor() as cur:
             await cur.execute("SELECT * FROM scheduler_run WHERE run_id = %s", (run_id,))
             return await cur.fetchone()
+
+    async def list_runs(
+        self, user_id: str, thread_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """按会话列出最近的调度运行，供前端后台任务栏展示。"""
+        conn = await self._get_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT run_id, mode, tier, status, goal, plan_version, state,
+                       created_at, updated_at
+                FROM scheduler_run
+                WHERE user_id = %s AND thread_id = %s
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (user_id, thread_id, max(1, min(int(limit), 100))),
+            )
+            return list(await cur.fetchall() or [])
 
     async def save_plan(self, plan: SchedulePlan) -> None:
         conn = await self._get_conn()

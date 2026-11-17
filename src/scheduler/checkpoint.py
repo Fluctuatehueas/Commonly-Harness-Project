@@ -9,9 +9,78 @@ import math
 from typing import Optional
 
 from .config import TierConfig
-from .models import CheckpointDecision, PlanItem, Tier
+from .models import CheckpointDecision, FactRecord, PlanItem, Tier
 
 _LEVEL = {"low": 0.0, "mid": 0.5, "high": 1.0}
+
+# 影响范围阈值：受影响未完成条目数 + 资源体积（写入路径数、不可逆加 1）
+IMPACT_MID_AT = 2
+IMPACT_HIGH_AT = 5
+
+
+def _descendants(item_id: str, items: list[PlanItem]) -> set[str]:
+    """返回 item_id 的全部下游条目（按 depends_on 反向遍历）。"""
+    children: dict[str, set[str]] = {}
+    for item in items:
+        for dep in item.depends_on:
+            children.setdefault(dep, set()).add(item.id)
+    seen: set[str] = set()
+    stack = [item_id]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(children.get(current, set()))
+    seen.discard(item_id)
+    return seen
+
+
+def measure_impact(item: PlanItem, items: list[PlanItem]) -> str:
+    """影响范围：受影响的未完成下游条目数 + 资源体积。"""
+    descendants = _descendants(item.id, items)
+    pending = sum(
+        1
+        for other in items
+        if other.id in descendants and other.status != "done"
+    )
+    volume = len(item.writes) + (1 if item.irreversible else 0)
+    score = pending + min(volume, 2)
+    if score >= IMPACT_HIGH_AT:
+        return "high"
+    if score >= IMPACT_MID_AT:
+        return "mid"
+    return "low"
+
+
+def measure_uncertainty(
+    item: PlanItem, facts: list[FactRecord], *, max_attempts: int = 2
+) -> str:
+    """不确定性：执行失败最高，重试过次之；验收结论决定成功后的可信度。"""
+    if item.status == "failed":
+        return "high"
+    if item.attempts >= max_attempts:
+        return "high"
+    if item.attempts > 1:
+        return "mid"
+    latest = next((fact for fact in reversed(facts) if fact.item_id == item.id), None)
+    if latest is None or latest.verdict == "unverified":
+        return "mid"
+    return "low"
+
+
+def measure_dimensions(
+    item: PlanItem,
+    items: list[PlanItem],
+    facts: list[FactRecord],
+    *,
+    max_attempts: int = 2,
+) -> tuple[str, str]:
+    """返回 (impact, uncertainty)，供检查点直接使用。"""
+    return (
+        measure_impact(item, items),
+        measure_uncertainty(item, facts, max_attempts=max_attempts),
+    )
 
 
 def _sigmoid(value: float) -> float:
@@ -108,4 +177,11 @@ def needs_checkpoint(
     return cfg.checkpoint_every > 0 and index > 0 and journal % cfg.checkpoint_every == 0
 
 
-__all__ = ["boundary_ratio", "needs_checkpoint", "score_checkpoint"]
+__all__ = [
+    "boundary_ratio",
+    "measure_dimensions",
+    "measure_impact",
+    "measure_uncertainty",
+    "needs_checkpoint",
+    "score_checkpoint",
+]

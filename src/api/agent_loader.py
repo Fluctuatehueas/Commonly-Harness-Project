@@ -46,7 +46,9 @@ logger = logging.getLogger(__name__)
 AgentFactory = Callable[..., Awaitable[Any]]
 SESSION_NAMESPACE_PREFIX = ("sessions",)
 ASYNC_TASK_NAMESPACE_PREFIX = ("async_tasks",)
+ASYNC_TASK_THREAD_NAMESPACE_PREFIX = ("async_tasks_by_thread",)
 ASYNC_TASK_MESSAGE_PREFIX = "async-task-result:"
+SCHEDULER_MESSAGE_PREFIX = "scheduler-result:"
 
 
 def _pick_state_node(agent: Any) -> str | None:
@@ -83,6 +85,8 @@ class AgentLoader:
         self._history_reader: ThreadHistoryReader | None = None
         self._sandbox_manager: SandboxManager | None = None
         self._mcp_watch_task: asyncio.Task | None = None
+        # 线程级异步任务索引兼容旧数据的回填标记，避免每次轮询都扫描扁平命名空间。
+        self._async_task_backfilled: set[str] = set()
 
     async def initialize(self) -> None:
         """初始化持久化资源和 Agent 工厂，并在后台调度沙箱预热。"""
@@ -504,6 +508,40 @@ class AgentLoader:
             archived_count += 1
         return archived_count
 
+    async def purge_archived_sessions(self, user_id: str, days: int) -> int:
+        """清除归档超过 ``days`` 天的会话，返回本次删除数量。
+
+        与自动归档共用同一保留天数：归档后 ``days`` 天内可恢复，逾期连同
+        checkpoint、轨迹、用量与反馈一起删除；``days <= 0`` 表示关闭。
+        """
+        if days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        purged = 0
+        for session in await self.list_sessions(user_id, archived=True):
+            raw = session.get("archived_at")
+            if not raw:
+                continue
+            try:
+                archived_at = datetime.fromisoformat(str(raw))
+            except ValueError:
+                continue
+            # 兼容历史上未带时区的 ISO 字符串。
+            if archived_at.tzinfo is None:
+                archived_at = archived_at.replace(tzinfo=timezone.utc)
+            if archived_at > cutoff:
+                continue
+            try:
+                await self.delete_session(user_id, session["thread_id"])
+                purged += 1
+            except HTTPException:
+                continue
+            except Exception:
+                logger.warning(
+                    "自动清除归档会话失败：%s", session.get("thread_id"), exc_info=True
+                )
+        return purged
+
     async def get_session(
         self, user_id: str, thread_id: str,
     ) -> dict[str, Any] | None:
@@ -675,19 +713,30 @@ class AgentLoader:
         user_id: str,
         username: str,
         thread_id: str,
+        agent_name: str = "",
     ) -> None:
-        """持久化远程任务与主会话的归属关系。"""
+        """持久化远程任务与主会话的归属关系，并建线程索引供任务栏查询。"""
         await self.initialize()
         assert self._store is not None
+        value = {
+            "task_id": task_id,
+            "user_id": user_id,
+            "username": username,
+            "thread_id": thread_id,
+            "agent_name": agent_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "delivered": False,
+        }
         await self._store.aput(
             ASYNC_TASK_NAMESPACE_PREFIX,
             task_id,
-            {
-                "task_id": task_id,
-                "user_id": user_id,
-                "username": username,
-                "thread_id": thread_id,
-            },
+            value,
+            index=False,
+        )
+        await self._store.aput(
+            (*ASYNC_TASK_THREAD_NAMESPACE_PREFIX, user_id, thread_id),
+            task_id,
+            value,
             index=False,
         )
 
@@ -707,6 +756,54 @@ class AgentLoader:
             username=str(value["username"]),
             thread_id=str(value["thread_id"]),
         )
+
+    async def list_async_task_bindings(
+        self, user_id: str, thread_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """列出会话内的远程异步任务绑定，按创建时间倒序。"""
+        await self.initialize()
+        assert self._store is not None
+        namespace = (*ASYNC_TASK_THREAD_NAMESPACE_PREFIX, user_id, thread_id)
+        size = max(1, min(int(limit), 50))
+        backfill_key = f"{user_id}:{thread_id}"
+        if backfill_key not in self._async_task_backfilled:
+            # 兼容早期只写扁平命名空间的绑定：每个线程只在首次查询时扫描一次。
+            flat = await self._store.asearch(ASYNC_TASK_NAMESPACE_PREFIX, limit=500)
+            for item in flat:
+                value = item.value
+                if (
+                    str(value.get("user_id")) != user_id
+                    or str(value.get("thread_id")) != thread_id
+                ):
+                    continue
+                # 线程索引可能已有更完整的投递状态，旧扁平数据不能覆盖它。
+                if await self._store.aget(namespace, item.key) is not None:
+                    continue
+                await self._store.aput(namespace, item.key, value, index=False)
+            self._async_task_backfilled.add(backfill_key)
+        items = await self._store.asearch(namespace, limit=max(size, 100))
+        rows = [dict(item.value) for item in items]
+        rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+        return rows[:size]
+
+    async def mark_async_task_delivered(
+        self,
+        task_id: str,
+        *,
+        user_id: str,
+        thread_id: str,
+        status: str,
+    ) -> None:
+        """记录终态结果已投递，避免任务栏轮询重复读取远端线程。"""
+        await self.initialize()
+        assert self._store is not None
+        namespace = (*ASYNC_TASK_THREAD_NAMESPACE_PREFIX, user_id, thread_id)
+        item = await self._store.aget(namespace, task_id)
+        if item is None:
+            return
+        value = dict(item.value)
+        value.update({"delivered": True, "status": status})
+        await self._store.aput(namespace, task_id, value, index=False)
 
     async def publish_async_task_result(
         self,
@@ -777,6 +874,98 @@ class AgentLoader:
             },
         )
         await self.save_session(binding.user_id, binding.thread_id, "新会话")
+        return True
+
+    async def publish_scheduler_result(
+        self,
+        run_id: str,
+        *,
+        user_id: str,
+        thread_id: str,
+        content: str,
+        timeout_sec: float = 600.0,
+    ) -> bool:
+        """把后台调度的终态幂等写入会话。
+
+        会话正在处理时不是失败，而是等待本轮结束后重试；暂停中的图不写入，
+        避免 aupdate_state 改写 checkpoint 的后续调度。
+        """
+        if not thread_id:
+            return False
+        message_id = f"{SCHEDULER_MESSAGE_PREFIX}{run_id}"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(1.0, timeout_sec)
+        while True:
+            async with self.thread_operation(thread_id, defer=True) as acquired:
+                if acquired:
+                    if await self.get_session(user_id, thread_id) is None:
+                        return False
+                    published = await self._publish_scheduler_message(
+                        message_id,
+                        run_id=run_id,
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        content=content,
+                    )
+                    if published is not None:
+                        return published
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(2)
+
+    async def _publish_scheduler_message(
+        self,
+        message_id: str,
+        *,
+        run_id: str,
+        user_id: str,
+        thread_id: str,
+        content: str,
+    ) -> bool | None:
+        """返回 True/False 表示最终结果，None 表示图暂停中、稍后重试。"""
+        state = await self.get_thread_state(thread_id)
+        messages = state.values.get("messages", [])
+        for message in messages:
+            current = (
+                message.get("id", "")
+                if isinstance(message, dict)
+                else getattr(message, "id", "")
+            )
+            if current == message_id:
+                return True
+        if state.next or state.interrupts:
+            return None
+
+        session = await self.get_session(user_id, thread_id)
+        agent = await self.get_agent_for_user(
+            user_id=user_id,
+            username=user_id,
+            thread_id=thread_id,
+            agent_id=str((session or {}).get("agent_id") or "default"),
+            group_id=str((session or {}).get("group_id") or ""),
+        )
+        await agent.aupdate_state(
+            self.create_config(
+                thread_id=thread_id,
+                user_id=user_id,
+                username=user_id,
+            ),
+            {
+                "messages": [
+                    AIMessage(
+                        id=message_id,
+                        content=content,
+                        additional_kwargs={
+                            # 历史接口只回放 source=main 的助手消息；
+                            # 调度结果必须作为主 Agent 交付出现在会话里。
+                            "source": "main",
+                            "scheduler_run_id": run_id,
+                        },
+                    )
+                ]
+            },
+        )
+        await self.save_session(user_id, thread_id, "新会话")
         return True
 
     async def delete_session(self, user_id: str, thread_id: str) -> bool:

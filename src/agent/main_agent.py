@@ -48,6 +48,8 @@ from agent.middlewares.subagent_progress import SubagentProgressMiddleware
 from agent.middlewares.time_awareness import TimeAwarenessMiddleware
 from agent.middlewares.token_usage import TokenUsageMiddleware
 from agent.middlewares.trajectory import TrajectoryMiddleware
+from agent.middlewares.verification_observer import VerificationObserverMiddleware
+from agent.middlewares.verification_points import VerificationPointMiddleware
 from agent.middlewares.visualization import VisualizationMiddleware
 from agent.pdc_state import PdcState
 from agent.schema import HarnessContext
@@ -87,6 +89,7 @@ from agent.tools.workspace_tools import (
     create_publish_to_project_tool,
     create_run_in_sandbox_tool,
 )
+from agent.verification import get_verification_runner
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,13 @@ SYNC_SUBAGENT_CONFIG_FILES: list[str | Path] = [
     config_path("researcher.yaml"),
     config_path("executor.yaml"),
     config_path("reviewer.yaml"),
+    # 验证角色：可由主 Agent 手动 task 委派；自动 L2 默认关闭。
+    config_path("verifier_score.yaml"),
+    config_path("verifier_critic.yaml"),
+    # 调度角色：验收员由 scheduler runner 直接调用，其余两个按需委派。
+    config_path("verification_expert.yaml"),
+    config_path("scheduler_evaluator.yaml"),
+    config_path("replan_advisor.yaml"),
 ]
 
 
@@ -456,8 +466,15 @@ async def create_main_agent(
         "- 对话分两种模式：项目会话绑定本机项目目录；自由会话没有项目目录。\n"
         "- 项目会话：文件工具中的 `/` 是项目根目录，可写任意类型文件，"
         "但绝不能执行项目内的文件。\n"
+        "- 项目会话的 `/workspace/<project_id>` 只是沙箱命令目录，"
+        "不要和文件工具的虚拟路径混用。\n"
         "- 自由会话：文件工具中的 `/` 是该会话在沙箱内的独立目录，"
         "文件保留在沙箱，用户可从右侧文件抽屉查看与下载。\n"
+        "- 路径规则：自由会话必须使用文件工具的虚拟路径（如 `/notes.md`）；"
+        "禁止使用 `/workspace/...` 绝对路径，用户给出时先转换成会话工作区内的虚拟路径。"
+        "只有写在虚拟 `/` 下的文件才会出现在右侧文件抽屉。\n"
+        "- 检查自由会话产出时，用文件工具的 `ls` / `read_file` 按虚拟路径检查；"
+        "不要用 `run_in_sandbox` 直接查看 `/workspace` 根目录来判断文件是否对用户可见。\n"
         f"{execute_policy_line}"
         "- 项目会话需要项目文件参与执行时，调用 `run_in_sandbox` 并在 `files` 中"
         "列出项目相对路径；自由会话直接在该会话沙箱目录执行。\n"
@@ -528,6 +545,9 @@ async def create_main_agent(
         "MD 档只需给出前两个阶段，后续阶段在检查点自动展开；HD 档给出完整阶段表。\n"
         "- 调度器已执行完成的条目不要重做；节点失败或需求变化时调用 "
         "`scheduler_replan`，按 reorder / subtree / full 选择最小范围。\n"
+        "- `scheduler_plan` 提交后台执行后立即返回 run_id，不代表任务已完成；"
+        "不要重复调用，也不要自行重做已交给调度的条目。进度由调度事件流推送，"
+        "终态摘要会写回会话。\n"
         "- 调用前先想清楚条目边界：一个条目应当由一次独立执行完成，并写明完成标准。\n"
         if scheduler_tools
         else ""
@@ -583,6 +603,10 @@ async def create_main_agent(
             # 轨迹结束事件落库后，再异步执行经验/归因/候选编排。
             EvolutionMiddleware(summary_model),
             TrajectoryMiddleware(context_limit=effective_context_limit),
+            # 验证（纯观测）：V1/V2 观察工具与委派结果，V3 在回答放行后后台记录。
+            # 必须放在 TrajectoryMiddleware 之后，确保本轮 run_id 已生成。
+            VerificationPointMiddleware(get_verification_runner()),
+            VerificationObserverMiddleware(get_verification_runner()),
             *skill_middleware,
             # 自动摘要 + 主动压缩 + 模型/工具调用上限。
             *build_agent_protection_middleware(

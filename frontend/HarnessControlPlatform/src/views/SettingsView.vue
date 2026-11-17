@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 系统设置：对话展示控制 + 后端运行参数（思考 / 联网搜索）+ 沙箱服务配置
-import { onMounted, reactive, ref, type Component } from 'vue'
+import { computed, onMounted, reactive, ref, type Component } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   ArrowRight,
@@ -25,15 +25,19 @@ import TopNav from '@/components/console/TopNav.vue'
 import InfoHint from '@/components/common/InfoHint.vue'
 import { useDisplayStore } from '@/stores/display'
 import { useSettingsStore } from '@/stores/settings'
+import { MODEL_CATALOG, formatContext } from '@/stores/models'
 import {
   checkSandboxPort,
   fetchArchiveSettings,
   fetchContextSettings,
+  fetchGlobalModelSettings,
   fetchSandboxSettings,
   updateArchiveSettings,
   updateContextSettings,
+  updateGlobalModelSettings,
   updateSandboxSettings,
   type ContextSettings,
+  type GlobalModelSettings,
   type LocalEnvironment,
   type SandboxSettings,
   type StoragePaths,
@@ -70,6 +74,72 @@ const ROWS: Row[] = [
   { key: 'expandToolArgs', label: '参数默认展开', desc: '轨迹节点默认展开参数与结果，而非折叠', icon: 'eye' },
   { key: 'typewriter', label: '打字机效果', desc: '流式 token 以逐字打字方式渲染', icon: 'message' },
 ]
+
+// ---------- 全局模型（.env） ----------
+const globalModel = ref<GlobalModelSettings | null>(null)
+const gmLoading = ref(true)
+const gmSaving = ref(false)
+const gmError = ref('')
+const gmForm = reactive({
+  model_name: '',
+  base_url: '',
+  api_key: '',
+  context_limit: 128000,
+})
+const gmContextOptions = computed(() => {
+  const spec = MODEL_CATALOG.find((item) => item.id === gmForm.model_name)
+  return spec?.contextOptions?.length ? spec.contextOptions : [128000, 200000, 256000, 1000000]
+})
+
+async function loadGlobalModel() {
+  gmLoading.value = true
+  gmError.value = ''
+  try {
+    const data = await fetchGlobalModelSettings()
+    globalModel.value = data
+    gmForm.model_name = data.model_name
+    gmForm.base_url = data.base_url
+    gmForm.context_limit = data.context_limit || 128000
+    gmForm.api_key = ''
+  } catch (err) {
+    gmError.value = (err as Error).message
+  } finally {
+    gmLoading.value = false
+  }
+}
+
+function pickGlobalModel(modelId: string) {
+  const spec = MODEL_CATALOG.find((item) => item.id === modelId)
+  if (!spec) return
+  gmForm.model_name = spec.id
+  gmForm.base_url = spec.baseUrl
+  gmForm.context_limit = spec.defaultContext
+  gmForm.api_key = ''
+}
+
+async function saveGlobalModel() {
+  if (gmSaving.value) return
+  gmSaving.value = true
+  gmError.value = ''
+  try {
+    const data = await updateGlobalModelSettings({
+      model_name: gmForm.model_name || undefined,
+      base_url: gmForm.base_url.trim(),
+      api_key: gmForm.api_key.trim() || undefined,
+      context_limit: Number(gmForm.context_limit),
+    })
+    globalModel.value = data
+    gmForm.model_name = data.model_name
+    gmForm.base_url = data.base_url
+    gmForm.context_limit = data.context_limit
+    gmForm.api_key = ''
+    ElMessage.success('已写入 .env 并热更新，所有未单独配置模型的 Agent 下一轮对话生效')
+  } catch (err) {
+    gmError.value = (err as Error).message
+  } finally {
+    gmSaving.value = false
+  }
+}
 
 // ---------- 沙箱服务 ----------
 const sandbox = ref<SandboxSettings | null>(null)
@@ -279,6 +349,7 @@ async function saveArchive() {
 
 onMounted(() => {
   void settings.load()
+  void loadGlobalModel()
   void loadSandbox()
   void loadContext()
   void loadArchive()
@@ -294,6 +365,95 @@ onMounted(() => {
         <h1>系统设置</h1>
         <p>对话展示、运行参数与执行环境，按模块分组。</p>
       </header>
+
+      <!-- 全局模型：写入 .env，所有未独立配置的 Agent 共用 -->
+      <section class="settings-module">
+        <header class="module-head">
+          <span class="module-icon"><el-icon><MagicStick /></el-icon></span>
+          <div class="module-heading">
+            <h2>全局模型</h2>
+            <p>写入 .env 并立即热更新；所有未单独配置模型的 Agent 都使用这里的配置</p>
+          </div>
+          <el-button
+            type="primary"
+            size="small"
+            :icon="Check"
+            :loading="gmSaving"
+            :disabled="gmLoading"
+            @click="saveGlobalModel"
+          >
+            {{ gmSaving ? '保存中…' : '保存全局模型' }}
+          </el-button>
+        </header>
+
+        <div v-if="gmLoading" v-loading="true" class="sandbox-loading">
+          <span class="loading-text">正在读取全局模型配置…</span>
+        </div>
+        <template v-else>
+          <el-form label-position="top" class="sandbox-grid">
+            <el-form-item label="模型">
+              <el-select
+                :model-value="gmForm.model_name"
+                filterable
+                placeholder="选择模型"
+                class="fill"
+                @update:model-value="pickGlobalModel"
+              >
+                <el-option
+                  v-for="item in MODEL_CATALOG"
+                  :key="item.id"
+                  :label="`${item.name} · ${item.provider}`"
+                  :value="item.id"
+                />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="Base URL">
+              <el-input
+                v-model="gmForm.base_url"
+                placeholder="https://api.deepseek.com"
+                spellcheck="false"
+              />
+            </el-form-item>
+            <el-form-item>
+              <template #label>
+                <span class="label-line">
+                  API Key
+                  <em>{{ globalModel?.has_api_key ? '已配置，留空保持不变' : '未配置' }}</em>
+                </span>
+              </template>
+              <el-input
+                v-model="gmForm.api_key"
+                type="password"
+                show-password
+                placeholder="留空则保持现有密钥"
+                autocomplete="new-password"
+                spellcheck="false"
+              />
+            </el-form-item>
+            <el-form-item label="上下文窗口">
+              <el-select v-model="gmForm.context_limit" class="fill">
+                <el-option
+                  v-for="tokens in gmContextOptions"
+                  :key="tokens"
+                  :value="tokens"
+                  :label="formatContext(tokens)"
+                />
+              </el-select>
+            </el-form-item>
+          </el-form>
+
+          <div class="foot" :class="{ warn: Boolean(gmError) }">
+            <el-icon>
+              <Warning v-if="gmError" />
+              <Monitor v-else />
+            </el-icon>
+            <span v-if="gmError">{{ gmError }}</span>
+            <span v-else>
+              保存后重写 {{ globalModel?.env_path || '.env' }} 并清空所有用户缓存的 Agent 图，下一轮对话生效。模型层级：Agent 独立配置 &gt; 全局模型；思考 / 联网仍按用户在「对话运行参数」中配置。
+            </span>
+          </div>
+        </template>
+      </section>
 
       <section class="settings-module">
         <header class="module-head">

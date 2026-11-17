@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -126,6 +127,17 @@ def _repeated_steps(messages: list[Any]) -> int:
     return max_repeat
 
 
+def _verification_issues(context: Any) -> list[dict[str, Any]]:
+    """读取本轮验证问题；格式异常时按空列表处理。"""
+    try:
+        value = json.loads(
+            str(getattr(context, "verification_issues_json", "") or "[]")
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
 def _build_signals(messages: list[Any], context: Any) -> RunSignals:
     tool_errors = _collect_tool_errors(messages)
     verification_failed = bool(
@@ -141,6 +153,12 @@ def _build_signals(messages: list[Any], context: Any) -> RunSignals:
         ).split(",")
         if item
     ]
+    verification_blocking = int(
+        getattr(context, "verification_blocking", 0) or 0
+    )
+    verification_degraded = bool(
+        getattr(context, "verification_degraded", False)
+    )
     signal = RunSignals(
         has_failure=bool(
             tool_errors
@@ -148,6 +166,7 @@ def _build_signals(messages: list[Any], context: Any) -> RunSignals:
             or hitl_rejected
             or user_correction
             or repeated >= 2
+            or verification_blocking
         ),
         tool_errors=tool_errors,
         verification_failed=verification_failed,
@@ -155,6 +174,9 @@ def _build_signals(messages: list[Any], context: Any) -> RunSignals:
         user_correction=user_correction,
         repeated_steps=repeated,
         injected_experience_ids=injected_ids,
+        verification_blocking=verification_blocking,
+        verification_degraded=verification_degraded,
+        verification_issues=_verification_issues(context),
     )
     return signal
 

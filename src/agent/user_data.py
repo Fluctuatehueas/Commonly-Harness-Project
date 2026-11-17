@@ -125,8 +125,26 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"", "0", "false", "off", "no"}
 
 
+def global_model_settings() -> dict[str, Any]:
+    """部署级全局模型配置：唯一来源是 .env，由系统设置页维护。"""
+    try:
+        context_limit = int(os.getenv("HARNESS_MODEL_CONTEXT_LIMIT") or 128000)
+    except (TypeError, ValueError):
+        context_limit = 128000
+    return {
+        "model_name": str(os.getenv("DEEPSEEK_MODEL_NAME") or "deepseek-v4-flash"),
+        "base_url": str(os.getenv("DEEPSEEK_BASE_URL") or ""),
+        "api_key": str(os.getenv("DEEPSEEK_API_KEY") or ""),
+        "context_limit": context_limit,
+    }
+
+
 def model_settings(user_id: str | None) -> dict[str, Any]:
-    """当前用户实际生效的模型配置（用户覆盖 > 部署级 .env）。"""
+    """当前用户实际生效的模型配置：全局模型 + 用户级思考/联网开关。
+
+    模型名、端点、密钥与上下文窗口只由系统设置里的全局模型（.env）决定；
+    用户 settings.json 中遗留的模型字段不再参与解析。
+    """
     config = _config_module()
     override = read_user_settings(user_id)["model"]
     thinking = override.get("thinking_enabled")
@@ -135,27 +153,10 @@ def model_settings(user_id: str | None) -> dict[str, Any]:
     web_search = override.get("web_search_enabled")
     if web_search is None:
         web_search = bool(config.WEB_SEARCH_ENABLED)
-    try:
-        context_limit = int(
-            override.get("context_limit")
-            or os.getenv("HARNESS_MODEL_CONTEXT_LIMIT", "128000")
-        )
-    except (TypeError, ValueError):
-        context_limit = 128000
     return {
-        "model_name": str(
-            override.get("model_name")
-            or os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
-        ),
-        "base_url": str(
-            override.get("base_url") or os.getenv("DEEPSEEK_BASE_URL") or ""
-        ),
-        "api_key": str(
-            override.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or ""
-        ),
+        **global_model_settings(),
         "thinking_enabled": bool(thinking),
         "web_search_enabled": bool(web_search),
-        "context_limit": context_limit,
     }
 
 

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.config import MCP_CONFIG_PATH, MCP_ROOT, PROJECT_ROOT
-from agent.mcp.client_registry import MCPClientRegistry
+from agent.mcp.client_registry import MCPClientRegistry, is_session_lost
 from agent.mcp.config_store import McpConfig, McpConfigStore
 from agent.mcp.observer import McpObserver
 from agent.mcp.registry import ToolRegistry
@@ -551,6 +551,11 @@ class MCPRuntime:
             if not result.startswith('{"ok": false'):
                 runtime.latency_ms = duration_ms
                 runtime.consecutive_failures = 0
+                if runtime.state is ServerState.DORMANT:
+                    # 调用成功即证明连接可用。健康检查可能恰好落在
+                    # “淘汰旧会话 → 重连”的窗口里，把状态误标为 Dormant。
+                    runtime.state = ServerState.CONNECTED
+                    runtime.connected_at = utc_now().isoformat()
                 threshold = (
                     runtime.config.health.degraded_latency_ms
                     or int(runtime.config.call_timeout_ms * 0.8)
@@ -1047,7 +1052,12 @@ class MCPRuntime:
                         failures=runtime.health_failures,
                         error_category=error.category.value,
                     )
-                    if runtime.health_failures >= config.health.failure_threshold:
+                    # 会话失效（服务重启 / 凭据轮换）是确定性事实，不必等
+                    # 失败次数累积：立即淘汰旧会话并进入重连流程。
+                    if (
+                        is_session_lost(exc)
+                        or runtime.health_failures >= config.health.failure_threshold
+                    ):
                         await self.pool.close_key(config.pool_key)
                         await self._apply_failure(server_id, error)
 

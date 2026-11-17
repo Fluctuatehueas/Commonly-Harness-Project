@@ -177,33 +177,47 @@ function onMapWheel(event: WheelEvent) {
 }
 
 // ---------- 拖拽平移 ----------
+// 注意：不能在 pointerdown 时就 setPointerCapture。捕获后 pointerup / click 会被
+// 重定向到视口，节点上的 @click 收不到事件，表现为「点圆点没反应」。
+// 因此先记录起点，等真正拖出阈值再开始平移并捕获指针。
+let panCandidate = false
+
 function onPanDown(event: PointerEvent) {
   if (props.compact || event.button !== 0) return
   const el = viewport.value
   if (!el) return
-  panning.value = true
+  panCandidate = true
+  panning.value = false
   panMoved = false
   panStart = { x: event.clientX, y: event.clientY, left: el.scrollLeft, top: el.scrollTop }
-  el.setPointerCapture(event.pointerId)
 }
 
 function onPanMove(event: PointerEvent) {
-  if (!panning.value) return
+  if (!panCandidate) return
   const el = viewport.value
   if (!el) return
   const dx = event.clientX - panStart.x
   const dy = event.clientY - panStart.y
-  if (!panMoved && Math.hypot(dx, dy) > 4) panMoved = true
+  if (!panMoved) {
+    if (Math.hypot(dx, dy) <= 4) return
+    panMoved = true
+    panning.value = true
+    el.setPointerCapture(event.pointerId)
+  }
   el.scrollLeft = panStart.left - dx
   el.scrollTop = panStart.top - dy
 }
 
 function onPanUp(event: PointerEvent) {
-  if (!panning.value) return
+  if (!panCandidate) return
+  panCandidate = false
   panning.value = false
   const el = viewport.value
-  el?.releasePointerCapture?.(event.pointerId)
+  if (el?.hasPointerCapture?.(event.pointerId)) {
+    el.releasePointerCapture(event.pointerId)
+  }
   if (panMoved) suppressClickUntil = Date.now() + 150
+  panMoved = false
 }
 
 /** 拖拽结束后的第一次点击不当作选中。 */
@@ -339,7 +353,6 @@ function isDragClick() {
   </Teleport>
 </template>
 
-<style scoped>
 <style scoped>
 /* ---------- 外层：工具条浮在视口右上角 ---------- */
 .map-shell {

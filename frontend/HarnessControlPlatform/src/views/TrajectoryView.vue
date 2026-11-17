@@ -41,6 +41,7 @@ const LANES = [
   { key: 'skill', label: '技能', color: '#8f7bff', icon: 'layers' },
   { key: 'delegation', label: '委派', color: '#f2b03c', icon: 'users' },
   { key: 'hitl', label: '人工介入', color: '#e2605e', icon: 'shield' },
+  { key: 'verification', label: '验证', color: '#4fd18b', icon: 'shield' },
   { key: 'compaction', label: '压缩', color: '#b07cff', icon: 'layers' },
 ] as const
 
@@ -51,6 +52,7 @@ const TYPE_META: Record<string, { label: string; icon: IconName; color: string }
   skill: { label: '技能', icon: 'layers', color: '#8f7bff' },
   delegation: { label: '委派', icon: 'users', color: '#f2b03c' },
   hitl: { label: '人工介入', icon: 'shield', color: '#e2605e' },
+  verification: { label: '验证', icon: 'shield', color: '#4fd18b' },
   compaction: { label: '上下文压缩', icon: 'layers', color: '#b07cff' },
 }
 
@@ -774,7 +776,41 @@ onBeforeUnmount(stopTimer)
                   <pre>{{ selectedEvent.preview }}</pre>
                 </section>
 
-                <section v-if="selectedEvent.summary && Object.keys(selectedEvent.summary).length" class="detail-block">
+                <section v-if="selectedEvent.verification" class="detail-block">
+                  <h4>验证结论</h4>
+                  <div class="kv">
+                    <div><small>验证点</small><span>{{ selectedEvent.verification.point || '-' }}</span></div>
+                    <div><small>级别</small><span>{{ selectedEvent.verification.level || '-' }}</span></div>
+                    <div><small>结论</small><span>{{ selectedEvent.verification.verdict || '-' }}</span></div>
+                    <div><small>来源</small><span>{{ selectedEvent.verification.source || '-' }}</span></div>
+                    <div><small>判官</small><span>{{ selectedEvent.verification.judge_model || '-' }}</span></div>
+                    <div v-if="selectedEvent.verification.blocking">
+                      <small>阻断问题</small><span>{{ selectedEvent.verification.blocking }}</span>
+                    </div>
+                  </div>
+                  <div v-if="selectedEvent.verification.scores" class="verify-scores">
+                    <span v-for="(value, key) in selectedEvent.verification.scores" :key="key">
+                      {{ key }} <b>{{ value }}</b>
+                    </span>
+                  </div>
+                  <div v-if="selectedEvent.verification.issues?.length" class="verify-issues">
+                    <article
+                      v-for="(issue, index) in selectedEvent.verification.issues"
+                      :key="index"
+                      class="verify-issue"
+                    >
+                      <div class="verify-issue-head">
+                        <span class="verify-severity" :class="issue.severity">{{ issue.severity }}</span>
+                        <strong>{{ issue.dimension }}</strong>
+                      </div>
+                      <p>{{ issue.message }}</p>
+                      <small v-if="issue.evidence_ref">证据：{{ issue.evidence_ref }}</small>
+                      <small v-if="issue.suggestion">建议：{{ issue.suggestion }}</small>
+                    </article>
+                  </div>
+                </section>
+
+                <section v-if="selectedEvent.type !== 'verification' && selectedEvent.summary && Object.keys(selectedEvent.summary).length" class="detail-block">
                   <h4>本轮汇总</h4>
                   <pre>{{ JSON.stringify(selectedEvent.summary, null, 2) }}</pre>
                 </section>
@@ -1536,6 +1572,76 @@ onBeforeUnmount(stopTimer)
   gap: 5px;
   font-size: 10px;
   color: var(--text-3);
+}
+
+.verify-scores {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.verify-scores b {
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.verify-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.verify-issue {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: var(--bg-deep);
+}
+
+.verify-issue-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+}
+
+.verify-issue p {
+  margin: 4px 0;
+  font-size: 10.5px;
+  color: var(--text-1);
+}
+
+.verify-issue small {
+  display: block;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.verify-severity {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  border: 1px solid var(--line);
+}
+
+.verify-severity.blocking {
+  color: #e2605e;
+  border-color: rgba(226, 96, 94, 0.45);
+}
+
+.verify-severity.major {
+  color: #f2b03c;
+  border-color: rgba(242, 176, 60, 0.45);
+}
+
+.verify-severity.minor {
+  color: #37d0c4;
+  border-color: rgba(55, 208, 196, 0.45);
 }
 
 .context-bar {
