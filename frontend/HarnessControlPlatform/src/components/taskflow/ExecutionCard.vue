@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// Chat 消息流中的任务流执行卡片：流名称 / 当前步骤 / 进度条 / 步骤状态图标，可展开看 step_traces。
-// 展示型组件：Chat 集成时由 SSE 事件或 Execution 记录映射出 props 传入。
+// Chat 消息流中的任务流执行卡片：流名称 / 当前步骤 / 进度条 / 步骤状态图标。
+// 鼠标进入自动展开步骤列表，离开或点击收起；归档后固定在本轮轨迹底部。
 import { computed, ref } from 'vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { ExecutionStepView, StepTrace } from '@/api/taskflow'
@@ -13,18 +13,15 @@ const props = withDefaults(
     currentStep?: string
     steps?: ExecutionStepView[]
     traces?: StepTrace[]
-    /** 顶部常驻卡片：默认折叠，只显示标题与进度条。 */
-    collapsible?: boolean
+    /** 归档态：位于本轮轨迹底部，只影响样式 */
+    archived?: boolean
   }>(),
-  { currentStep: '', steps: () => [], traces: () => [], collapsible: false },
+  { currentStep: '', steps: () => [], traces: () => [], archived: false },
 )
 
-const expanded = ref(false)
-// 可折叠时默认收起：折叠只留标题 + 进度条，展开才显示步骤列表。
-const open = ref(!props.collapsible)
+const open = ref(false)
 
 function toggle() {
-  if (!props.collapsible) return
   open.value = !open.value
 }
 
@@ -51,12 +48,38 @@ const stepIcon: Record<string, 'clock' | 'play' | 'check' | 'close' | 'wrench'> 
   degraded: 'wrench',
 }
 
+const total = computed(() => props.steps.length)
+
+const doneCount = computed(
+  () => props.steps.filter((step) => step.status === 'done' || step.status === 'degraded').length,
+)
+
+/** 收起时展示的当前步骤：优先运行中的步骤，其次按名称匹配。 */
+const current = computed(() => {
+  const index = props.steps.findIndex((step) => step.status === 'running')
+  const running = index >= 0 ? props.steps[index] : undefined
+  if (running) return { index, step: running }
+  if (!props.currentStep) return null
+  const fallback = props.steps.findIndex((step) => step.name === props.currentStep)
+  const target = fallback >= 0 ? props.steps[fallback] : undefined
+  return target ? { index: fallback, step: target } : null
+})
+
+/** 本轮结束时仍未执行的步骤数，收起态也能看出流程走到了哪一步。 */
+const leftover = computed(() =>
+  props.status === 'running' ? 0 : Math.max(0, total.value - doneCount.value),
+)
+
+const stateLabel = computed(() => {
+  if (props.status === 'done' && leftover.value > 0) return '已结束'
+  return statusLabel[props.status] || props.status
+})
+
+const partial = computed(() => props.status === 'done' && leftover.value > 0)
+
 const progress = computed(() => {
-  if (!props.steps.length) return 0
-  const finished = props.steps.filter(
-    (step) => step.status === 'done' || step.status === 'degraded',
-  ).length
-  return Math.round((finished / props.steps.length) * 100)
+  if (!total.value) return 0
+  return Math.round((doneCount.value / total.value) * 100)
 })
 
 function tracesOf(stepId: string): StepTrace[] {
@@ -74,22 +97,53 @@ function formatDuration(ms: number): string {
 </script>
 
 <template>
-  <article class="exec-card" :class="status">
-    <header class="exec-head" :class="{ clickable: collapsible }" @click="toggle">
+  <article
+    class="exec-card"
+    :class="[status, { archived, partial }]"
+    @mouseenter="open = true"
+    @mouseleave="open = false"
+  >
+    <header class="exec-head" @click="toggle">
       <span class="exec-icon">
         <AppIcon
-          :name="status === 'done' ? 'check' : status === 'failed' ? 'close' : 'target'"
+          :name="
+            status === 'done'
+              ? 'check'
+              : status === 'failed'
+                ? 'close'
+                : status === 'aborted'
+                  ? 'stop'
+                  : 'target'
+          "
           :size="13"
         />
       </span>
       <div class="exec-title">
         <strong>{{ flowName }}</strong>
-        <small v-if="status === 'running' && currentStep">当前步骤：{{ currentStep }}</small>
-        <small v-else>{{ statusLabel[status] || status }}</small>
+        <small class="exec-sub">
+          <template v-if="status === 'running'">
+            <template v-if="current">
+              <span class="cur-step">
+                <em>第 {{ current.index + 1 }} / {{ total }} 步</em>
+                <AppIcon
+                  :name="stepIcon[current.step.status] || 'play'"
+                  :size="12"
+                  class="cur-icon"
+                  :class="current.step.status"
+                />
+                <span class="cur-name">{{ current.step.name }}</span>
+              </span>
+            </template>
+            <template v-else>准备中 · 已完成 {{ doneCount }} / {{ total }} 步</template>
+          </template>
+          <template v-else>
+            已完成 {{ doneCount }} / {{ total }} 步
+            <span v-if="leftover" class="leftover">· {{ leftover }} 步未执行</span>
+          </template>
+        </small>
       </div>
-      <span class="exec-state">{{ statusLabel[status] || status }}</span>
+      <span class="exec-state">{{ stateLabel }}</span>
       <button
-        v-if="collapsible"
         class="expand-btn"
         type="button"
         :title="open ? '收起步骤进度' : '展开步骤进度'"
@@ -97,53 +151,50 @@ function formatDuration(ms: number): string {
       >
         <AppIcon name="chevronRight" :size="12" :class="{ rotated: open }" />
       </button>
-      <button
-        v-else-if="traces.length"
-        class="expand-btn"
-        type="button"
-        :title="expanded ? '收起步骤详情' : '展开步骤详情'"
-        @click="expanded = !expanded"
-      >
-        <AppIcon name="chevronRight" :size="12" :class="{ rotated: expanded }" />
-      </button>
     </header>
 
     <div class="exec-progress">
       <i :style="{ width: `${Math.max(4, progress)}%` }"></i>
     </div>
 
-    <ul v-if="steps.length && open" class="step-list">
-      <li v-for="(step, index) in steps" :key="step.id" class="step-item" :class="step.status">
-        <span class="step-name">
-          <em class="step-index">{{ index + 1 }}</em>
-          <span class="step-dash">—</span>
-          <span>{{ step.name || step.id }}</span>
-        </span>
-        <em v-if="step.branch" class="step-branch">{{ step.branch }}</em>
-        <span class="step-state" :title="stepStatusLabel[step.status] || step.status">
-          <AppIcon :name="stepIcon[step.status] || 'clock'" :size="13" />
-        </span>
+    <div class="exec-body" :class="{ open }">
+      <div class="exec-body-inner">
+        <ul v-if="steps.length" class="step-list">
+          <li v-for="(step, index) in steps" :key="step.id" class="step-item" :class="step.status">
+            <span class="step-name">
+              <em class="step-index">{{ index + 1 }}</em>
+              <span class="step-dash">—</span>
+              <span>{{ step.name || step.id }}</span>
+            </span>
+            <em v-if="step.branch" class="step-branch">{{ step.branch }}</em>
+            <span class="step-state" :title="stepStatusLabel[step.status] || step.status">
+              <AppIcon :name="stepIcon[step.status] || 'clock'" :size="13" />
+            </span>
 
-        <!-- 运行中的步骤实时展示模型增量输出，避免长时间无反馈 -->
-        <pre v-if="step.status === 'running' && step.output" class="live-output">{{
-          step.output
-        }}</pre>
+            <!-- 运行中的步骤实时展示模型增量输出，避免长时间无反馈 -->
+            <pre v-if="step.status === 'running' && step.output" class="live-output">{{
+              step.output
+            }}</pre>
 
-        <div v-if="expanded && tracesOf(step.id).length" class="traces">
-          <div v-for="(trace, ti) in tracesOf(step.id)" :key="ti" class="trace">
-            <p class="trace-meta">
-              <span v-if="trace.branch">分支：{{ trace.branch }} · </span>
-              <span>尝试 {{ trace.attempts }} 次 · {{ formatDuration(trace.duration_ms) }}</span>
-              <span v-if="trace.state_source === 'user_provided'" class="user-provided"
-                >用户提供的上游状态</span
-              >
-            </p>
-            <p v-if="traceOutput(trace)" class="trace-text">{{ traceOutput(trace) }}</p>
-            <p v-if="trace.check_result" class="trace-text check">校验：{{ trace.check_result }}</p>
-          </div>
-        </div>
-      </li>
-    </ul>
+            <div v-if="tracesOf(step.id).length" class="traces">
+              <div v-for="(trace, ti) in tracesOf(step.id)" :key="ti" class="trace">
+                <p class="trace-meta">
+                  <span v-if="trace.branch">分支：{{ trace.branch }} · </span>
+                  <span>尝试 {{ trace.attempts }} 次 · {{ formatDuration(trace.duration_ms) }}</span>
+                  <span v-if="trace.state_source === 'user_provided'" class="user-provided"
+                    >用户提供的上游状态</span
+                  >
+                </p>
+                <p v-if="traceOutput(trace)" class="trace-text">{{ traceOutput(trace) }}</p>
+                <p v-if="trace.check_result" class="trace-text check">
+                  校验：{{ trace.check_result }}
+                </p>
+              </div>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </div>
   </article>
 </template>
 
@@ -151,7 +202,6 @@ function formatDuration(ms: number): string {
 .exec-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   padding: 12px 14px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
@@ -166,13 +216,20 @@ function formatDuration(ms: number): string {
   border-color: rgba(226, 96, 94, 0.42);
 }
 
+.exec-card.partial {
+  border-color: rgba(242, 176, 60, 0.35);
+}
+
+.exec-card.archived {
+  margin-top: 4px;
+  background: transparent;
+}
+
 .exec-head {
   display: flex;
   align-items: center;
   gap: 9px;
-}
-
-.exec-head.clickable {
+  margin-bottom: 8px;
   cursor: pointer;
 }
 
@@ -197,6 +254,11 @@ function formatDuration(ms: number): string {
   background: rgba(226, 96, 94, 0.12);
 }
 
+.exec-card.aborted .exec-icon {
+  color: var(--text-3);
+  background: rgba(255, 255, 255, 0.05);
+}
+
 .exec-title {
   flex: 1;
   min-width: 0;
@@ -211,7 +273,7 @@ function formatDuration(ms: number): string {
   white-space: nowrap;
 }
 
-.exec-title small {
+.exec-sub {
   display: block;
   margin-top: 1px;
   font-size: 10px;
@@ -221,10 +283,63 @@ function formatDuration(ms: number): string {
   white-space: nowrap;
 }
 
+/* 收起态也能看到当前步骤序号、状态图标与名称 */
+.cur-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+}
+
+.cur-step em {
+  flex: none;
+  font-style: normal;
+  font-family: var(--font-mono);
+  color: var(--accent-cyan);
+}
+
+.cur-icon.running {
+  color: var(--accent-cyan);
+  animation: exec-pulse 1.2s ease-in-out infinite;
+}
+
+.cur-icon.done {
+  color: var(--green);
+}
+
+.cur-icon.failed {
+  color: var(--danger);
+}
+
+.cur-icon.degraded {
+  color: var(--amber);
+}
+
+.cur-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+
+.leftover {
+  color: var(--amber);
+}
+
+@keyframes exec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 .exec-state {
   flex: none;
   font-size: 10px;
   color: var(--text-3);
+}
+
+.exec-card.partial .exec-state {
+  color: var(--amber);
 }
 
 .expand-btn {
@@ -267,6 +382,34 @@ function formatDuration(ms: number): string {
   background: var(--danger);
 }
 
+.exec-card.aborted .exec-progress i {
+  background: var(--text-3);
+}
+
+.exec-card.partial .exec-progress i {
+  background: linear-gradient(90deg, var(--accent-cyan), var(--amber));
+}
+
+/* 高度过渡：0fr -> 1fr，内容多少都能平滑展开 */
+.exec-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.24s ease;
+}
+
+.exec-body.open {
+  grid-template-rows: 1fr;
+}
+
+.exec-body-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.exec-body-inner > :first-child {
+  margin-top: 8px;
+}
+
 .step-list {
   list-style: none;
   margin: 0;
@@ -274,6 +417,8 @@ function formatDuration(ms: number): string {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  max-height: 260px;
+  overflow: auto;
 }
 
 .step-item {
@@ -282,6 +427,8 @@ function formatDuration(ms: number): string {
   flex-wrap: wrap;
   gap: 7px;
   min-height: 20px;
+  /* 列表超高时不允许压缩条目，否则步骤产出会溢出并与相邻行重叠 */
+  flex: 0 0 auto;
   font-size: 11px;
   color: var(--text-3);
 }

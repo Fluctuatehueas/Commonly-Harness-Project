@@ -202,8 +202,11 @@ async function onToggle(item: SkillItem, value: boolean) {
   togglingId.value = item.skill_id
   try {
     const updated = await toggleSkill(item.target, item.name, value)
+    // 抽屉里的 active 是详情接口返回的新对象，和列表行不同引用，需要按 skill_id 双向回写
     Object.assign(item, updated)
-    if (active.value && active.value.skill_id === item.skill_id) {
+    const row = items.value.find((it) => it.skill_id === updated.skill_id)
+    if (row && row !== item) Object.assign(row, updated)
+    if (active.value && active.value.skill_id === updated.skill_id && active.value !== item) {
       Object.assign(active.value, updated)
     }
     flash(value ? '技能已启用，下一轮对话生效' : '技能已停用，下一轮对话不再加载')

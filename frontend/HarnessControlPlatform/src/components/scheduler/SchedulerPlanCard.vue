@@ -27,9 +27,7 @@ const props = withDefaults(
     events?: string[]
     /** 降级警告：验收异常、落库失败等。 */
     warnings?: string[]
-    /** 顶部常驻卡片：默认折叠，只显示标题与进度条。 */
-    collapsible?: boolean
-    /** 归档态：位于轨迹底部，直接展示全部条目。 */
+    /** 归档态：位于轨迹底部，只影响样式。 */
     archived?: boolean
   }>(),
   {
@@ -42,15 +40,14 @@ const props = withDefaults(
     note: '',
     events: () => [],
     warnings: () => [],
-    collapsible: false,
     archived: false,
   },
 )
 
-const open = ref(true)
+// 默认收起，鼠标进入展开；离开或点击收起。
+const open = ref(false)
 
 function toggle() {
-  if (!props.collapsible) return
   open.value = !open.value
 }
 
@@ -163,8 +160,13 @@ function showPhase(index: number): boolean {
 </script>
 
 <template>
-  <article class="sched-card" :class="[status, { archived }]">
-    <header class="sched-head" :class="{ clickable: collapsible }" @click="toggle">
+  <article
+    class="sched-card"
+    :class="[status, { archived }]"
+    @mouseenter="open = true"
+    @mouseleave="open = false"
+  >
+    <header class="sched-head" @click="toggle">
       <span class="sched-icon">
         <AppIcon
           :name="
@@ -184,13 +186,15 @@ function showPhase(index: number): boolean {
         <small v-if="status === 'running' && runningItem">
           正在执行：{{ runningItem.title }}
         </small>
+        <small v-else-if="items.length">
+          已完成 {{ doneCount }} / {{ items.length }} 条<template v-if="goal"> · {{ goal }}</template>
+        </small>
         <small v-else-if="goal">{{ goal }}</small>
         <small v-else-if="meta">{{ meta }}</small>
       </div>
       <span class="sched-meta">{{ meta }}</span>
       <span class="sched-state">{{ statusLabel[status] || status }}</span>
       <button
-        v-if="collapsible"
         class="expand-btn"
         type="button"
         :title="open ? '收起规划条目' : '展开规划条目'"
@@ -204,7 +208,9 @@ function showPhase(index: number): boolean {
       <i :style="{ width: `${Math.max(4, progress)}%` }"></i>
     </div>
 
-    <ul v-if="items.length && open" class="plan-list">
+    <div class="sched-body" :class="{ open }">
+      <div class="sched-body-inner">
+        <ul v-if="items.length" class="plan-list">
       <template v-for="(item, index) in shownItems" :key="item.id">
         <li v-if="showPhase(index)" class="phase-row">
           <span class="phase-label">{{ item.phaseTitle || item.phaseId }}</span>
@@ -230,35 +236,37 @@ function showPhase(index: number): boolean {
           </span>
         </li>
       </template>
-      <li v-if="shownCount < items.length" class="plan-item pending">
-        <span class="plan-name">
-          <em class="plan-index">{{ shownCount + 1 }}</em>
-          <span class="plan-dash">—</span>
-          <span class="plan-text typing">规划中…</span>
-        </span>
-      </li>
-    </ul>
+          <li v-if="shownCount < items.length" class="plan-item pending">
+            <span class="plan-name">
+              <em class="plan-index">{{ shownCount + 1 }}</em>
+              <span class="plan-dash">—</span>
+              <span class="plan-text typing">规划中…</span>
+            </span>
+          </li>
+        </ul>
 
-    <footer
-      v-if="note || summary || checkpoint || events.length || warnings.length"
-      class="sched-foot"
-    >
-      <p v-if="checkpoint" class="sched-checkpoint">
-        检查点 {{ checkpoint.score.toFixed(2) }} ·
-        {{ actionLabel[checkpoint.action] || checkpoint.action }}
-        <template v-if="checkpoint.impact || checkpoint.uncertainty">
-          · 影响 {{ checkpoint.impact || '-' }} / 不确定性 {{ checkpoint.uncertainty || '-' }}
-        </template>
-      </p>
-      <p v-for="(line, index) in events" :key="`ev-${index}`" class="sched-event">
-        {{ line }}
-      </p>
-      <p v-for="(line, index) in warnings" :key="`warn-${index}`" class="sched-warning">
-        {{ line }}
-      </p>
-      <p v-if="note" class="sched-note">{{ note }}</p>
-      <p v-if="summary" class="sched-summary">{{ summary }}</p>
-    </footer>
+        <footer
+          v-if="note || summary || checkpoint || events.length || warnings.length"
+          class="sched-foot"
+        >
+          <p v-if="checkpoint" class="sched-checkpoint">
+            检查点 {{ checkpoint.score.toFixed(2) }} ·
+            {{ actionLabel[checkpoint.action] || checkpoint.action }}
+            <template v-if="checkpoint.impact || checkpoint.uncertainty">
+              · 影响 {{ checkpoint.impact || '-' }} / 不确定性 {{ checkpoint.uncertainty || '-' }}
+            </template>
+          </p>
+          <p v-for="(line, index) in events" :key="`ev-${index}`" class="sched-event">
+            {{ line }}
+          </p>
+          <p v-for="(line, index) in warnings" :key="`warn-${index}`" class="sched-warning">
+            {{ line }}
+          </p>
+          <p v-if="note" class="sched-note">{{ note }}</p>
+          <p v-if="summary" class="sched-summary">{{ summary }}</p>
+        </footer>
+      </div>
+    </div>
   </article>
 </template>
 
@@ -266,7 +274,6 @@ function showPhase(index: number): boolean {
 .sched-card {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   padding: 12px 14px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
@@ -298,9 +305,7 @@ function showPhase(index: number): boolean {
   display: flex;
   align-items: center;
   gap: 9px;
-}
-
-.sched-head.clickable {
+  margin-bottom: 8px;
   cursor: pointer;
 }
 
@@ -407,6 +412,29 @@ function showPhase(index: number): boolean {
   background: var(--text-3);
 }
 
+/* 高度过渡：0fr -> 1fr，条目增减时也能平滑展开/收起 */
+.sched-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.24s ease;
+}
+
+.sched-body.open {
+  grid-template-rows: 1fr;
+}
+
+.sched-body-inner {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sched-body-inner > :first-child {
+  margin-top: 8px;
+}
+
 .plan-list {
   list-style: none;
   margin: 0;
@@ -420,6 +448,7 @@ function showPhase(index: number): boolean {
 }
 
 .phase-row {
+  flex: 0 0 auto;
   margin-top: 4px;
   padding-left: 2px;
   font-size: 9.5px;
@@ -433,6 +462,8 @@ function showPhase(index: number): boolean {
   align-items: center;
   gap: 7px;
   min-height: 20px;
+  /* 列表超高时只滚动，不压缩条目 */
+  flex: 0 0 auto;
   font-size: 11px;
   color: var(--text-3);
 }

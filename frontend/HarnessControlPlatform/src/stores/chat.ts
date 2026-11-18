@@ -77,6 +77,8 @@ export interface ChatMsg {
   resolved?: 'answered' | 'approved' | 'rejected'
   // 用户在 HITL 卡片里提交内容的简短摘要，卡片收起后用于轨迹树展示
   resolution?: string
+  // 执行卡归属的用户轮次（user 消息 id）；用于把卡片固定在它结束的那一轮
+  turnKey?: string
   // ---------- 任务流执行卡片 ----------
   flowId?: string
   flowName?: string
@@ -357,9 +359,6 @@ function summarizeResume(payload: Record<string, unknown>): string {
 export const useChatStore = defineStore('chat', () => {
   // threadId -> 独立会话状态。SSE 事件始终写入发起请求的那个 thread。
   const threads = ref<Record<string, ThreadChat>>({})
-  // threadId -> 最近一次未完成任务流的卡片快照。
-  // 历史重新拉取（撤回）会丢掉本地卡片，这里用于把未完成的进度卡挂回去。
-  const flowSnapshots = ref<Record<string, ChatMsg>>({})
   // run_id -> 后台调度事件流订阅；工具返回后用它继续接收进度。
   const schedulerSubs = new Map<string, { close: () => void }>()
   const threadId = ref<string | null>(null)
@@ -370,6 +369,12 @@ export const useChatStore = defineStore('chat', () => {
   const turnVersion = ref(0)
   // 最近完成一轮的 thread_id；后台会话完成时也能定位到正确文件域
   const lastTurnThreadId = ref<string | null>(null)
+  // threadId -> 最近完成一轮的用户消息 id，供文件产出按轮归档
+  const lastTurnKeys = ref<Record<string, string>>({})
+
+  function lastTurnKeyFor(tid: string | null): string {
+    return tid ? lastTurnKeys.value[tid] || '' : ''
+  }
 
   let pendingDemoIndex = 0
 
@@ -545,45 +550,35 @@ export const useChatStore = defineStore('chat', () => {
     card.schedEvents = list.slice(-6)
   }
 
-  /** 记录/清理任务流快照：整条流走完后删除，保证卡片不再出现。 */
-  function rememberFlowSnapshot(key: string, card: ChatMsg | undefined) {
+  /**
+   * 收尾任务流卡片：本轮结束、失败或中止时统一调用。
+   *
+   * 流没有等到 task_flow_end 就随本轮结束时，把仍在运行的步骤降回等待态，
+   * 避免卡片停在上一步的转圈状态；卡片本身的终态由调用方传入。
+   */
+  function finalizeFlowCard(
+    card: ChatMsg | undefined,
+    status: 'done' | 'failed' | 'aborted',
+    turnKey = '',
+  ) {
     if (!card || card.kind !== 'taskflow') return
-    const steps = (card.flowSteps || []).map((step) => ({ ...step }))
-    const finished =
-      steps.length > 0 &&
-      steps.every((step) => step.status === 'done' || step.status === 'degraded')
-    if (finished) {
-      delete flowSnapshots.value[key]
-      return
+    if (card.flowStatus === 'running') card.flowStatus = status
+    for (const step of card.flowSteps || []) {
+      if (step.status === 'running') step.status = 'pending'
     }
-    flowSnapshots.value[key] = {
-      ...card,
-      id: uid('tf'),
-      flowStatus: 'running',
-      flowCurrentStep: '',
-      flowSteps: steps,
-      flowTraces: (card.flowTraces || []).slice(),
-      at: Date.now(),
-    }
+    card.flowCurrentStep = ''
+    // 卡片固定到「结束/归档」时所在的那一轮，后续对话不再跟着走。
+    card.turnKey = turnKey || card.turnKey || ''
   }
 
-  /** 撤回导致历史被重新拉取后，把未完成任务流的进度卡挂回消息流。 */
-  function restoreFlowCard(tid: string) {
-    const snapshot = flowSnapshots.value[tid]
-    const state = threads.value[tid]
-    if (!snapshot || !state) return
-    if (
-      state.messages.some(
-        (message) => message.kind === 'taskflow' && message.flowStatus === 'running',
-      )
-    ) {
-      return
+  /** 当前轮次的用户消息 id；后台事件没有 activeTurnKey 时回退到最近一条用户消息。 */
+  function turnKeyOf(state: ThreadChat): string {
+    if (state.activeTurnKey) return state.activeTurnKey
+    for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+      const msg = state.messages[i]
+      if (msg?.kind === 'user') return msg.id
     }
-    state.messages.push({
-      ...snapshot,
-      id: uid('tf'),
-      flowSteps: (snapshot.flowSteps || []).map((step) => ({ ...step })),
-    })
+    return ''
   }
 
   function migrateThread(from: string, to: string) {
@@ -695,6 +690,7 @@ export const useChatStore = defineStore('chat', () => {
       card = {
         id: uid('sc'),
         kind: 'scheduler',
+        turnKey: turnKeyOf(state),
         schedRunId: runId,
         schedGoal: String(evt.goal || ''),
         schedTier: String(evt.tier || ''),
@@ -789,8 +785,10 @@ export const useChatStore = defineStore('chat', () => {
       }
       card.schedStatus = 'paused'
       card.at = Date.now()
+      card.turnKey = turnKeyOf(state)
     } else if (phase === 'phase_failed') {
       card.schedStatus = 'paused'
+      card.turnKey = turnKeyOf(state)
       pushSchedEvent(
         card,
         `阶段 ${String(evt.phase_id || '')} 失败：${String(evt.reason || '')}`,
@@ -810,8 +808,9 @@ export const useChatStore = defineStore('chat', () => {
       card.schedReplans = Number(evt.replans || 0)
       const warnings = Array.isArray(evt.warnings) ? evt.warnings.map(String) : []
       if (warnings.length) card.schedWarnings = warnings.slice(-4)
-      // 完成后归档：时间戳后移，落到本轮轨迹的最底部。
+      // 完成后归档：固定到结束时的这一轮，后续对话不再跟随。
       card.at = Date.now()
+      card.turnKey = turnKeyOf(state)
     }
   }
 
@@ -1203,6 +1202,7 @@ export const useChatStore = defineStore('chat', () => {
         state.messages.push({
           id: uid('tf'),
           kind: 'taskflow',
+          turnKey: turnKeyOf(state),
           flowId: String(evt.flow_id || ''),
           flowName: String(evt.flow_name || '任务流'),
           flowStatus: 'running',
@@ -1263,22 +1263,22 @@ export const useChatStore = defineStore('chat', () => {
           }
           if (status === 'step_started' && attempt > 1) card.flowCurrentStep = step.name
         }
-        card.flowStatus = 'running'
+        // 迟到的进度事件不能把已收尾的卡片重新挂回顶部。
+        if (card.flowStatus !== 'done' && card.flowStatus !== 'failed' && card.flowStatus !== 'aborted') {
+          card.flowStatus = 'running'
+        }
         break
       }
       case 'task_flow_end': {
         const card = findTaskFlowMsg(state)
         if (!card) break
         const status = String(evt.status || 'done')
-        card.flowStatus = status === 'failed' || status === 'aborted' ? status : 'done'
         card.flowTraces = Array.isArray(evt.step_traces) ? (evt.step_traces as StepTrace[]) : []
-        if (card.flowStatus !== 'done') {
-          for (const step of card.flowSteps || []) {
-            if (step.status === 'running') step.status = 'failed'
-          }
-        }
-        card.flowCurrentStep = ''
-        rememberFlowSnapshot(key, card)
+        finalizeFlowCard(
+          card,
+          status === 'failed' || status === 'aborted' ? status : 'done',
+          turnKeyOf(state),
+        )
         break
       }
       case 'scheduler_progress': {
@@ -1393,23 +1393,39 @@ export const useChatStore = defineStore('chat', () => {
           state.compaction = null
         }
         state.compactionBuffer = ''
+        // 记录本轮的用户消息 id，卡片与文件产出都要固定到这一轮。
+        const finishedTurnKey = state.activeTurnKey || turnKeyOf(state)
         state.sending = false
         state.thinking = false
         state.controller = null
         state.activeTurnKey = null
         // HITL 中断不算异常终止，不写终止原因；只有真正超限才标记。
         if (limitHit && !evt.interrupted) markTerminated(state, 'limit')
+        // 本轮结束：任务流卡片统一收尾，随后归档到本轮轨迹底部。
+        // HITL 中断时任务流只是暂停，恢复后还会继续，不能提前归档。
+        // 只收尾属于本轮的执行卡；后台仍在跑的旧卡片不能被无关轮次结束顺手归档。
         const flowCard = findTaskFlowMsg(state)
-        if (flowCard && flowCard.flowStatus === 'running') flowCard.flowStatus = 'done'
-        // 本轮结束卡片即收起；未走完的流留一份快照，撤回后可重新挂出。
-        rememberFlowSnapshot(key, flowCard)
+        if (
+          !evt.interrupted &&
+          flowCard &&
+          (!flowCard.turnKey || flowCard.turnKey === finishedTurnKey)
+        ) {
+          finalizeFlowCard(flowCard, 'done', finishedTurnKey)
+        }
         const schedCard = findSchedulerMsg(state)
-        if (schedCard && schedCard.schedStatus === 'running') {
+        if (
+          schedCard &&
+          schedCard.schedStatus === 'running' &&
+          (!schedCard.turnKey || schedCard.turnKey === finishedTurnKey)
+        ) {
           schedCard.schedStatus = 'done'
           schedCard.at = Date.now()
+          schedCard.turnKey = finishedTurnKey || schedCard.turnKey || ''
         }
         if (!evt.interrupted) state.pendingInterrupt = null
-        lastTurnThreadId.value = realId || key
+        const finishedThread = realId || key
+        lastTurnThreadId.value = finishedThread
+        lastTurnKeys.value = { ...lastTurnKeys.value, [finishedThread]: finishedTurnKey }
         turnVersion.value++
         break
       }
@@ -1431,18 +1447,27 @@ export const useChatStore = defineStore('chat', () => {
         clearCompactionWatchdog(state)
         state.compaction = null
         state.compactionBuffer = ''
+        const failedTurnKey = state.activeTurnKey || turnKeyOf(state)
         state.sending = false
         state.thinking = false
         state.controller = null
         state.activeTurnKey = null
         const flowCard = findTaskFlowMsg(state)
-        if (flowCard && flowCard.flowStatus === 'running') flowCard.flowStatus = 'failed'
-        rememberFlowSnapshot(key, flowCard)
+        if (flowCard && (!flowCard.turnKey || flowCard.turnKey === failedTurnKey)) {
+          finalizeFlowCard(flowCard, 'failed', failedTurnKey)
+        }
         const schedCard = findSchedulerMsg(state)
-        if (schedCard && schedCard.schedStatus === 'running') {
+        if (
+          schedCard &&
+          schedCard.schedStatus === 'running' &&
+          (!schedCard.turnKey || schedCard.turnKey === failedTurnKey)
+        ) {
           schedCard.schedStatus = 'failed'
           schedCard.at = Date.now()
+          schedCard.turnKey = failedTurnKey || schedCard.turnKey || ''
         }
+        const failedThread = String(evt.thread_id || key)
+        lastTurnKeys.value = { ...lastTurnKeys.value, [failedThread]: failedTurnKey }
         break
       }
     }
@@ -1679,6 +1704,11 @@ export const useChatStore = defineStore('chat', () => {
     // HITL 恢复仍属于同一用户轮次，耗时回填到该轮。
     const lastUser = [...state.messages].reverse().find((message) => message.kind === 'user')
     state.activeTurnKey = lastUser?.id || state.activeTurnKey
+    // 暂停中的任务流恢复后归入当前轮，结束时才能正确归档。
+    const pausedFlow = findTaskFlowMsg(state)
+    if (pausedFlow && pausedFlow.flowStatus === 'running') {
+      pausedFlow.turnKey = state.activeTurnKey || pausedFlow.turnKey || ''
+    }
     if (demoMode.value) {
       void runDemoResume(state, key, markAs)
       return
@@ -1708,6 +1738,12 @@ export const useChatStore = defineStore('chat', () => {
     state.compactionBuffer = ''
     restoreRetryBackup(state)
     if (running) markTerminated(state, 'user')
+    // 手动终止后任务流不可能再走完，立即归档并标记中止；只处理本轮自己的卡片。
+    const stoppedKey = turnKeyOf(state)
+    const stoppedFlow = findTaskFlowMsg(state)
+    if (stoppedFlow && (!stoppedFlow.turnKey || stoppedFlow.turnKey === stoppedKey)) {
+      finalizeFlowCard(stoppedFlow, 'aborted', stoppedKey)
+    }
     state.sending = false
     state.thinking = false
     state.activeTurnKey = null
@@ -2010,6 +2046,7 @@ export const useChatStore = defineStore('chat', () => {
       if (!card) continue
       card.schedStatus = status
       card.at = Date.now()
+      card.turnKey = turnKeyOf(state)
       pushSchedEvent(card, '后台任务已终止')
       return
     }
@@ -2034,12 +2071,12 @@ export const useChatStore = defineStore('chat', () => {
     selectedGroupId,
     turnVersion,
     lastTurnThreadId,
+    lastTurnKeyFor,
     runningThreadIds,
     waitingThreadIds,
     activateThread,
     releaseThread,
     isThreadSending,
-    restoreFlowCard,
     send,
     resume,
     stop,

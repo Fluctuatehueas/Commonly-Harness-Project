@@ -147,8 +147,6 @@ function openSessionFile(file: { path: string; origin: 'project' | 'sandbox' }) 
   showFiles.value = true
 }
 
-/** 当前会话最近一轮的有用产出，只渲染在最后一条回答下方 */
-const turnArtifacts = computed(() => files.artifactsFor(chat.threadId))
 const fileRefreshKey = ref(0)
 // null=检测中 true=在线 false=离线（离线时提示后端不可达）
 const backendOnline = ref<boolean | null>(null)
@@ -663,6 +661,17 @@ async function hydrateTurnDurations(threadId: string, msgs: ChatMsg[]) {
 }
 
 async function createSession() {
+  // 当前会话还没有任何消息时，它本身就是新会话：重复点击不再新建，直接聚焦输入框。
+  const currentSession = sessions.sessions.find((item) => item.thread_id === chat.threadId)
+  if (
+    chat.threadId &&
+    !chat.sending &&
+    chat.isEmpty &&
+    !currentSession?.message_count
+  ) {
+    inputEl.value?.focus()
+    return
+  }
   const previousThread = chat.threadId
   // 新建会话前保留原会话草稿；新建后输入框从空白开始。
   stashCurrentDraft()
@@ -815,7 +824,7 @@ watch(
   () => {
     if (backendOnline.value) void sessions.refresh()
     const threadId = chat.lastTurnThreadId
-    if (threadId) void files.markRound(threadId)
+    if (threadId) void files.markRound(threadId, chat.lastTurnKeyFor(threadId))
     fileRefreshKey.value++
   },
 )
@@ -855,8 +864,8 @@ interface TurnView {
   key: string
   user: ChatMsg | null
   process: ChatMsg[]
-  taskflow: ChatMsg | null
-  // 执行中的任务规划卡固定在顶部；结束后的卡片归档到本轮轨迹底部
+  // 执行中的任务流卡固定在顶部；结束后与任务规划卡一起归档到本轮轨迹底部
+  taskflows: ChatMsg[]
   scheduler: ChatMsg | null
   schedulers: ChatMsg[]
   final: ChatMsg | null
@@ -908,7 +917,7 @@ const turns = computed<TurnView[]>(() => {
         key: msg.id,
         user: msg,
         process: [],
-        taskflow: null,
+        taskflows: [],
         scheduler: null,
         schedulers: [],
         final: null,
@@ -924,7 +933,7 @@ const turns = computed<TurnView[]>(() => {
         key: `pre-${msg.id}`,
         user: null,
         process: [],
-        taskflow: null,
+        taskflows: [],
         scheduler: null,
         schedulers: [],
         final: null,
@@ -938,14 +947,21 @@ const turns = computed<TurnView[]>(() => {
       current.terminated = msg
       continue
     }
+    // 执行卡按 turnKey 归到它结束/归档的那一轮，不能跟着最新对话走。
+    const archivedOwner = (card: ChatMsg): TurnView | null => {
+      if (!card.turnKey) return null
+      if (current && current.key === card.turnKey) return current
+      return result.find((item) => item.key === card.turnKey) || null
+    }
     if (msg.kind === 'taskflow') {
-      current.taskflow = msg
+      // 运行中的卡片固定在顶部；本轮结束后归档到所属轮次的轨迹底部。
+      if (msg.flowStatus !== 'running') (archivedOwner(msg) || current).taskflows.push(msg)
       continue
     }
     if (msg.kind === 'scheduler') {
-      // 运行中固定在顶部；完成/中断后归档到本轮轨迹最底部。
+      // 运行中固定在顶部；完成/中断后归档到所属轮次的轨迹最底部。
       if (msg.schedStatus === 'running') current.scheduler = msg
-      else current.schedulers.push(msg)
+      else (archivedOwner(msg) || current).schedulers.push(msg)
       continue
     }
     if (msg.kind === 'interrupt') {
@@ -979,6 +995,19 @@ const turns = computed<TurnView[]>(() => {
 function turnDuration(turn: TurnView): number | undefined {
   if (!turn.user) return undefined
   return chat.turnDurations[turn.user.id]
+}
+
+// 本轮归档卡片：任务流与任务规划按产生顺序排在轨迹底部。
+function archivedCards(turn: TurnView): ChatMsg[] {
+  // 同一条流可能因中断恢复重复收到 task_flow_start，按 flowId 只保留最新一张。
+  const flows = new Map<string, ChatMsg>()
+  for (const card of turn.taskflows) flows.set(card.flowId || card.id, card)
+  return [...flows.values(), ...turn.schedulers].sort((a, b) => (a.at || 0) - (b.at || 0))
+}
+
+// 本轮产出文件：按轮归档，固定显示在真正产出它的那一轮回答下方。
+function turnFiles(turn: TurnView) {
+  return turn.user ? files.artifactsFor(chat.threadId, turn.user.id) : []
 }
 
 // ---------- 终止原因提示 ----------
@@ -1173,9 +1202,8 @@ async function withdrawLatest(turn: TurnView, index: number) {
       turn.user.sentText ?? turn.user.content,
     )
     // 重新拉取历史，确保消息、中断与用量都以后端 head 为准。
+    // 任务流/任务规划卡片只存在于前端消息流，重拉后随所在轮次一起消失。
     await selectSession(threadId)
-    // 撤回后如果上一轮的任务流还没走完，把进度卡片重新挂回消息流。
-    chat.restoreFlowCard(threadId)
     sessionUsageOverride.value = null
     void hydrateSessionUsage(threadId)
     const withdrawn = result.content || turn.user.content || ''
@@ -1907,7 +1935,6 @@ async function submit() {
               :checkpoint="activeScheduler.schedCheckpoint"
               :events="activeScheduler.schedEvents || []"
               :warnings="activeScheduler.schedWarnings || []"
-              collapsible
             />
           </div>
           <!-- 任务流进度：固定在滚动区顶部，只显示当前运行中的那一条；本轮结束即消失 -->
@@ -1918,7 +1945,6 @@ async function submit() {
               :current-step="activeFlow.flowCurrentStep || ''"
               :steps="activeFlow.flowSteps || []"
               :traces="activeFlow.flowTraces || []"
-              collapsible
             />
           </div>
           <!-- 轨迹粘性折叠条：整条可点，箭头指示当前节点的展开状态 -->
@@ -2029,14 +2055,24 @@ async function submit() {
                 </div>
               </div>
 
-              <!-- 已归档的任务规划卡：固定在本轮轨迹最底部，恢复执行时回到顶部 -->
+              <!-- 已归档的执行卡：任务流与任务规划固定在本轮轨迹最底部，恢复执行时回到顶部 -->
               <div
-                v-for="card in turn.schedulers"
+                v-for="card in archivedCards(turn)"
                 :key="card.id"
                 class="row indent tree-row"
               >
                 <div class="tree-col">
+                  <ExecutionCard
+                    v-if="card.kind === 'taskflow'"
+                    :flow-name="card.flowName || '任务流'"
+                    :status="card.flowStatus || 'done'"
+                    :current-step="card.flowCurrentStep || ''"
+                    :steps="card.flowSteps || []"
+                    :traces="card.flowTraces || []"
+                    archived
+                  />
                   <SchedulerPlanCard
+                    v-else
                     :goal="card.schedGoal || ''"
                     :tier="card.schedTier || ''"
                     :mode="card.schedMode || ''"
@@ -2066,14 +2102,10 @@ async function submit() {
                     />
                     <span v-if="turn.final.streaming" class="cursor"></span>
                   </div>
-                  <!-- 本轮产出：只渲染在最新一轮回答下方 -->
+                  <!-- 本轮产出：固定渲染在真正产出文件的那一轮回答下方 -->
                   <ProducedFilesCard
-                    v-if="
-                      turnIndex === turns.length - 1 &&
-                      !turn.final.streaming &&
-                      turnArtifacts.length
-                    "
-                    :files="turnArtifacts"
+                    v-if="!turn.final.streaming && turnFiles(turn).length"
+                    :files="turnFiles(turn)"
                     @open-file="openSessionFile"
                   />
                   <div v-if="turn.final.content && !turn.final.streaming" class="msg-meta ai">

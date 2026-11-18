@@ -4,6 +4,36 @@
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, render, watch } from 'vue'
 import { marked, Renderer, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
+// 代码块语法高亮：只注册常用语言，避免把全量语法打进主包
+import hljs from 'highlight.js/lib/core'
+import javascript from 'highlight.js/lib/languages/javascript'
+import typescript from 'highlight.js/lib/languages/typescript'
+import python from 'highlight.js/lib/languages/python'
+import csharp from 'highlight.js/lib/languages/csharp'
+import java from 'highlight.js/lib/languages/java'
+import kotlin from 'highlight.js/lib/languages/kotlin'
+import go from 'highlight.js/lib/languages/go'
+import rust from 'highlight.js/lib/languages/rust'
+import cpp from 'highlight.js/lib/languages/cpp'
+import c from 'highlight.js/lib/languages/c'
+import php from 'highlight.js/lib/languages/php'
+import ruby from 'highlight.js/lib/languages/ruby'
+import swift from 'highlight.js/lib/languages/swift'
+import sql from 'highlight.js/lib/languages/sql'
+import json from 'highlight.js/lib/languages/json'
+import yaml from 'highlight.js/lib/languages/yaml'
+import bash from 'highlight.js/lib/languages/bash'
+import powershell from 'highlight.js/lib/languages/powershell'
+import xml from 'highlight.js/lib/languages/xml'
+import css from 'highlight.js/lib/languages/css'
+import scss from 'highlight.js/lib/languages/scss'
+import markdown from 'highlight.js/lib/languages/markdown'
+import ini from 'highlight.js/lib/languages/ini'
+import dockerfile from 'highlight.js/lib/languages/dockerfile'
+import lua from 'highlight.js/lib/languages/lua'
+import r from 'highlight.js/lib/languages/r'
+import makefile from 'highlight.js/lib/languages/makefile'
+import nginx from 'highlight.js/lib/languages/nginx'
 import { API_BASE } from '@/api/client'
 import { currentUserId } from '@/api/identity'
 import { fetchFileContent, saveBlob, type FileOrigin } from '@/stores/files'
@@ -98,6 +128,98 @@ function escapeHtml(value: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
+}
+
+// ---------- 代码语法高亮（VS Code 配色） ----------
+const HLJS_LANGUAGES = {
+  javascript,
+  typescript,
+  python,
+  csharp,
+  java,
+  kotlin,
+  go,
+  rust,
+  cpp,
+  c,
+  php,
+  ruby,
+  swift,
+  sql,
+  json,
+  yaml,
+  bash,
+  powershell,
+  xml,
+  css,
+  scss,
+  markdown,
+  ini,
+  dockerfile,
+  lua,
+  r,
+  makefile,
+  nginx,
+}
+for (const [name, language] of Object.entries(HLJS_LANGUAGES)) {
+  hljs.registerLanguage(name, language)
+}
+
+// 常见别名 → highlight.js 语言名；未命中时按纯文本处理。
+const LANGUAGE_ALIASES: Record<string, string> = {
+  js: 'javascript',
+  jsx: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  py: 'python',
+  python3: 'python',
+  cs: 'csharp',
+  'c#': 'csharp',
+  dotnet: 'csharp',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  golang: 'go',
+  rs: 'rust',
+  'c++': 'cpp',
+  cc: 'cpp',
+  hpp: 'cpp',
+  sh: 'bash',
+  shell: 'bash',
+  zsh: 'bash',
+  console: 'bash',
+  ps1: 'powershell',
+  pwsh: 'powershell',
+  rb: 'ruby',
+  yml: 'yaml',
+  html: 'xml',
+  htm: 'xml',
+  vue: 'xml',
+  svg: 'xml',
+  xhtml: 'xml',
+  md: 'markdown',
+  docker: 'dockerfile',
+  toml: 'ini',
+  cfg: 'ini',
+  conf: 'ini',
+}
+
+function normalizeLanguage(raw: string): string {
+  const value = (raw || '').trim().toLowerCase()
+  return LANGUAGE_ALIASES[value] || value
+}
+
+function highlightCode(source: string, language: string): string {
+  const name = normalizeLanguage(language)
+  if (!name || name === 'text' || name === 'plaintext' || !hljs.getLanguage(name)) {
+    return escapeHtml(source)
+  }
+  try {
+    return hljs.highlight(source, { language: name, ignoreIllegals: true }).value
+  } catch {
+    return escapeHtml(source)
+  }
 }
 
 const COPY_ICON =
@@ -242,10 +364,12 @@ renderer.link = function (this: Renderer, token: Tokens.Link) {
 // 代码块自定义渲染：语言标签 + 复制按钮放在代码上方。
 // mermaid / echarts 代码块先保留源码，待本次回答结束后由 renderVisuals 渲染成图表。
 renderer.code = ({ text, lang, escaped }) => {
-  const language = (lang || '').trim().split(/\s+/)[0] || 'text'
-  const body = escaped ? text : escapeHtml(text)
+  const rawLanguage = (lang || '').trim().split(/\s+/)[0] || 'text'
+  const language = normalizeLanguage(rawLanguage)
+  const plainBody = escaped ? text : escapeHtml(text)
   const languageAttr = escapeHtml(language)
   if (VIZ_LANGUAGES.has(language.toLowerCase())) {
+    const body = plainBody
     const vizType = language.toLowerCase() === 'mermaid' ? 'mermaid' : 'echarts'
     return (
       `<div class="viz-block" data-viz="${vizType}">` +
@@ -263,13 +387,15 @@ renderer.code = ({ text, lang, escaped }) => {
       `</div>`
     )
   }
+  // 流式过程中仍按纯文本渲染，结束后的最终渲染再做语法高亮，避免每来一个 chunk 全量重算。
+  const body = props.streaming ? plainBody : highlightCode(text, rawLanguage)
   return (
     `<div class="code-block">` +
     `<div class="code-head">` +
     `<span class="code-lang">${escapeHtml(language)}</span>` +
     `<button type="button" class="code-copy" aria-label="复制代码">${COPY_ICON}<span>复制</span></button>` +
     `</div>` +
-    `<pre><code class="language-${languageAttr}">${body}</code></pre>` +
+    `<pre><code class="hljs language-${languageAttr}">${body}</code></pre>` +
     `</div>`
   )
 }
@@ -818,6 +944,12 @@ async function onBodyClick(event: MouseEvent) {
   background: rgba(4, 10, 22, 0.85);
 }
 
+/* 普通代码块使用 VS Code Dark+ 的编辑器底色与文字色 */
+.markdown-body :deep(.code-block) {
+  border-color: #2f2f2f;
+  background: #1e1e1e;
+}
+
 /* ---------- Mermaid / ECharts 可视化 ---------- */
 .markdown-body :deep(.viz-source) {
   margin: 0;
@@ -953,6 +1085,11 @@ async function onBodyClick(event: MouseEvent) {
   }
 }
 
+.markdown-body :deep(.code-block .code-head) {
+  border-bottom: 1px solid #2f2f2f;
+  background: #252526;
+}
+
 .markdown-body :deep(.code-head) {
   display: flex;
   align-items: center;
@@ -969,6 +1106,10 @@ async function onBodyClick(event: MouseEvent) {
   color: var(--text-3);
 }
 
+.markdown-body :deep(.code-block .code-lang) {
+  color: #9d9d9d;
+}
+
 .markdown-body :deep(.code-copy) {
   display: inline-flex;
   align-items: center;
@@ -982,9 +1123,19 @@ async function onBodyClick(event: MouseEvent) {
   transition: color 0.15s, border-color 0.15s;
 }
 
+.markdown-body :deep(.code-block .code-copy) {
+  color: #9d9d9d;
+  border-color: #3c3c3c;
+}
+
 .markdown-body :deep(.code-copy):hover {
   color: var(--accent-cyan);
   border-color: rgba(53, 224, 255, 0.4);
+}
+
+.markdown-body :deep(.code-block .code-copy):hover {
+  color: #ffffff;
+  border-color: #5a5a5a;
 }
 
 .markdown-body :deep(.code-copy.copied) {
@@ -1017,6 +1168,115 @@ async function onBodyClick(event: MouseEvent) {
   color: #d7e6ff;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.markdown-body :deep(.code-block pre code) {
+  color: #d4d4d4;
+  font-family: 'Cascadia Code', Consolas, 'Courier New', monospace;
+  tab-size: 4;
+}
+
+/* ---------- VS Code Dark+ 语法配色 ---------- */
+.markdown-body :deep(.hljs-comment),
+.markdown-body :deep(.hljs-quote) {
+  color: #6a9955;
+}
+
+.markdown-body :deep(.hljs-keyword),
+.markdown-body :deep(.hljs-selector-tag),
+.markdown-body :deep(.hljs-doctag),
+.markdown-body :deep(.hljs-formula) {
+  color: #569cd6;
+}
+
+.markdown-body :deep(.hljs-built_in),
+.markdown-body :deep(.hljs-type),
+.markdown-body :deep(.hljs-title.class_),
+.markdown-body :deep(.hljs-class .hljs-title) {
+  color: #4ec9b0;
+}
+
+.markdown-body :deep(.hljs-title),
+.markdown-body :deep(.hljs-title.function_),
+.markdown-body :deep(.hljs-section),
+.markdown-body :deep(.hljs-function .hljs-title) {
+  color: #dcdcaa;
+}
+
+.markdown-body :deep(.hljs-string),
+.markdown-body :deep(.hljs-meta .hljs-string),
+.markdown-body :deep(.hljs-char.escape_) {
+  color: #ce9178;
+}
+
+.markdown-body :deep(.hljs-regexp) {
+  color: #d16969;
+}
+
+.markdown-body :deep(.hljs-number),
+.markdown-body :deep(.hljs-symbol),
+.markdown-body :deep(.hljs-bullet) {
+  color: #b5cea8;
+}
+
+.markdown-body :deep(.hljs-literal),
+.markdown-body :deep(.hljs-boolean) {
+  color: #569cd6;
+}
+
+.markdown-body :deep(.hljs-variable),
+.markdown-body :deep(.hljs-template-variable),
+.markdown-body :deep(.hljs-params),
+.markdown-body :deep(.hljs-attr),
+.markdown-body :deep(.hljs-attribute),
+.markdown-body :deep(.hljs-property) {
+  color: #9cdcfe;
+}
+
+.markdown-body :deep(.hljs-operator),
+.markdown-body :deep(.hljs-punctuation) {
+  color: #d4d4d4;
+}
+
+.markdown-body :deep(.hljs-meta),
+.markdown-body :deep(.hljs-meta .hljs-keyword) {
+  color: #c586c0;
+}
+
+.markdown-body :deep(.hljs-tag),
+.markdown-body :deep(.hljs-name),
+.markdown-body :deep(.hljs-selector-id),
+.markdown-body :deep(.hljs-template-tag),
+.markdown-body :deep(.hljs-link) {
+  color: #569cd6;
+}
+
+.markdown-body :deep(.hljs-selector-class),
+.markdown-body :deep(.hljs-selector-attr),
+.markdown-body :deep(.hljs-selector-pseudo) {
+  color: #d7ba7d;
+}
+
+.markdown-body :deep(.hljs-link) {
+  text-decoration: underline;
+}
+
+.markdown-body :deep(.hljs-emphasis) {
+  font-style: italic;
+}
+
+.markdown-body :deep(.hljs-strong) {
+  font-weight: 600;
+}
+
+.markdown-body :deep(.hljs-addition) {
+  color: #b5cea8;
+  background: rgba(155, 185, 85, 0.1);
+}
+
+.markdown-body :deep(.hljs-deletion) {
+  color: #ce9178;
+  background: rgba(255, 0, 0, 0.1);
 }
 
 .markdown-body :deep(blockquote) {
