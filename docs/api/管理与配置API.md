@@ -79,6 +79,7 @@
 | PUT | `/settings/archive` | 更新自动归档配置 |
 | GET | `/settings/sandbox` | 沙箱配置与状态 |
 | GET | `/settings/sandbox/status` | 执行模式 |
+| GET | `/settings/readiness` | 首屏运行自检（LLM / 沙箱） |
 | PUT | `/settings/sandbox` | 更新沙箱配置 |
 | POST | `/settings/sandbox/check` | 探测沙箱端口 |
 | GET | `/agents` | MyAgent 列表 |
@@ -668,6 +669,23 @@
 ```json
 {"reachable": true, "host": "127.0.0.1", "port": 18083, "message": "端口可达，凭据已配置。"}
 ```
+
+### 5.5 运行自检
+
+**GET** `/settings/readiness` → 工作台首屏调用；只读配置，不触发数据库或沙箱连接。
+
+```json
+{
+  "ready": false,
+  "blocking": true,
+  "issues": ["未配置 DEEPSEEK_API_KEY，对话无法调用模型"],
+  "llm": {"configured": false, "model_name": "deepseek-v4-flash", "base_url": "https://api.deepseek.com"},
+  "sandbox": {"configured": true, "mode": "sandbox", "notice": ""},
+  "env_path": "F:\\Python\\HarnessEngineering\\CommonProject\\.env"
+}
+```
+
+`blocking=true` 表示 LLM 未配置、前端应阻断并引导到系统设置；沙箱未配置只写入 `issues`，不阻断。
 
 ---
 

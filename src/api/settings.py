@@ -5,6 +5,7 @@
 - GET  /settings/model/global  返回全局 LLM 配置（.env，所有用户共享）
 - PUT  /settings/model/global  写入 .env 并热更新，清空所有用户的 Agent 缓存
 - GET  /settings/sandbox       返回沙箱配置、执行模式与本机运行时探测结果
+- GET  /settings/readiness     首屏自检：LLM 与沙箱是否允许正常使用
 - PUT  /settings/sandbox       更新沙箱配置并重建沙箱管理器
 - POST /settings/sandbox/check 检测沙箱服务端口是否可达
 """
@@ -125,7 +126,7 @@ def _global_model_state() -> dict[str, Any]:
     return {
         "model_name": settings["model_name"],
         "base_url": settings["base_url"],
-        "has_api_key": bool(settings["api_key"]),
+        "has_api_key": bool(settings["api_key"].strip()),
         "context_limit": settings["context_limit"],
         "env_path": str(ENV_PATH),
     }
@@ -409,6 +410,42 @@ async def get_sandbox_status() -> dict[str, Any]:
     from api.agent_loader import agent_loader
 
     return agent_loader.sandbox_status()
+
+
+@router.get("/settings/readiness")
+async def get_readiness() -> dict[str, Any]:
+    """首屏自检：LLM 凭据是否可用、沙箱是否配置。
+
+    只读配置，不触发数据库或沙箱连接；供前端在工作台进入时判断能否正常使用。
+    LLM 未配置视为阻断（对话必然失败），沙箱未配置只做警告（退化为项目工作区模式）。
+    """
+    from api.agent_loader import agent_loader
+
+    model = _global_model_state()
+    sandbox = agent_loader.sandbox_status()
+    llm_ready = bool(model["has_api_key"])
+    sandbox_ready = bool(sandbox["configured"])
+    issues: list[str] = []
+    if not llm_ready:
+        issues.append("未配置 DEEPSEEK_API_KEY，对话无法调用模型")
+    if not sandbox_ready:
+        issues.append("未配置沙箱服务，Agent 只能读写项目文件、不能执行命令")
+    return {
+        "ready": llm_ready,
+        "blocking": not llm_ready,
+        "issues": issues,
+        "llm": {
+            "configured": llm_ready,
+            "model_name": model["model_name"],
+            "base_url": model["base_url"],
+        },
+        "sandbox": {
+            "configured": sandbox_ready,
+            "mode": sandbox["mode"],
+            "notice": sandbox["notice"],
+        },
+        "env_path": model["env_path"],
+    }
 
 
 @router.put("/settings/sandbox")

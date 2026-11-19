@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 系统设置：对话展示控制 + 后端运行参数（思考 / 联网搜索）+ 沙箱服务配置
 import { computed, onMounted, reactive, ref, type Component } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   ArrowRight,
@@ -46,6 +47,27 @@ import type { IconName } from '@/components/console/icons'
 
 const display = useDisplayStore()
 const settings = useSettingsStore()
+const route = useRoute()
+
+// 从工作台自检跳转过来时，滚动并短暂高亮对应配置区块
+type FocusTarget = 'model' | 'sandbox' | ''
+const focusTarget = ref<FocusTarget>('')
+const FOCUS_ANCHORS: Record<Exclude<FocusTarget, ''>, string> = {
+  model: 'global-model',
+  sandbox: 'sandbox-service',
+}
+
+function applyFocusFromQuery() {
+  const focus = String(route.query.focus || '')
+  if (focus !== 'model' && focus !== 'sandbox') return
+  focusTarget.value = focus
+  document
+    .getElementById(FOCUS_ANCHORS[focus])
+    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  window.setTimeout(() => {
+    focusTarget.value = ''
+  }, 2600)
+}
 
 // 展示项图标：项目独有图标改用 Element Plus 图标
 const ROW_ICONS: Partial<Record<IconName, Component>> = {
@@ -353,6 +375,8 @@ onMounted(() => {
   void loadSandbox()
   void loadContext()
   void loadArchive()
+  // 等首屏数据渲染出区块高度后再定位
+  window.setTimeout(applyFocusFromQuery, 400)
 })
 </script>
 
@@ -367,7 +391,11 @@ onMounted(() => {
       </header>
 
       <!-- 全局模型：写入 .env，所有未独立配置的 Agent 共用 -->
-      <section class="settings-module">
+      <section
+        id="global-model"
+        class="settings-module"
+        :class="{ 'is-focused': focusTarget === 'model' }"
+      >
         <header class="module-head">
           <span class="module-icon"><el-icon><MagicStick /></el-icon></span>
           <div class="module-heading">
@@ -807,7 +835,11 @@ onMounted(() => {
       </section>
 
       <!-- 沙箱服务配置：未配置时给出安全提示 -->
-      <section class="settings-module">
+      <section
+        id="sandbox-service"
+        class="settings-module"
+        :class="{ 'is-focused': focusTarget === 'sandbox' }"
+      >
         <header class="module-head">
           <span class="module-icon"><el-icon><Lock /></el-icon></span>
           <div class="module-heading">
@@ -1043,6 +1075,14 @@ onMounted(() => {
   padding: 30px 0 36px;
   border-top: 1px solid var(--line);
   background: transparent;
+  scroll-margin-top: calc(var(--topbar-h) + 12px);
+  transition: box-shadow 0.4s ease, background 0.4s ease;
+}
+
+/* 自检跳转落点：左侧强调条 + 短暂背景高亮 */
+.settings-module.is-focused {
+  background: linear-gradient(90deg, rgba(55, 208, 196, 0.07), transparent 72%);
+  box-shadow: inset 3px 0 0 var(--accent-cyan), 0 0 34px rgba(55, 208, 196, 0.08);
 }
 
 .settings-module + .settings-module {

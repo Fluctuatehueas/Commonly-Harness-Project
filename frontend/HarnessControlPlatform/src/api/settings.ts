@@ -297,3 +297,30 @@ export async function fetchSandboxStatus(): Promise<SandboxSettingsResponse['sta
   return (await res.json()) as SandboxSettingsResponse['status']
 }
 
+/** 首屏自检结果：LLM 缺失阻断，沙箱缺失仅警告。 */
+export interface ReadinessReport {
+  ready: boolean
+  blocking: boolean
+  issues: string[]
+  llm: {
+    configured: boolean
+    model_name: string
+    base_url: string
+  }
+  sandbox: {
+    configured: boolean
+    mode: 'sandbox' | 'local'
+    notice: string
+  }
+  env_path: string
+}
+
+export async function fetchReadiness(): Promise<ReadinessReport> {
+  const res = await fetch(`${API_BASE}/settings/readiness`, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(6000),
+  })
+  if (!res.ok) throw new Error(`读取运行自检失败: HTTP ${res.status}`)
+  return (await res.json()) as ReadinessReport
+}
+

@@ -9,8 +9,13 @@ import brandIcon from '@/assets/icon.png'
 import { ICONS } from '@/components/console/icons'
 import { NAV_ITEMS } from '@/mock/dashboard'
 import { API_BASE } from '@/api/client'
+import { fetchReadiness, type ReadinessReport } from '@/api/settings'
+import ReadinessDialog from '@/components/common/ReadinessDialog.vue'
 import { useSessionStore } from '@/stores/sessions'
 import { useWorkspaceStore } from '@/stores/workspace'
+
+// 自检每个页面生命周期只跑一次；刷新页面后重新检测。
+let readinessChecked = false
 
 function introEase(value: number): number {
   const v = Math.min(1, Math.max(0, value))
@@ -41,6 +46,9 @@ const workspace = useWorkspaceStore()
 const canvas = ref<HTMLCanvasElement | null>(null)
 const stage = ref<HTMLElement | null>(null)
 const online = ref<boolean | null>(null)
+const readiness = ref<ReadinessReport | null>(null)
+const readinessOpen = ref(false)
+const readinessLoading = ref(false)
 const holoMode = ref<'sessions' | 'projects' | null>(null)
 const revealed = ref(false)
 const showHardware = ref(true)
@@ -139,6 +147,49 @@ const statusTagType = computed<'success' | 'warning' | 'danger'>(() =>
 const holoTitle = computed(() =>
   holoMode.value === 'sessions' ? '最近对话' : '最近项目',
 )
+
+// ---------- 启动自检 ----------
+async function probeReadiness() {
+  readinessLoading.value = true
+  try {
+    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(4000) })
+    online.value = res.ok
+    if (!res.ok) {
+      readiness.value = null
+      readinessOpen.value = true
+      return
+    }
+    try {
+      readiness.value = await fetchReadiness()
+    } catch {
+      // 旧版后端没有 readiness 接口时无法判断，直接关闭弹窗避免误报
+      readiness.value = null
+      readinessOpen.value = false
+      return
+    }
+    readinessOpen.value = !(readiness.value.llm.configured && readiness.value.sandbox.configured)
+  } catch {
+    online.value = false
+    readiness.value = null
+    readinessOpen.value = true
+  } finally {
+    readinessLoading.value = false
+  }
+}
+
+async function refreshOnline() {
+  try {
+    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(4000) })
+    online.value = res.ok
+  } catch {
+    online.value = false
+  }
+}
+
+function openSettings(focus: 'model' | 'sandbox') {
+  readinessOpen.value = false
+  void router.push({ path: '/settings', query: { focus } })
+}
 
 const latestSessionTitle = computed(
   () => recentSessions.value[0]?.title || '还没有对话',
@@ -578,12 +629,13 @@ onMounted(async () => {
   tickClock()
   clockTimer = window.setInterval(tickClock, 1000)
   mountOrbit()
-  try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(4000) })
-    online.value = res.ok
-  } catch {
-    online.value = false
+  if (readinessChecked) {
+    // 已弹过自检，回工作台只刷新在线状态
+    await refreshOnline()
+    return
   }
+  readinessChecked = true
+  await probeReadiness()
 })
 
 onBeforeUnmount(() => {
@@ -774,6 +826,15 @@ onBeforeUnmount(() => {
         </el-button>
       </div>
     </main>
+
+    <ReadinessDialog
+      v-model="readinessOpen"
+      :backend-online="online === true"
+      :report="readiness"
+      :loading="readinessLoading"
+      @retry="probeReadiness"
+      @locate="openSettings"
+    />
   </div>
 </template>
 
