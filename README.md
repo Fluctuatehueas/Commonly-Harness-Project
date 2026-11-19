@@ -8,7 +8,7 @@
 | 版本 | v1.0（2026-11） |
 | 内核 | Python 3.12+ · FastAPI · LangGraph · deepagents |
 | 前端 | Vue 3 · TypeScript · Element Plus · Pinia · ECharts · Electron |
-| 部署 | [项目部署说明书](./项目部署说明书.docx) |
+| 部署 | [项目部署说明书](./docs/项目部署说明书.docx) |
 | 文档 | [设计文档索引](./docs/core_design/README.md) · [接口文档](./docs/api/README.md) · [使用指南](./docs/for_use/) |
 
 ---
@@ -64,6 +64,13 @@
 | 项目工作区 | 已具备 | 项目登记、文件域、产物发布 |
 | 轨迹与用量 | 已具备 | 轨迹事件、甘特图、上下文占用、会话 Token |
 | 模型热更新 | 已具备 | `/settings/model` 写 `.env` 并重建图 |
+| 运行自检 | 已具备 | 工作台首屏检测后端 / LLM / 沙箱，缺失时全息弹窗引导到系统设置 |
+| Agent 团队 | 已具备 | 主 Agent 招募、独立提示词 / 模型 / MCP 绑定、团队委派 |
+| 消息反馈与重试 | 已具备 | 赞同 / 不赞同落库、失败重试与反馈开关 |
+| 上下文压缩评估 | 已具备 | 压缩前后评估、LLM 裁判、阈值在线调整与自动调参 |
+| 会话归档 | 已具备 | 按天数自动归档，支持恢复与永久删除 |
+| RAG 接入 | 已具备 | Provider 注册、统一检索与引用归一化 |
+| 演进控制面 | 部分具备 | 评估集、判官、经验写回、发布与回滚；外部 Trace 未接入 |
 | 任务调度（分档 / 计划 / 检查点） | 部分具备 | 两级计划、依赖波次、检查点打分；HTN 方法层未落地，见[设计文档 §16](./docs/core_design/任务调度模块设计.md) |
 
 ### 1.4 技术栈与目录结构
@@ -77,16 +84,32 @@ CommonProject/
 ├── src/
 │   ├── api/                HTTP / SSE 接口层
 │   ├── agent/              主 Agent、子 Agent、中间件、上下文、记忆
-│   ├── task_flow/          任务流
+│   │   ├── agent_team/     多 Agent 团队（招募 / 成员 / 委派）
+│   │   ├── backends/       工作区与沙箱后端、技能同步
+│   │   ├── context/        上下文工程与压缩评估
+│   │   ├── evolution/      评估集、判官、经验写回与发布控制面
+│   │   ├── mcp/            MCP 客户端与配置
+│   │   ├── middlewares/    工具与运行时中间件
+│   │   ├── runtime/        运行时异常捕获与守护
+│   │   ├── skills/         技能加载
+│   │   ├── subagents/      YAML 子 Agent
+│   │   ├── tools/          内置工具
+│   │   └── verification/   结果校验
+│   ├── mcp_server/         内置 MCP 示例服务端（调试与联调用）
+│   ├── rag/                RAG Provider 适配
 │   ├── scheduler/          任务调度（分档 / 计划 / 检查点 / 重规划）
-│   ├── utils/              日志、完整性、模型 Web 服务
-│   └── mcp/ rag/           协议适配
+│   ├── task_flow/          任务流
+│   ├── sql/                SQL 查询定义
+│   └── utils/              日志、完整性、模型 Web 服务
 ├── frontend/
 │   ├── HarnessControlPlatform/   Web 控制台（Vue 3 + Vite）
 │   └── Desktop/HarnessDesktop/   Electron 桌面端
 ├── sandbox/                沙箱镜像与 OpenSandbox 配置
-├── docs/                   设计、开发、接口、使用文档
-└── tests/                  单元测试
+├── mcp/                    MCP 服务配置（servers.json，运行时生成）
+├── rag/                    RAG Provider 配置（providers.json，运行时生成）
+├── docs/                   设计、开发、接口、使用、运维文档
+├── test/ · tests/          单元与集成测试
+└── logs/ · .harness/       运行日志与用户数据（运行时生成）
 ```
 
 ### 1.5 两种工作模式
@@ -103,14 +126,14 @@ CommonProject/
 
 ## 2. 快速使用
 
-> 这一节是「本机最快跑起来」。生产部署、Nginx、systemd、备份与回滚见 [项目部署说明书](./项目部署说明书.docx)。
+> 这一节是「本机最快跑起来」。生产部署、Nginx、systemd、备份与回滚见 [项目部署说明书](./docs/项目部署说明书.docx)。
 
 ### 2.1 前置条件
 
 | 依赖 | 要求 |
 | :-- | :-- |
 | Python | 3.12+（仓库验证 3.14） |
-| Node.js | 20+（仓库验证 24.x） |
+| Node.js | `^22.18.0` 或 `>=24.12.0`（前端 package.json engines；仓库验证 24.x） |
 | PostgreSQL | 13+（推荐 16） |
 | Docker | 可构建镜像；用于 PostgreSQL 与沙箱镜像 |
 | OpenSandbox Server | 可访问地址 + API Key |
@@ -180,6 +203,51 @@ opensandbox-server --config /opt/opensandbox/sandbox.toml
 
 `sandbox/sandbox.toml` 中的 `api_key` 必须与 `.env` 的 `OPEN_SANDBOX_API_KEY` 一致，`port` 必须与 `OPEN_SANDBOX_PORT` 一致。
 
+**开放沙箱端口（防火墙 / 安全组）**
+
+远程访问沙箱时，如果 Linux 主机防火墙或云安全组未放行 `OPEN_SANDBOX_PORT`，典型现象是**连接超时**而不是 401。默认端口为 `18083`；如果你的环境改成 `18031` 等其他端口，把下面命令里的端口同步替换即可。
+
+```bash
+# 1. 先确认当前启用的防火墙
+systemctl status firewalld
+ufw status
+iptables -L -n
+
+# 2. firewalld（CentOS / RHEL / Rocky）
+sudo firewall-cmd --permanent --add-port=18083/tcp
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+
+# 3. ufw（Ubuntu / Debian）
+sudo ufw allow 18083/tcp comment 'opensandbox'
+sudo ufw reload
+sudo ufw status
+
+# 4. iptables（前两者都未使用时；规则默认不持久）
+sudo iptables -I INPUT -p tcp --dport 18083 -j ACCEPT
+sudo iptables -L INPUT -n --line-numbers
+# 持久化（按系统二选一）：
+sudo netfilter-persistent save                 # Debian / Ubuntu
+sudo service iptables save                     # CentOS / RHEL（需 iptables-services）
+```
+
+放行后验证监听地址与连通性：
+
+```bash
+# Linux 主机：必须是 0.0.0.0:18083，不能是 127.0.0.1:18083
+ss -lntp | grep 18083
+
+# 跨机验证
+curl http://<Linux主机IP>:18083/health
+```
+
+```powershell
+# Windows 侧
+Test-NetConnection <Linux主机IP> -Port 18083
+```
+
+两个容易漏的点：`sandbox.toml` 的 `server.host` 必须是 `0.0.0.0`；云主机还要在控制台安全组放行同一端口。`firewalld`、`ufw`、`iptables` 不要混用，只选当前系统实际启用的那一套。
+
 **⑤ 启动后端**
 
 ```powershell
@@ -193,6 +261,7 @@ opensandbox-server --config /opt/opensandbox/sandbox.toml
 | 存活探针 | `curl http://127.0.0.1:8000/health` | `{"status":"ok",...}` |
 | 接口文档 | 浏览器打开 `http://127.0.0.1:8000/docs` | Swagger 页面可加载 |
 | 沙箱可达 | `curl http://127.0.0.1:18083/health` | 200 |
+| 运行自检 | `curl http://127.0.0.1:8000/settings/readiness` | `llm` / `sandbox` 的 `configured` 与实际配置一致 |
 | 一条对话 | `POST /chat`，body `{"message":"你好","user_id":"alice"}` | 返回模型回答 |
 
 ### 2.4 常见问题
@@ -201,7 +270,9 @@ opensandbox-server --config /opt/opensandbox/sandbox.toml
 | :-- | :-- | :-- |
 | `error while attempting to bind on address` | 端口被占用 | 换 `HARNESS_API_PORT`，或停止占用进程 |
 | 日志出现「用户数据目录不可写」 | 默认目录无写权限 | 设置 `HARNESS_USER_DATA_DIR` 到可写路径 |
-| 启动即报 `未配置 DEEPSEEK_API_KEY` | `.env` 未填 Key | 填写后重启 |
+| 后端启动失败、前端显示「后端服务不可达」 | PostgreSQL 不可达或 `.env` 未配置数据库连接 | 先确认 `DB_HOST` / `DB_USER` / `DB_PASSWORD`，再启动数据库 |
+| 工作台弹出「大模型尚未配置」 | `.env` 的 `DEEPSEEK_API_KEY` 为空 | 点击「前往配置模型」在系统设置中填写并保存（热更新） |
+| 对话报 `未配置 DEEPSEEK_API_KEY` | 后端能启动，但模型调用前校验失败 | 填写 Key 后保存或重启后端 |
 | 沙箱创建失败 | 服务端未启动 / API Key 不一致 / 时间不同步 | 检查 18083、比对 Key、同步时间 |
 | 前端请求被浏览器拦截 | 跨域未放行 | 把前端地址加入 `HARNESS_CORS_ORIGINS` |
 
@@ -214,9 +285,9 @@ opensandbox-server --config /opt/opensandbox/sandbox.toml
 | 形态 | 目录 | 技术栈 | 适用 |
 | :-- | :-- | :-- | :-- |
 | Web 控制台 | `frontend/HarnessControlPlatform` | Vue 3 + Vite + Element Plus | 浏览器访问、服务端部署、可嵌入门户 |
-| 桌面端 | `frontend/Desktop/HarnessDesktop` | Electron + Vue 3 | 本机常驻、需要访问本地目录 |
+| 桌面端 | `frontend/Desktop/HarnessDesktop` | Electron + Vue 3 | 本机启动与守护后端；界面仍在向 Web 控制台收敛 |
 
-两者共用同一套后端接口，切换用户、会话、项目的语义一致。
+Web 控制台是当前功能完整的入口。桌面端复用同一套后端接口，主要负责拉起 `main.py`、托管窗口与进程生命周期。
 
 ### 3.2 启动与构建
 
@@ -245,13 +316,16 @@ VITE_API_BASE_URL=https://harness.example.com
 
 | 页面 | 用途 | 关键操作 |
 | :-- | :-- | :-- |
+| 工作台 | 首屏入口 | 轨道式模块导航；首次进入自动做运行自检（后端 / LLM / 沙箱），缺失时弹出全息提示并跳转系统设置 |
 | 对话 | 主入口，SSE 流式输出 | 新建会话、附件上传、中断后继续、审批卡片、轨迹下钻 |
-| 项目 / 工作区 | 绑定一个可读写目录 | 新建项目、切换当前项目、查看文件与产物 |
-| 技能 | `SKILL.md` 为入口的能力包 | 下载、分配、启停、更新 |
-| MCP | 外部工具接入 | 新增服务、测试连通、启停、查看工具清单 |
 | 轨迹 | 执行过程记录 | 按轮查看思考、工具参数、结果、耗时、Token |
 | 我的任务流 | 可复用的执行流程 | 复制内置流、可视化编辑、发布、回放 |
-| 设置 | 模型与环境 | 填写模型 Key / Base URL、思考模式、沙箱参数、上下文阈值 |
+| 插件市场 | 插件与工具包入口 | 当前为占位页，后续接入技能、MCP 与任务流的一键安装 |
+| 技能 | `SKILL.md` 为入口的能力包 | 下载、分配、启停、更新 |
+| MCP 服务 | 外部工具接入 | 新增服务、测试连通、启停、查看工具清单 |
+| 知识库 | RAG Provider 管理 | 注册 Provider、统一检索、查看引用 |
+| MyAgent | 主 Agent 管理 | 招募 Agent、编辑提示词、绑定 MCP、为每个 Agent 选择模型 |
+| 系统设置 | 模型与环境 | 全局模型（写 `.env`）、思考 / 联网开关、沙箱参数、上下文阈值、会话归档 |
 
 ### 3.4 多用户与隔离
 
@@ -409,13 +483,19 @@ server {
 
 | 文档 | 内容 |
 | :-- | :-- |
-| [项目部署说明书](./项目部署说明书.docx) | Linux 生产部署、systemd、Nginx、备份升级、故障排查、环境变量总表 |
+| [项目部署说明书](./docs/项目部署说明书.docx) | Linux 生产部署、systemd、Nginx、备份升级、故障排查、环境变量总表 |
 | [项目描述](./docs/core_design/项目描述.md) | 产品定位、两种模式、接入拓扑、演进路线 |
 | [接口文档](./docs/api/README.md) | 业务主链路 API、管理与配置 API、MCP 服务接入 API |
 | [接入全流程示例与避坑指南](./docs/for_use/接入全流程示例与避坑指南.md) | 从零跑到流式对话 + 工具 + HITL + 异步任务 |
 | [如何编写 SubAgent](./docs/for_use/如何编写SubAgent.md) | 子 Agent YAML 结构与注册 |
 | [拓展技能与工具的流程](./docs/for_use/拓展技能与工具的流程.md) | 技能包与工具接入 |
+| [Agent 团队设计](./docs/core_design/AgentTeam设计.md) · [开发文档](./docs/develope/AgentTeam开发文档.md) | 主 Agent 招募、团队委派与成员隔离 |
+| [RAG 模块设计](./docs/core_design/RAG模块设计.md) | Provider 注册、检索与引用归一化 |
+| [上下文工程设计](./docs/develope/上下文工程设计.md) | 注入、卸载、摘要、压缩与评估 |
 | [任务调度模块设计](./docs/core_design/任务调度模块设计.md) | 分档、计划、检查点、重规划，含实现现状与待办 |
+| [任务流模块设计](./docs/core_design/任务流模块设计.md) | 任务流的编译、执行与接管 |
+| [消息反馈与重试设计](./docs/core_design/消息反馈与重试设计.md) · [归档功能](./docs/core_design/归档功能.md) | 反馈落库、重试链路、会话归档 |
+| [运行时异常捕获与重启机制](./docs/develope/运行时异常捕获与重启机制设计开发.md) | 进程守护、异常恢复与重启策略 |
 | [架构图与核心时序](./docs/core_design/架构图与核心时序.md) | 组件关系与关键链路 |
 
 ---
@@ -423,10 +503,11 @@ server {
 ## 6. 已知限制
 
 1. **会话互斥仅单进程有效**：多 worker 部署需要额外设计。
-2. **外部 Trace 与评估集未接入**：目前依赖内置轨迹，Langfuse / LangSmith / DeepEval 为演进项。
+2. **外部 Trace 与评估集未接入**：内置轨迹与演进控制面（评估集 / 判官 / 经验）已可用，Langfuse / LangSmith / DeepEval 仍为演进项。
 3. **MCP 生产化未完成**：懒连接、熔断、命名空间、管理 UI 仍在推进。
 4. **任务调度未达 HTN**：当前是「两级任务表 + 依赖 DAG + 拓扑波次 + 检查点打分」，方法层与 `(S,R,D)` 闭环未落地。
 5. **Linux 项目路径校验需复核**：当前校验以 Windows 本机为基线，服务端场景需按部署说明书 8.5 加固。
+6. **运行自检只在前端首屏**：工作台首次进入时检测一次；后端完全不可达时只能给出排障提示，无法在线修复配置。
 
 ---
 
