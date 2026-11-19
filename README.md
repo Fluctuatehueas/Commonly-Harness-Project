@@ -511,4 +511,4 @@ server {
 
 ---
 
-Author: GuiQiHueas · License: 内部交付，未经许可请勿外传
+Author: GuiQiHueas · License: [MIT](./LICENSE)
