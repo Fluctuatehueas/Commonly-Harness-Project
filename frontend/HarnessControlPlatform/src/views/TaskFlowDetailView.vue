@@ -10,6 +10,7 @@ import {
   Clock,
   CopyDocument,
   Delete,
+  Download,
   Plus,
   Promotion,
   Refresh,
@@ -454,6 +455,29 @@ function buildPayload(): TaskFlowSchema {
   return payload
 }
 
+// 导出当前编辑内容：未保存的修改也会包含；导入时会作为新草稿创建。
+function exportJson() {
+  const payload = JSON.parse(JSON.stringify(draft)) as TaskFlowSchema
+  payload.schema_version = payload.schema_version || '1.0'
+  payload.source = meta.source
+  payload.status = meta.status
+  if (!isNew.value) payload.id = flowId.value
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: 'application/json;charset=utf-8',
+  })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${(draft.name || 'task-flow').replace(/[\\/:*?"<>|]/g, '-')}.json`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  // 延迟释放，避免部分浏览器在下载启动前失去 Blob URL
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  ElMessage.success('已导出当前编辑内容')
+}
+
 function handleValidation(err: FlowValidationError) {
   issues.value = err.issues
   const first = err.issues.find((issue) => issue.step_id)
@@ -629,6 +653,9 @@ onMounted(() => {
             />
             <span class="enable-label">{{ meta.enabled ? '已启用' : '已停用' }}</span>
           </span>
+          <el-button :icon="Download" :disabled="loading" @click="exportJson">
+            导出 JSON
+          </el-button>
           <el-button v-if="!isNew" :icon="CopyDocument" :loading="forking" @click="fork">
             复制为我的任务流
           </el-button>
@@ -878,6 +905,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* 启用开关：与保存/发布按钮同排，靠左一眼可见 */
