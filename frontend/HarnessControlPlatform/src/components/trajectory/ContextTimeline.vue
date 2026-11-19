@@ -30,14 +30,30 @@ const props = defineProps<{
 
 const CHART_HEIGHT = 240
 
-const events = computed<TrajectoryEvent[]>(() => {
-  const scoped = props.selectedRunId
+const scopedRuns = computed(() =>
+  props.selectedRunId
     ? props.runs.filter((run) => run.run_id === props.selectedRunId)
-    : props.runs
-  return scoped
+    : props.runs,
+)
+
+const events = computed<TrajectoryEvent[]>(() =>
+  scopedRuns.value
     .flatMap((run) => run.events)
-    .sort((a, b) => String(a.start).localeCompare(String(b.start)))
-})
+    .sort((a, b) => String(a.start).localeCompare(String(b.start))),
+)
+
+// Token 统计归属上下文视图：会话（或选中轮次）的累计输入/输出与总量。
+const tokens = computed(() =>
+  scopedRuns.value.reduce(
+    (total, run) => {
+      total.input += run.summary.tokens?.input || 0
+      total.output += run.summary.tokens?.output || 0
+      total.total += run.summary.tokens?.total || 0
+      return total
+    },
+    { input: 0, output: 0, total: 0 },
+  ),
+)
 
 const points = computed(() =>
   events.value.filter(
@@ -546,6 +562,8 @@ watch([softWatermark, hardWatermark, windowSize, selectedId], () => renderChart(
         <small>占用曲线 · 软硬水位 · 压缩节点 · 锚点保真与成本回执</small>
       </div>
       <div class="ctx-stats">
+        <span><small>Token</small><b>{{ fmt(tokens.total) }}</b></span>
+        <span><small>输入 / 输出</small><b>{{ fmt(tokens.input) }} / {{ fmt(tokens.output) }}</b></span>
         <span><small>窗口</small><b>{{ fmt(windowSize) }}</b></span>
         <span><small>峰值</small><b>{{ fmt(peak) }}</b></span>
         <span><small>最低</small><b>{{ fmt(lowest) }}</b></span>

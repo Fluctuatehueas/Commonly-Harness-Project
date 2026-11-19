@@ -149,20 +149,49 @@ watch(
 
 
 const logList = ref<HTMLElement | null>(null)
+const timelinePanel = ref<HTMLElement | null>(null)
+// 时间轴吸顶后转为不透明背景，避免滚动内容透出。
+const timelineStuck = ref(false)
+
+function syncTimelineStuck() {
+  const el = timelinePanel.value
+  if (!el) {
+    timelineStuck.value = false
+    return
+  }
+  const topbar =
+    Number.parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--topbar-h'),
+    ) || 0
+  timelineStuck.value = el.getBoundingClientRect().top <= topbar + 0.5
+}
+
+watch([activeTab, () => runs.value.length], () => {
+  void nextTick(syncTimelineStuck)
+})
 
 function typeMeta(type: string) {
   return TYPE_META[type] || { label: type || '过程', icon: 'workflow', color: '#5b6b8c' }
 }
 
-// 色块点击后同步日志分页并滚动到对应条目。
+// 色块点击后同步日志分页并滚动到对应条目；吸顶时间轴会遮挡视口顶部，滚动时主动让出这段高度。
 function selectEventFromBar(eventId: string) {
   selectedEventId.value = eventId
   const index = events.value.findIndex((event) => event.id === eventId)
   if (index >= 0) logPage.value = Math.floor(index / LOG_PAGE_SIZE) + 1
   void nextTick(() => {
-    logList.value
-      ?.querySelector<HTMLElement>('.log-item.selected')
-      ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    const item = logList.value?.querySelector<HTMLElement>('.log-item.selected')
+    if (!item) return
+    const panel = document.querySelector<HTMLElement>('.timeline-panel')
+    const topbar =
+      Number.parseFloat(
+        getComputedStyle(document.documentElement).getPropertyValue('--topbar-h'),
+      ) || 0
+    const covered = topbar + (panel?.offsetHeight || 0) + 8
+    const rect = item.getBoundingClientRect()
+    if (rect.top < covered || rect.bottom > window.innerHeight - 8) {
+      window.scrollBy({ top: rect.top - covered, behavior: 'smooth' })
+    }
   })
 }
 
@@ -319,9 +348,16 @@ onMounted(async () => {
   threadId.value =
     queryThread || sessions.activeThreadId || sessions.sessions[0]?.thread_id || ''
   startTimer()
+  window.addEventListener('scroll', syncTimelineStuck, { passive: true })
+  window.addEventListener('resize', syncTimelineStuck)
+  void nextTick(syncTimelineStuck)
 })
 
-onBeforeUnmount(stopTimer)
+onBeforeUnmount(() => {
+  stopTimer()
+  window.removeEventListener('scroll', syncTimelineStuck)
+  window.removeEventListener('resize', syncTimelineStuck)
+})
 </script>
 
 <template>
@@ -478,20 +514,6 @@ onBeforeUnmount(stopTimer)
             <strong>{{ summary.delegations }} / {{ summary.hitl }}</strong>
           </div>
           <div class="stat">
-            <small>Token</small>
-            <strong>{{ summary.tokens.total }}</strong>
-            <span class="stat-sub">
-              in {{ summary.tokens.input }} · out {{ summary.tokens.output }}
-            </span>
-          </div>
-          <div class="stat">
-            <small>上下文峰值</small>
-            <strong>{{ summary.peak_context_tokens }}</strong>
-            <span class="stat-sub">
-              / {{ events[events.length - 1]?.context?.limit || 0 }} tokens
-            </span>
-          </div>
-          <div class="stat">
             <small>压缩 / 节省</small>
             <strong>{{ summary.compact_count || 0 }}</strong>
             <span class="stat-sub">{{ (summary.tokens_saved || 0).toLocaleString('zh-CN') }} tok</span>
@@ -500,7 +522,11 @@ onBeforeUnmount(stopTimer)
 
         <div class="traj-layout">
           <div class="traj-main">
-            <section class="panel timeline-panel">
+            <section
+              ref="timelinePanel"
+              class="panel timeline-panel"
+              :class="{ stuck: timelineStuck }"
+            >
               <ProcessTimeline
                 :events="events"
                 :selected-id="selectedEventId"
@@ -810,7 +836,7 @@ onBeforeUnmount(stopTimer)
 
 .summary {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -859,6 +885,22 @@ onBeforeUnmount(stopTimer)
 .timeline-panel,
 .log-panel {
   padding: 12px 14px 14px;
+}
+
+/* 时间轴吸顶：向下翻日志时仍可直接点色块定位轨迹 */
+.timeline-panel {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 20;
+  background: transparent;
+  transition: background 0.18s ease, box-shadow 0.18s ease;
+}
+
+/* 只有粘贴在顶部时才需要遮住下方滚动内容 */
+.timeline-panel.stuck {
+  background: rgba(8, 12, 22, 0.94);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 10px 20px rgba(3, 7, 16, 0.5);
 }
 
 .panel-head {
@@ -1338,29 +1380,39 @@ onBeforeUnmount(stopTimer)
   opacity: 0.7;
 }
 
+/* 与 MyAgent 的组 / Agent 切换保持同一套分段按钮样式 */
 .tab-switch {
   display: inline-flex;
-  align-items: center;
-  padding: 2px;
+  overflow: hidden;
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-deep);
+  border-radius: 7px;
 }
 
 .tab-switch button {
-  padding: 5px 11px;
+  min-width: 62px;
+  padding: 5px 12px;
   font-family: inherit;
-  font-size: 11px;
-  color: var(--text-3);
-  background: transparent;
+  font-size: 11.5px;
+  color: var(--text-2);
   border: 0;
-  border-radius: calc(var(--radius-sm) - 1px);
+  background: transparent;
   cursor: pointer;
+  transition: color 0.16s, background 0.16s;
+}
+
+.tab-switch button + button {
+  border-left: 1px solid var(--line-strong);
+}
+
+.tab-switch button:hover {
+  color: var(--text-1);
+  background: var(--bg-hover);
 }
 
 .tab-switch button.active {
-  color: var(--text-1);
-  background: var(--bg-rail);
+  font-weight: 600;
+  color: #041018;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent));
 }
 
 .experience-panel {
@@ -1377,7 +1429,7 @@ onBeforeUnmount(stopTimer)
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  background: var(--bg-deep);
+  background: transparent;
 }
 
 .experience-card header {
