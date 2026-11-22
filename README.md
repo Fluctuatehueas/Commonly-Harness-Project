@@ -1,5 +1,7 @@
 # Common Harness
 
+**中文** | [English](./README.en.md)
+
 > 业务无关、可源码交付、可嵌入既有后端系统的通用 Agent 运行时。
 > 用 Harness Engineering 的方法，把大模型的概率性生成能力约束成**可操作、可恢复、可审计、可持续改进**的任务执行能力。
 
