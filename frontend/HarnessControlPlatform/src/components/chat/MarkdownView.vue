@@ -4,6 +4,8 @@
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, render, watch } from 'vue'
 import { marked, Renderer, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
+// KaTeX 排版样式（字体随 CSS 一起由 Vite 打包），脚本按需加载
+import 'katex/dist/katex.min.css'
 // 代码块语法高亮：只注册常用语言，避免把全量语法打进主包
 import hljs from 'highlight.js/lib/core'
 import javascript from 'highlight.js/lib/languages/javascript'
@@ -400,6 +402,67 @@ renderer.code = ({ text, lang, escaped }) => {
   )
 }
 
+// ---------- 数学公式：$...$ / $$...$$ / \(...\) / \[...\] ----------
+// 解析阶段只产出占位元素，排版在 DOMPurify 消毒之后由 KaTeX 完成：
+// 既避免 MathML 被消毒规则剥离，也不把模型可控的 HTML 直接注入页面。
+function mathPlaceholder(kind: 'inline' | 'block', source: string): string {
+  return (
+    `<span class="md-math md-math-${kind}" data-math-kind="${kind}"` +
+    ` data-math="${encodeURIComponent(source.trim())}"></span>`
+  )
+}
+
+marked.use({
+  extensions: [
+    {
+      name: 'mathBlock',
+      level: 'block',
+      start(src) {
+        const index = src.search(/\$\$|\\\[/)
+        return index < 0 ? undefined : index
+      },
+      tokenizer(src) {
+        const match =
+          /^\$\$([\s\S]+?)\$\$[ \t]*(?:\n|$)/.exec(src) ||
+          /^\\\[([\s\S]+?)\\\][ \t]*(?:\n|$)/.exec(src)
+        if (!match) return undefined
+        return { type: 'mathBlock', raw: match[0], text: match[1] || '' }
+      },
+      renderer(token) {
+        return mathPlaceholder('block', String(token.text || ''))
+      },
+    },
+    {
+      name: 'mathInline',
+      level: 'inline',
+      start(src) {
+        const index = src.search(/\$|\\\(|\\\[/)
+        return index < 0 ? undefined : index
+      },
+      tokenizer(src) {
+        // 段落里出现的 $$...$$ 仍按行间公式处理，允许跨行
+        const display = /^\$\$([\s\S]+?)\$\$(?!\d)/.exec(src)
+        if (display) {
+          return { type: 'mathInline', raw: display[0], text: display[1], display: true }
+        }
+        // 行内公式：$ 后不能是空白或 $；闭合 $ 前不能是空白、后不能紧跟数字（规避 $5、$10 这类金额）
+        const dollar = /^\$(?![\s$])((?:\\.|[^\\\n$])+?)(?<!\s)\$(?!\d)/.exec(src)
+        if (dollar) {
+          return { type: 'mathInline', raw: dollar[0], text: dollar[1], display: false }
+        }
+        const paren = /^\\\(([^\n]+?)\\\)/.exec(src)
+        if (paren) {
+          return { type: 'mathInline', raw: paren[0], text: paren[1], display: false }
+        }
+        return undefined
+      },
+      renderer(token) {
+        return mathPlaceholder(token.display ? 'block' : 'inline', String(token.text || ''))
+      },
+    },
+  ],
+})
+
 const html = computed(() => {
   const raw = marked.parse(props.content || '', {
     async: false,
@@ -476,6 +539,48 @@ function attachImageFallbacks() {
   })
 }
 
+// ---------- KaTeX 数学公式排版 ----------
+let katexPromise: Promise<typeof import('katex')> | null = null
+let mathRun = 0
+
+function getKatex() {
+  if (!katexPromise) katexPromise = import('katex')
+  return katexPromise
+}
+
+/** 把占位元素替换成 KaTeX 排版结果；失败时保留 LaTeX 源码，至少不影响阅读。 */
+async function renderMath() {
+  const host = container.value
+  if (!host) return
+  const nodes = Array.from(host.querySelectorAll<HTMLElement>('.md-math[data-math]'))
+  if (!nodes.length) return
+  const run = ++mathRun
+  let katex: typeof import('katex').default
+  try {
+    katex = (await getKatex()).default
+  } catch {
+    return
+  }
+  // 等待脚本加载期间回答可能又追加了新 chunk，旧 DOM 已被替换则放弃本次排版
+  if (run !== mathRun) return
+  for (const node of nodes) {
+    if (node.dataset.mathRendered === '1') continue
+    const source = decodeURIComponent(node.dataset.math || '')
+    if (!source.trim()) continue
+    try {
+      katex.render(source, node, {
+        displayMode: node.dataset.mathKind === 'block',
+        throwOnError: false,
+        strict: 'ignore',
+        trust: false,
+      })
+      node.dataset.mathRendered = '1'
+    } catch {
+      node.textContent = source
+    }
+  }
+}
+
 async function renderVisuals() {
   const host = container.value
   if (!host) return
@@ -490,6 +595,8 @@ async function renderVisuals() {
     if (error) error.textContent = ''
   })
   attachImageFallbacks()
+  // 公式排版不受流式状态限制：KaTeX 很快，且能随 chunk 逐步补齐
+  void renderMath()
   // 流式阶段保留源码，避免半截 Mermaid / JSON 反复报错和闪烁。
   if (props.streaming) return
 
@@ -562,6 +669,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   vizRun += 1
+  mathRun += 1
   disposeInlinePreviews()
   window.removeEventListener('resize', resizeCharts)
   disposeCharts()
@@ -832,6 +940,27 @@ async function onBodyClick(event: MouseEvent) {
   border: 1px solid rgba(53, 224, 255, 0.18);
   border-radius: 5px;
   background: rgba(6, 18, 36, 0.8);
+}
+
+/* ---------- 数学公式（KaTeX） ---------- */
+.markdown-body :deep(.md-math) {
+  color: inherit;
+}
+
+/* 行间公式用块级 span，避免在 <p> 内塞 <div> 破坏结构 */
+.markdown-body :deep(.md-math-block) {
+  display: block;
+  margin: 10px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.markdown-body :deep(.md-math .katex-display) {
+  margin: 0;
+}
+
+.markdown-body :deep(.md-math .katex-error) {
+  color: #ff9e9e;
 }
 
 /* ---------- 会话文件卡片 ---------- */
