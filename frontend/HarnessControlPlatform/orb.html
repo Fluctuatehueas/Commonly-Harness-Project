@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Harness 悬浮助手</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      body {
+        display: grid;
+        place-items: center;
+        font-family: 'Inter', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      }
+
+      #wrap {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 100%;
+        height: 100%;
+      }
+
+      /* 图标和波纹动画共用同一个 stage：stage 平移时两者始终对齐 */
+      .orb-stage {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 96px;
+        height: 96px;
+        transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      .orb {
+        position: relative;
+        width: 96px;
+        height: 96px;
+        padding: 0;
+        border: 1px solid rgba(55, 208, 196, 0.45);
+        border-radius: 50%;
+        background: rgba(6, 20, 32, 0.86);
+        box-shadow:
+          0 0 0 1px rgba(55, 208, 196, 0.12),
+          0 12px 34px rgba(0, 0, 0, 0.55),
+          inset 0 0 24px rgba(55, 208, 196, 0.14);
+        cursor: grab;
+        touch-action: none;
+        -webkit-user-drag: none;
+        transition:
+          opacity 0.22s ease,
+          box-shadow 0.24s ease,
+          border-color 0.24s ease;
+      }
+
+      .orb img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        object-fit: cover;
+        pointer-events: none;
+        -webkit-user-drag: none;
+      }
+
+      .orb-ring {
+        position: absolute;
+        border-radius: 50%;
+        pointer-events: none;
+      }
+
+      .orb-ring.outer {
+        inset: -7px;
+        border: 1px solid rgba(55, 208, 196, 0.2);
+        border-top-color: rgba(160, 240, 255, 0.75);
+        animation: spin 6s linear infinite;
+      }
+
+      .orb-ring.inner {
+        inset: -14px;
+        border: 1px dashed rgba(91, 140, 255, 0.18);
+        animation: spin 14s linear infinite reverse;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      /* 贴边收起：窗口中心固定在“滑出后”的位置，收起时 stage 向屏幕外偏移 96px */
+      #wrap.edge-right .orb-stage {
+        transform: translateX(96px);
+      }
+
+      #wrap.edge-left .orb-stage {
+        transform: translateX(-96px);
+      }
+
+      #wrap.edge-right.hovered .orb-stage,
+      #wrap.edge-right.locked .orb-stage,
+      #wrap.edge-left.hovered .orb-stage,
+      #wrap.edge-left.locked .orb-stage {
+        transform: translateX(0);
+      }
+
+      #wrap.edge-none .orb-stage {
+        transform: none;
+      }
+
+      #wrap.edge-right .orb,
+      #wrap.edge-left .orb {
+        opacity: 0.58;
+      }
+
+      #wrap.edge-right.hovered .orb,
+      #wrap.edge-left.hovered .orb {
+        opacity: 1;
+      }
+
+      #wrap.edge-none .orb {
+        opacity: 1;
+      }
+
+      #wrap.dragging .orb {
+        cursor: grabbing;
+      }
+
+      #wrap.dragging .orb-stage {
+        transition: none;
+      }
+
+      #wrap.hovered .orb {
+        border-color: rgba(160, 240, 255, 0.9);
+        animation: breathe 2.1s ease-in-out infinite;
+      }
+
+      @keyframes breathe {
+        0%,
+        100% {
+          box-shadow:
+            0 0 0 1px rgba(55, 208, 196, 0.14),
+            0 10px 26px rgba(0, 0, 0, 0.5),
+            0 0 16px rgba(55, 208, 196, 0.28),
+            inset 0 0 20px rgba(55, 208, 196, 0.12);
+        }
+        50% {
+          box-shadow:
+            0 0 0 1px rgba(160, 240, 255, 0.45),
+            0 14px 36px rgba(0, 0, 0, 0.55),
+            0 0 36px rgba(55, 208, 196, 0.62),
+            inset 0 0 32px rgba(55, 208, 196, 0.3);
+        }
+      }
+
+      /* 点击跃迁：全部绘制在 200px 窗口内，不再被裁切 */
+      #warp {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        pointer-events: none;
+      }
+
+      .warp-ring {
+        position: absolute;
+        width: 88px;
+        height: 88px;
+        border: 1px solid rgba(160, 240, 255, 0.85);
+        border-radius: 50%;
+        opacity: 0;
+      }
+
+      #warp.on .warp-ring {
+        animation: warp-ring 0.72s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      }
+
+      .warp-ring.r2 {
+        border-color: rgba(91, 140, 255, 0.8);
+        animation-delay: 0.07s;
+      }
+
+      .warp-ring.r3 {
+        border-color: rgba(55, 208, 196, 0.5);
+        animation-delay: 0.14s;
+      }
+
+      .warp-core {
+        position: absolute;
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        background: radial-gradient(
+          circle,
+          rgba(160, 240, 255, 0.55),
+          rgba(55, 208, 196, 0) 68%
+        );
+        opacity: 0;
+      }
+
+      #warp.on .warp-core {
+        animation: warp-core 0.72s ease forwards;
+      }
+
+      @keyframes warp-ring {
+        from {
+          transform: scale(0.25);
+          opacity: 0.15;
+        }
+        40% {
+          opacity: 1;
+        }
+        to {
+          transform: scale(2.2);
+          opacity: 0;
+        }
+      }
+
+      @keyframes warp-core {
+        from {
+          transform: scale(0.4);
+          opacity: 0.3;
+        }
+        45% {
+          transform: scale(1.3);
+          opacity: 1;
+        }
+        to {
+          transform: scale(0.1);
+          opacity: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wrap" class="edge-right">
+      <div id="stage" class="orb-stage">
+        <button id="orb" class="orb" type="button" title="打开 CommonHarness 悬浮助手（可拖动）">
+          <span class="orb-ring outer"></span>
+          <span class="orb-ring inner"></span>
+          <img src="/ICON.png" alt="CommonHarness" draggable="false" />
+        </button>
+        <div id="warp">
+          <span class="warp-ring r1"></span>
+          <span class="warp-ring r2"></span>
+          <span class="warp-ring r3"></span>
+          <span class="warp-core"></span>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/orb/main.ts"></script>
+  </body>
+</html>

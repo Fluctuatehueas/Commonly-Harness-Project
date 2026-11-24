@@ -43,6 +43,74 @@ const backendApi = {
   }> => ipcRenderer.invoke('backend:status')
 }
 
+/** 桌面壳能力：托盘弹窗、悬浮助手与运行中会话上报。 */
+const desktopApi = {
+  openWindow: (): void => ipcRenderer.send('desktop:open-window'),
+  openSession: (threadId: string): void =>
+    ipcRenderer.send('desktop:open-session', threadId),
+  toggleAssistant: (): Promise<boolean> =>
+    ipcRenderer.invoke('desktop:toggle-assistant') as Promise<boolean>,
+  isAssistantVisible: (): Promise<boolean> =>
+    ipcRenderer.invoke('desktop:assistant-visible') as Promise<boolean>,
+  quit: (): void => ipcRenderer.send('desktop:quit'),
+  getRunningSessions: (): Promise<
+    { threadId: string; title: string; waiting?: boolean }[]
+  > => ipcRenderer.invoke('desktop:running-sessions'),
+  reportRunningSessions: (
+    sessions: { threadId: string; title: string; waiting?: boolean }[],
+  ): void => ipcRenderer.send('desktop:report-running', sessions),
+  resizeTrayPopup: (height: number): void =>
+    ipcRenderer.send('desktop:tray-popup-resize', height),
+  /** 图标点击：打开助手面板窗口。 */
+  openAssistantPanel: (): void => ipcRenderer.send('desktop:assistant-expand'),
+  /** 面板收起：隐藏面板并回到图标。 */
+  collapseAssistant: (): void => ipcRenderer.send('desktop:assistant-collapse'),
+  getAssistantMode: (): Promise<'left' | 'right' | 'none'> =>
+    ipcRenderer.invoke('desktop:assistant-mode') as Promise<'left' | 'right' | 'none'>,
+  startAssistantDrag: (revealed: boolean): void =>
+    ipcRenderer.send('desktop:assistant-drag-start', revealed),
+  endAssistantDrag: (): void => ipcRenderer.send('desktop:assistant-drag-end'),
+  onAssistantMode: (
+    callback: (side: 'left' | 'right' | 'none') => void,
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      side: 'left' | 'right' | 'none',
+    ): void => callback(side)
+    ipcRenderer.on('desktop:assistant-mode', listener)
+    return () => ipcRenderer.removeListener('desktop:assistant-mode', listener)
+  },
+  onOpenSession: (callback: (threadId: string) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, threadId: string): void => {
+      callback(threadId)
+    }
+    ipcRenderer.on('desktop:select-session', listener)
+    return () => ipcRenderer.removeListener('desktop:select-session', listener)
+  },
+  onRunningSessions: (
+    callback: (sessions: { threadId: string; title: string; waiting?: boolean }[]) => void,
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      sessions: { threadId: string; title: string; waiting?: boolean }[],
+    ): void => callback(sessions)
+    ipcRenderer.on('desktop:running-sessions', listener)
+    return () => ipcRenderer.removeListener('desktop:running-sessions', listener)
+  },
+  onAssistantVisibleChange: (callback: (visible: boolean) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, visible: boolean): void => {
+      callback(visible)
+    }
+    ipcRenderer.on('desktop:assistant-visible-changed', listener)
+    return () => ipcRenderer.removeListener('desktop:assistant-visible-changed', listener)
+  },
+  onAssistantReset: (callback: () => void): (() => void) => {
+    const listener = (): void => callback()
+    ipcRenderer.on('desktop:assistant-reset', listener)
+    return () => ipcRenderer.removeListener('desktop:assistant-reset', listener)
+  }
+}
+
 // Use `contextBridge` APIs to expose Electron APIs to
 // renderer only if context isolation is enabled, otherwise
 // just add to the DOM global.
@@ -53,6 +121,7 @@ if (process.contextIsolated) {
     contextBridge.exposeInMainWorld('harnessWindow', windowApi)
     contextBridge.exposeInMainWorld('harnessWorkspace', workspaceApi)
     contextBridge.exposeInMainWorld('harnessBackend', backendApi)
+    contextBridge.exposeInMainWorld('harnessDesktop', desktopApi)
   } catch (error) {
     console.error(error)
   }
@@ -67,4 +136,6 @@ if (process.contextIsolated) {
   window.harnessWorkspace = workspaceApi
   // @ts-ignore (define in dts)
   window.harnessBackend = backendApi
+  // @ts-ignore (define in dts)
+  window.harnessDesktop = desktopApi
 }

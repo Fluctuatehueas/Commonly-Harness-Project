@@ -4,6 +4,14 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { getBackendStatus, startBackend, stopBackend } from './backend'
+import {
+  attachMainWindowBehavior,
+  markQuitting,
+  setupDesktop,
+} from './desktop'
+
+/** 主窗体引用：托盘与「打开窗体」都通过它恢复已隐藏的窗口。 */
+let mainWindow: BrowserWindow | null = null
 
 /** 自绘窗口按钮所需的 IPC：全部以事件来源窗口为准，避免多窗口时操作错对象。 */
 function registerWindowControls(): void {
@@ -29,7 +37,7 @@ function registerWindowControls(): void {
 
 function createWindow(): void {
   // Create the browser window.
-  const mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     // 控制台是宽幅仪表盘布局，默认窗口给足宽度，并允许用户缩放。
     width: 1280,
     height: 860,
@@ -49,21 +57,28 @@ function createWindow(): void {
       sandbox: false
     },
   })
+  mainWindow = win
+
+  // 关闭按钮 / Alt+F4 只收起窗口，不退出进程；托盘图标常驻。
+  attachMainWindowBehavior(win)
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null
+  })
 
   // 最大化状态变化通知渲染进程，用于切换「最大化 / 还原」图标
   const pushMaximizeState = (): void => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('window:maximized', mainWindow.isMaximized())
+    if (!win.isDestroyed()) {
+      win.webContents.send('window:maximized', win.isMaximized())
     }
   }
-  mainWindow.on('maximize', pushMaximizeState)
-  mainWindow.on('unmaximize', pushMaximizeState)
+  win.on('maximize', pushMaximizeState)
+  win.on('unmaximize', pushMaximizeState)
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
+  win.on('ready-to-show', () => {
+    win.show()
   })
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
+  win.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
@@ -71,9 +86,9 @@ function createWindow(): void {
   // HMR for renderer base on electron-vite cli.
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -138,6 +153,9 @@ app.whenReady().then(() => {
 
   createWindow()
 
+  // 托盘、托盘全息弹窗与悬浮助手：主窗口关闭后仍由此维持进程与入口。
+  setupDesktop(() => mainWindow)
+
   // 由 Electron 主进程托管 Python 后端：正常启动时子进程继承 Medium 完整性，
   // 不会被文件系统沙箱降级。启动失败/完整性过低会记录到状态里。
   void startBackend()
@@ -145,7 +163,7 @@ app.whenReady().then(() => {
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
     // dock icon is clicked and there are no other windows open.
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (!mainWindow || mainWindow.isDestroyed()) createWindow()
   })
 })
 
@@ -153,6 +171,7 @@ app.whenReady().then(() => {
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on('before-quit', () => {
+  markQuitting()
   void stopBackend()
 })
 app.on('will-quit', () => {

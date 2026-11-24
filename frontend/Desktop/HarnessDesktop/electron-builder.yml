@@ -11,6 +11,10 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
+# 托盘与悬浮助手共用控制台资源目录里的 ICON.png；打包后放到 resources 根。
+extraResources:
+  - from: ../HarnessControlPlatform/resources/ICON.png
+    to: ICON.png
 win:
   executableName: harnessdesktop
   icon: build/icon.png

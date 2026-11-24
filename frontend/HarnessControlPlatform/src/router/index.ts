@@ -11,6 +11,8 @@ import SkillsView from '@/views/SkillsView.vue'
 import TaskFlowDetailView from '@/views/TaskFlowDetailView.vue'
 import TaskFlowListView from '@/views/TaskFlowListView.vue'
 import TrajectoryView from '@/views/TrajectoryView.vue'
+import AssistantView from '@/views/AssistantView.vue'
+import TrayPopupView from '@/views/TrayPopupView.vue'
 
 // 同一套代码同时跑在浏览器与 Electron：打包后的 Electron 通过 file:// 加载页面，
 // 此时 Web History 无法解析路径，必须退化为 hash 路由。
@@ -33,6 +35,19 @@ const router = createRouter({
     { path: '/kb', name: 'kb', component: RagView },
     { path: '/models', name: 'models', component: MyAgentView },
     { path: '/settings', name: 'settings', component: SettingsView },
+    // Electron 桌面壳：独立透明窗口，不渲染全局星空背景。
+    {
+      path: '/assistant',
+      name: 'assistant',
+      component: AssistantView,
+      meta: { desktopOverlay: true },
+    },
+    {
+      path: '/tray-popup',
+      name: 'tray-popup',
+      component: TrayPopupView,
+      meta: { desktopOverlay: true },
+    },
     // 兼容旧地址
     { path: '/overview', redirect: '/' },
     { path: '/chat-control', redirect: '/settings' },

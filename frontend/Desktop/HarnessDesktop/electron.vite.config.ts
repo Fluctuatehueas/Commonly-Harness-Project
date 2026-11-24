@@ -43,7 +43,11 @@ const config: ElectronViteConfigFn = async (env) => {
       // electron-vite 默认把渲染入口固定为 <项目>/src/renderer/index.html，
       // 这里必须显式指到外部 Vue 工程的 index.html。
       rollupOptions: {
-        input: resolve(VUE_PROJECT_ROOT, 'index.html'),
+        input: {
+          main: resolve(VUE_PROJECT_ROOT, 'index.html'),
+          // 图标窗口使用独立轻量页面，避免加载整套 Vue 应用影响拖拽性能。
+          orb: resolve(VUE_PROJECT_ROOT, 'orb.html'),
+        },
       },
     },
     // 与后端 CORS 默认放行的 5173 对齐；端口被占用时 Vite 会自动递增

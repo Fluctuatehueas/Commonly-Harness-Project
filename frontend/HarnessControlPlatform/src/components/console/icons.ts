@@ -156,6 +156,7 @@ export const ICONS = {
   minimize: ['M5 12h14'],
   maximize: ['M5.5 5.5h13v13h-13z'],
   restore: ['M8.5 8.5h10v10h-10z', 'M5.5 15.5V5.5h10'],
+  list: ['M4 6.5h16', 'M4 12h16', 'M4 17.5h16'],
 } as const
 
 export type IconName = keyof typeof ICONS

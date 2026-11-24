@@ -49,8 +49,8 @@ import {
   type ContextFormats,
 } from '@/api/context'
 import { fetchTrajectory } from '@/api/trajectory'
+import { mapHistoryMessages, type HistoryPayload } from '@/components/chat/history'
 import {
-  categoryOf,
   useChatStore,
   type ChatMsg,
   type TerminateReason,
@@ -71,6 +71,9 @@ const sessions = useSessionStore()
 const files = useFileStore()
 const settings = useSettingsStore()
 const agents = useAgentStore()
+const desktopBridge = window.harnessDesktop
+// 托盘弹窗点选会话后由主进程下发；组件卸载时解绑。
+let disposeDesktopSession: (() => void) | undefined
 
 // 轨迹节点索引：TrajectoryNode 挂载时登记，顶部粘性折叠条据此定位并代理收起。
 const trajectoryRegistry: TrajectoryRegistry = new Map()
@@ -359,6 +362,10 @@ async function fetchHealthWithRetry(attempts = 20): Promise<Response | null> {
 }
 
 onMounted(async () => {
+  // 托盘弹窗选择「正在工作的会话」后，切到对应线程并展示。
+  disposeDesktopSession = desktopBridge?.onOpenSession((threadId) => {
+    if (threadId) void selectSession(threadId)
+  })
   void agents.load()
   void agents.loadGroups()
   const res = await fetchHealthWithRetry()
@@ -587,29 +594,6 @@ async function appendClipboardImages(images: File[]) {
 }
 
 // ---------- 会话切换 ----------
-interface HistoryMessage {
-  id: string
-  role: string
-  content?: string
-  tool_name?: string
-  tool_status?: string
-  tool_call_id?: string
-  text?: string
-  args?: string
-  source?: string
-  tokens?: { input: number; output: number; total: number }
-  feedback?: 'like' | 'dislike' | null
-  created_at?: string
-  // 用户消息随消息发送的附件元信息；旧会话没有该字段。
-  attachments?: ContextFile[]
-}
-
-/** 历史消息自带 created_at，转成毫秒供气泡底部显示时间。 */
-function messageTime(value?: string): number | undefined {
-  const parsed = Date.parse(value || '')
-  return Number.isFinite(parsed) ? parsed : undefined
-}
-
 /** 气泡底部时间只显示时:分，完整时间放在 title 里。 */
 function clockOf(value?: number): string {
   if (!value) return ''
@@ -647,84 +631,8 @@ async function selectSession(threadId: string) {
         `${API_BASE}/history/${threadId}/messages?user_id=${USER_ID}`,
       )
       if (!res.ok) throw new Error(String(res.status))
-      const data = (await res.json()) as {
-        messages: HistoryMessage[]
-        interrupt: Record<string, unknown> | null
-        session_usage?: {
-          input: number
-          output: number
-          total: number
-          spent?: number
-          rounds?: number
-          context_window?: number
-          context_used?: number
-        }
-      }
-      const msgs: ChatMsg[] = data.messages.map((m, i) => {
-        const at = messageTime(m.created_at)
-        if (m.role === 'user') {
-          return {
-            id: `h-u-${i}`,
-            kind: 'user',
-            content: m.content,
-            attachments: m.attachments,
-            at,
-          }
-        }
-        if (m.role === 'reasoning') {
-          return {
-            id: m.id || `h-r-${i}`,
-            kind: 'reasoning',
-            content: m.content,
-            source: m.source || 'main',
-            at,
-          }
-        }
-        if (m.role === 'assistant') {
-          return {
-            id: m.id || `h-a-${i}`,
-            kind: 'assistant',
-            content: m.content,
-            tokens: m.tokens,
-            feedback: m.feedback,
-            at,
-          }
-        }
-        const name = m.tool_name || 'tool'
-        return {
-          id: `h-t-${i}`,
-          kind: 'tool',
-          toolCallId: m.tool_call_id || m.id || `h-t-${i}`,
-          toolName: name,
-          category: categoryOf(name),
-          args: m.args || '',
-          result: m.text || '',
-          status: m.tool_status === 'error' ? 'error' : m.tool_status === 'calling' ? 'calling' : 'done',
-          source: m.source,
-          subagentName: m.role === 'delegation' && m.source && m.source !== 'main' ? m.source : undefined,
-        }
-      })
-      if (data.interrupt) {
-        const it = data.interrupt as { interrupt_id?: string; interrupt_type?: string }
-        msgs.push({
-          id: `h-i-${Date.now()}`,
-          kind: 'interrupt',
-          interruptId: it.interrupt_id,
-          interruptType: it.interrupt_type || 'unknown',
-          payload: data.interrupt,
-        })
-      }
-      const usage = data.session_usage
-        ? {
-            input: data.session_usage.input,
-            output: data.session_usage.output,
-            total: data.session_usage.total,
-            spent: data.session_usage.spent,
-            rounds: data.session_usage.rounds,
-            contextWindow: data.session_usage.context_window,
-            contextUsed: data.session_usage.context_used,
-          }
-        : null
+      const data = (await res.json()) as HistoryPayload
+      const { messages: msgs, usage } = mapHistoryMessages(data)
       chat.loadHistory(msgs, threadId, usage)
       void hydrateTurnDurations(threadId, msgs)
       stickToBottom.value = true
@@ -1558,6 +1466,7 @@ document.addEventListener('visibilitychange', onVisibilityChange)
 
 onBeforeUnmount(() => {
   flushDraft()
+  disposeDesktopSession?.()
   window.removeEventListener('beforeunload', flushDraft)
   document.removeEventListener('visibilitychange', onVisibilityChange)
   if (pinFrame) cancelAnimationFrame(pinFrame)
@@ -2503,21 +2412,18 @@ async function submit() {
             />
             <el-button
               v-if="chat.sending"
-              class="stop"
-              type="danger"
+              class="stop holo-send-btn is-stop"
               :icon="VideoPause"
               size="large"
-              circle
               title="中止"
               @click="chat.stop()"
             />
             <el-button
               v-else
-              class="send"
-              type="primary"
+              class="send holo-send-btn"
               :icon="Promotion"
               size="large"
-              circle
+              title="发送"
               :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
               @click="submit"
             />

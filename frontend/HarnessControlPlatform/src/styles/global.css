@@ -212,6 +212,106 @@ textarea {
   animation-delay: calc(var(--i, 0) * 60ms);
 }
 
+/* Electron 透明浮窗（悬浮助手 / 托盘弹窗）：不加任何全局底色。 */
+html.desktop-overlay,
+html.desktop-overlay body,
+html.desktop-overlay #app {
+  background: transparent !important;
+  background-image: none !important;
+  overflow: hidden;
+}
+
+/* 全息发送按钮：对话页与悬浮助手共用同一套视觉。 */
+.holo-send-btn.el-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: #d6fffb;
+  border: 1px solid rgba(55, 208, 196, 0.55);
+  border-radius: 11px;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(55, 208, 196, 0.06) 0,
+      rgba(55, 208, 196, 0.06) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(145deg, rgba(55, 208, 196, 0.28), rgba(91, 140, 255, 0.18)),
+    rgba(6, 18, 30, 0.94);
+  box-shadow:
+    0 0 12px rgba(55, 208, 196, 0.16),
+    inset 0 0 18px rgba(55, 208, 196, 0.16);
+  transition:
+    color 0.18s ease,
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.holo-send-btn.el-button .el-icon {
+  font-size: 18px;
+  filter: drop-shadow(0 0 6px rgba(55, 208, 196, 0.45));
+}
+
+.holo-send-btn.el-button:hover:not(.is-disabled) {
+  color: #f0fffe;
+  border-color: rgba(160, 240, 255, 0.9);
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(55, 208, 196, 0.08) 0,
+      rgba(55, 208, 196, 0.08) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(145deg, rgba(55, 208, 196, 0.34), rgba(91, 140, 255, 0.24)),
+    rgba(8, 22, 36, 0.96);
+  box-shadow:
+    0 0 18px rgba(55, 208, 196, 0.35),
+    inset 0 0 22px rgba(55, 208, 196, 0.22);
+}
+
+.holo-send-btn.el-button:active:not(.is-disabled) {
+  transform: translateY(1px);
+}
+
+.holo-send-btn.el-button.is-disabled,
+.holo-send-btn.el-button.is-disabled:hover {
+  color: var(--text-3);
+  border-color: rgba(126, 154, 198, 0.25);
+  background: rgba(8, 16, 28, 0.8);
+  box-shadow: none;
+  opacity: 0.55;
+}
+
+.holo-send-btn.is-stop.el-button {
+  color: #ffc9c8;
+  border-color: rgba(226, 96, 94, 0.55);
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(226, 96, 94, 0.06) 0,
+      rgba(226, 96, 94, 0.06) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(145deg, rgba(226, 96, 94, 0.22), rgba(120, 40, 48, 0.14)),
+    rgba(26, 10, 14, 0.92);
+  box-shadow:
+    0 0 0 1px rgba(226, 96, 94, 0.1),
+    inset 0 0 16px rgba(226, 96, 94, 0.14);
+}
+
+.holo-send-btn.is-stop.el-button:hover:not(.is-disabled) {
+  color: #ffe9e8;
+  border-color: rgba(255, 150, 148, 0.9);
+  box-shadow:
+    0 0 18px rgba(226, 96, 94, 0.35),
+    inset 0 0 22px rgba(226, 96, 94, 0.22);
+}
+
 /* 尊重减少动态偏好 */
 @media (prefers-reduced-motion: reduce) {
   *,
