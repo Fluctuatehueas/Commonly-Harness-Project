@@ -136,6 +136,35 @@ def _message_created_at(message: Any) -> datetime | None:
     return parse_iso(message_timestamp(message))
 
 
+def _user_attachments(message: Any) -> list[dict[str, Any]] | None:
+    """读取用户消息携带的附件元信息；旧 checkpoint 没有该字段。"""
+    additional = _message_value(message, "additional_kwargs", {}) or {}
+    if not isinstance(additional, dict):
+        return None
+    raw = additional.get("attachments")
+    if not isinstance(raw, list):
+        return None
+    attachments: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        file_id = item.get("id")
+        name = item.get("name")
+        if not isinstance(file_id, str) or not isinstance(name, str):
+            continue
+        attachments.append(
+            {
+                "id": file_id,
+                "name": name,
+                "ext": str(item.get("ext") or ""),
+                "kind": str(item.get("kind") or "text"),
+                "mime": str(item.get("mime") or ""),
+                "size": int(item.get("size") or 0),
+            }
+        )
+    return attachments or None
+
+
 def serialize_messages(
     messages: list[Any],
     usage_by_message: dict[str, dict[str, int]] | None = None,
@@ -284,6 +313,7 @@ def serialize_messages(
                     role="user",
                     content=content,
                     created_at=_message_created_at(message),
+                    attachments=_user_attachments(message),
                 )
             )
     return serialized

@@ -70,7 +70,7 @@ from api.agent_groups import router as agent_groups_router
 from api.agents import router as agents_router
 from api.async_tasks import extract_async_task_id
 from api.async_tasks import router as async_tasks_router
-from api.context import build_user_content
+from api.context import attachment_metadata, build_user_content
 from api.context import router as context_router
 from api.identity import UserIdentityMiddleware, effective_user_id
 from api.evolution import router as evolution_router
@@ -576,13 +576,18 @@ async def _run_chat_turn(
                 message=request.message,
                 attachment_ids=request.attachments,
             )
+            # 附件元信息随用户消息落 checkpoint，历史回放时恢复缩略图与图标。
+            attachments_meta = attachment_metadata(request.user_id, request.attachments)
             # task_flow 置空：新一轮普通消息不应继承上一轮的流程快照。
             agent_input = {
                 "messages": [
                     HumanMessage(
                         content=user_content,
                         # 用户发送时刻就是这条消息的时间属性，供后续轮次回看。
-                        additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
+                        additional_kwargs={
+                            MESSAGE_TIME_KEY: now_iso(),
+                            **({"attachments": attachments_meta} if attachments_meta else {}),
+                        },
                     )
                 ],
                 "task_flow": {},
@@ -1923,13 +1928,18 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             message=request.message,
             attachment_ids=request.attachments,
         )
+        # 附件元信息随用户消息落 checkpoint，历史回放时恢复缩略图与图标。
+        attachments_meta = attachment_metadata(request.user_id, request.attachments)
         # task_flow 置空：新一轮普通消息不应继承上一轮的流程快照。
         agent_input = {
             "messages": [
                 HumanMessage(
                     content=user_content,
                     # 用户发送时刻就是这条消息的时间属性，供后续轮次回看。
-                    additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
+                    additional_kwargs={
+                        MESSAGE_TIME_KEY: now_iso(),
+                        **({"attachments": attachments_meta} if attachments_meta else {}),
+                    },
                 )
             ],
             "task_flow": {},

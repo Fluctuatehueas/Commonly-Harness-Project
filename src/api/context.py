@@ -27,6 +27,7 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from agent.config import CONTEXT_ROOT
@@ -185,6 +186,27 @@ def resolve_attachments(user_id: str, file_ids: list[str]) -> list[Attachment]:
             raise HTTPException(status_code=400, detail=f"非法附件 ID: {file_id}")
         attachments.append(_to_attachment(user_id, file_id))
     return attachments
+
+
+def attachment_metadata(user_id: str, file_ids: list[str]) -> list[dict[str, Any]]:
+    """返回可直接下发给前端的附件元信息，不暴露磁盘路径。
+
+    元信息同时写进用户消息的 additional_kwargs，历史回放时据此恢复
+    附件缩略图与文件类型图标。
+    """
+    if not file_ids:
+        return []
+    return [
+        {
+            "id": attachment.id,
+            "name": attachment.name,
+            "ext": attachment.ext,
+            "kind": attachment.kind,
+            "mime": attachment.mime,
+            "size": attachment.size,
+        }
+        for attachment in resolve_attachments(user_id, file_ids)
+    ]
 
 
 # ============================================================
@@ -474,6 +496,25 @@ async def import_context_url(request: UrlImportRequest) -> dict[str, Any]:
         name,
         data,
         original_name=request.url,
+    )
+
+
+@router.get("/{file_id}/raw")
+async def get_context_file_raw(
+    file_id: str,
+    user_id: str = Query(..., min_length=1),
+) -> FileResponse:
+    """读取已上传附件原文；供历史消息恢复图片缩略图与全屏预览。"""
+    from api.identity import effective_user_id
+
+    user_id = effective_user_id(user_id)
+    if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+        raise HTTPException(status_code=400, detail="非法附件 ID")
+    attachment = _to_attachment(user_id, file_id)
+    return FileResponse(
+        path=attachment.path,
+        media_type=attachment.mime,
+        filename=attachment.name,
     )
 
 

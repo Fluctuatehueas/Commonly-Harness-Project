@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import mimetypes
 import os
 from datetime import datetime, timezone
@@ -19,11 +21,16 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from pydantic import BaseModel, Field
 
 from agent import project_store
 from agent.backends.project_backend import IGNORED_NAMES
 from agent.project_context import sandbox_project_dir, sandbox_session_dir
 from agent.project_marker import MARKER_DIRNAME
+from agent.session_artifacts_store import (
+    artifacts_for_thread,
+    save_message_artifacts,
+)
 from api.agent_loader import agent_loader
 
 
@@ -75,6 +82,48 @@ def _relative(root: str, absolute: str) -> str:
     return absolute
 
 
+def _sandbox_sizes(sandbox: Any, paths: list[str]) -> dict[str, int]:
+    """批量读取沙箱文件大小。
+
+    deepagents 的 ``sandbox.glob`` 只返回 path/is_dir，size 恒为 0；这里用一次
+    沙箱内 stat 补齐，而不是给每个文件单独发一次请求。
+    """
+    if not paths:
+        return {}
+    payload = base64.b64encode(json.dumps(paths).encode("utf-8")).decode("ascii")
+    script = (
+        'python3 -c "'
+        "import base64,json,os\n"
+        f"paths=json.loads(base64.b64decode('{payload}').decode('utf-8'))\n"
+        "for p in paths:\n"
+        "    try:\n"
+        "        st=os.stat(p)\n"
+        "        print(json.dumps({'path':p,'size':st.st_size}))\n"
+        "    except OSError:\n"
+        "        pass\n"
+        '"'
+    )
+    try:
+        result = sandbox.execute(script)
+    except Exception:  # noqa: BLE001 - 取不到大小时退化为 0，不影响文件列表
+        return {}
+    sizes: dict[str, int] = {}
+    for line in str(getattr(result, "output", "") or "").splitlines():
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        path = data.get("path")
+        if isinstance(path, str):
+            try:
+                sizes[path] = int(data.get("size") or 0)
+            except (TypeError, ValueError):
+                continue
+    return sizes
+
+
 def _list_sync(sandbox: Any, root: str) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     try:
@@ -83,21 +132,28 @@ def _list_sync(sandbox: Any, root: str) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 - 目录不存在时按空列表处理
         return entries
     seen: set[str] = set()
+    absolute_paths: list[str] = []
     for item in matches:
         absolute = str(item.get("path") or "")
         if not absolute or absolute in seen:
             continue
         seen.add(absolute)
+        absolute_paths.append(absolute)
+    # 先按路径排序再截断，保证返回的一定是展示出来的那批文件；
+    # 只对这批文件取 size，避免给上万条匹配发一条超长命令。
+    absolute_paths.sort()
+    absolute_paths = absolute_paths[:MAX_FILES]
+    sizes = _sandbox_sizes(sandbox, absolute_paths)
+    for absolute in absolute_paths:
         entries.append(
             {
                 "path": _relative(root, absolute),
-                "size": int(item.get("size") or 0),
-                "modified_at": item.get("modified_at") or None,
+                "size": sizes.get(absolute, 0),
+                "modified_at": None,
                 "origin": "sandbox",
             }
         )
-    entries.sort(key=lambda item: item["path"])
-    return entries[:MAX_FILES]
+    return entries
 
 
 def _list_project_sync(root: Path) -> list[dict[str, Any]]:
@@ -280,9 +336,15 @@ async def download_session_file(
         project_root=project_root,
     )
     filename = PurePosixPath(path).name or "download"
-    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    # 只有图片允许内联展示，其他文件仍强制下载，避免把 HTML/SVG 当页面执行。
-    allow_inline = inline and media_type.startswith("image/")
+    # Windows 的 mimetypes 会读注册表，.pdf 可能被映射成 octet-stream，这里显式兜底。
+    if filename.lower().endswith(".pdf"):
+        media_type = "application/pdf"
+    else:
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    # 只有图片和 PDF 允许内联展示，其他文件仍强制下载，避免把 HTML/SVG 当页面执行。
+    allow_inline = inline and (
+        media_type.startswith("image/") or media_type == "application/pdf"
+    )
     disposition = (
         f"inline; filename*=UTF-8''{quote(filename)}"
         if allow_inline
@@ -293,3 +355,44 @@ async def download_session_file(
         media_type=media_type if allow_inline else "application/octet-stream",
         headers={"Content-Disposition": disposition},
     )
+
+
+class SaveArtifactsRequest(BaseModel):
+    """某条助手消息的产出文件清单。"""
+
+    message_id: str = Field(min_length=1, max_length=200)
+    files: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.get("/threads/{thread_id}/artifacts")
+async def list_session_artifacts(
+    thread_id: str,
+    user_id: str = Query(..., min_length=1),
+) -> dict[str, Any]:
+    """返回会话内「助手消息 ID -> 本轮产出文件」的映射，供刷新后回显。"""
+    await agent_loader.require_session(user_id, thread_id, allow_archived=True)
+    store = await agent_loader.get_store()
+    return {
+        "artifacts": await artifacts_for_thread(
+            store, user_id=user_id, thread_id=thread_id
+        )
+    }
+
+
+@router.put("/threads/{thread_id}/artifacts")
+async def save_session_artifacts(
+    thread_id: str,
+    body: SaveArtifactsRequest,
+    user_id: str = Query(..., min_length=1),
+) -> dict[str, Any]:
+    """前端每轮结束后写入本轮产出，刷新时再按消息 ID 取回。"""
+    await agent_loader.require_session(user_id, thread_id, allow_archived=True)
+    store = await agent_loader.get_store()
+    files = await save_message_artifacts(
+        store,
+        user_id=user_id,
+        thread_id=thread_id,
+        message_id=body.message_id,
+        files=body.files,
+    )
+    return {"message_id": body.message_id, "files": files}

@@ -371,9 +371,15 @@ export const useChatStore = defineStore('chat', () => {
   const lastTurnThreadId = ref<string | null>(null)
   // threadId -> 最近完成一轮的用户消息 id，供文件产出按轮归档
   const lastTurnKeys = ref<Record<string, string>>({})
+  // threadId -> 最近完成一轮的助手消息 id，供产出文件卡片按消息持久化
+  const lastFinalIds = ref<Record<string, string>>({})
 
   function lastTurnKeyFor(tid: string | null): string {
     return tid ? lastTurnKeys.value[tid] || '' : ''
+  }
+
+  function lastFinalIdFor(tid: string | null): string {
+    return tid ? lastFinalIds.value[tid] || '' : ''
   }
 
   let pendingDemoIndex = 0
@@ -1426,6 +1432,9 @@ export const useChatStore = defineStore('chat', () => {
         const finishedThread = realId || key
         lastTurnThreadId.value = finishedThread
         lastTurnKeys.value = { ...lastTurnKeys.value, [finishedThread]: finishedTurnKey }
+        if (stableId) {
+          lastFinalIds.value = { ...lastFinalIds.value, [finishedThread]: stableId }
+        }
         turnVersion.value++
         break
       }
@@ -2072,6 +2081,7 @@ export const useChatStore = defineStore('chat', () => {
     turnVersion,
     lastTurnThreadId,
     lastTurnKeyFor,
+    lastFinalIdFor,
     runningThreadIds,
     waitingThreadIds,
     activateThread,

@@ -30,6 +30,7 @@ from deepagents.middleware.summarization import (
     SummarizationToolMiddleware,
 )
 from langchain.agents.middleware import ModelRequest, ModelResponse
+from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain_core.messages import HumanMessage
 from agent.context.anchors import Anchor, extract_anchors, message_text, render_anchor_block
 from agent.context.budget import ContextBudget, build_budget
@@ -183,6 +184,28 @@ def _budget_payload(budget: ContextBudget) -> dict[str, Any]:
     return budget.as_dict()
 
 
+def _nearest_safe_cutoff(messages: list[Any], cutoff: int) -> int:
+    """若切点落在 ToolMessage 上，回退到发起该批工具调用的 AI 消息。
+
+    模型服务要求每条 tool 消息都能对应到前一条 assistant 的 tool_calls；
+    切在 tool 中间会让重建后的消息列表以孤立 tool 消息开头，触发 400。
+    """
+    if getattr(messages[cutoff], "type", "") != "tool":
+        return cutoff
+    end = cutoff
+    while end < len(messages) and getattr(messages[end], "type", "") == "tool":
+        end += 1
+    wanted = {getattr(message, "tool_call_id", None) for message in messages[cutoff:end]}
+    for index in range(cutoff - 1, -1, -1):
+        message = messages[index]
+        if getattr(message, "type", "") != "ai":
+            continue
+        calls = getattr(message, "tool_calls", None) or []
+        if any(call.get("id") in wanted for call in calls):
+            return index
+    return end
+
+
 def _emit_phase(phase: str) -> None:
     """向前端推送压缩阶段，用于区分“压缩”和“评估”两步。"""
     writer = _CURRENT_WRITER.get()
@@ -226,6 +249,17 @@ async def _heartbeat_loop(
 
 class HarnessContextCompactionMiddleware(SummarizationMiddleware):
     """自动压缩 + 触发策略 + 事件 + 回执。"""
+
+    @property
+    def name(self) -> str:
+        """与 deepagents 内置摘要同名，替换而不是叠加第二个摘要中间件。
+
+        ``create_deep_agent`` 默认已注册 ``SummarizationMiddleware``，并按
+        ``name`` 合并自定义中间件。名字不同会变成两层摘要：外层把
+        ``_summarization_event`` 应用到 messages 后透传，内层再应用一次，
+        压缩切点会写入错误的索引空间，导致后续请求出现孤立 tool 消息。
+        """
+        return "SummarizationMiddleware"
 
     def __init__(
         self,
@@ -504,7 +538,7 @@ class HarnessContextCompactionMiddleware(SummarizationMiddleware):
         writer_handle = _CURRENT_WRITER.set(writer)
         id_handle = _CURRENT_COMPACTION_ID.set(compaction_id)
         try:
-            return await super().awrap_model_call(request, observing_handler)
+            result = await super().awrap_model_call(request, observing_handler)
         except CompactionSummaryError as exc:
             logger.warning("上下文压缩失败，走兜底截断", exc_info=True)
             _emit(
@@ -538,6 +572,48 @@ class HarnessContextCompactionMiddleware(SummarizationMiddleware):
             _CURRENT_COMPACTION_ID.reset(id_handle)
             _CURRENT_WRITER.reset(writer_handle)
             _CURRENT_ANCHORS.reset(token_handle)
+        return self._guard_event_cutoff(result, request=request)
+
+    def _guard_event_cutoff(
+        self,
+        result: ModelResponse | ExtendedModelResponse,
+        *,
+        request: ModelRequest,
+    ) -> ModelResponse | ExtendedModelResponse:
+        """兜底校正压缩事件的 cutoff，避免切点落在 ToolMessage 上。
+
+        正常路径下框架已保证切点安全；这里针对“消息列表被上游改写、
+        索引空间错位”的异常情况防护，避免把坏 cutcoff 写回 state 后
+        令整个会话永久 400。
+        """
+        command = getattr(result, "command", None)
+        update = getattr(command, "update", None)
+        if not isinstance(update, dict):
+            return result
+        event = update.get(SUMMARIZATION_EVENT_KEY)
+        if not isinstance(event, dict):
+            return result
+        messages = list(request.messages or [])
+        cutoff = event.get("cutoff_index")
+        if not isinstance(cutoff, int) or cutoff < 0 or cutoff >= len(messages):
+            return result
+        fixed = _nearest_safe_cutoff(messages, cutoff)
+        if fixed == cutoff:
+            return result
+        logger.warning(
+            "[ContextCompaction] cutoff=%s 落在 tool 消息上，回退到最近安全切点 %s",
+            cutoff,
+            fixed,
+        )
+        corrected = {**event, "cutoff_index": fixed}
+        try:
+            return ExtendedModelResponse(
+                model_response=result.model_response,
+                command=command.__class__(update={**update, SUMMARIZATION_EVENT_KEY: corrected}),
+            )
+        except Exception:
+            logger.warning("修正压缩 cutoff 失败", exc_info=True)
+            return result
 
     async def _fallback(
         self,

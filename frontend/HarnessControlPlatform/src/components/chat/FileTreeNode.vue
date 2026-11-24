@@ -1,8 +1,9 @@
 <script setup lang="ts">
 // 文件树节点：目录可折叠，文件行提供预览 + 来源对应的操作按钮。
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Download, FolderOpened } from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
+import FileTypeIcon from './FileTypeIcon.vue'
 import type { TreeNode } from './fileTree'
 import { countFiles } from './fileTree'
 import type { FileMeta } from '@/stores/files'
@@ -13,6 +14,8 @@ const props = defineProps<{
   node: TreeNode
   depth: number
   isNew?: (file: FileMeta) => boolean
+  /** 递增时收起所有目录（抽屉头部的「全部折叠」）。 */
+  collapseSignal?: number
 }>()
 
 const emit = defineEmits<{
@@ -22,8 +25,16 @@ const emit = defineEmits<{
 
 const folder = computed(() => (props.node.kind === 'folder' ? props.node : null))
 const file = computed(() => (props.node.kind === 'file' ? props.node : null))
-const open = ref(true)
+// 默认只展开根级目录，更深的层级保持折叠，打开抽屉时先看全局结构。
+const open = ref(props.depth === 0)
 const indent = computed(() => ({ paddingLeft: `${8 + props.depth * 14}px` }))
+
+watch(
+  () => props.collapseSignal,
+  () => {
+    open.value = false
+  },
+)
 
 function toggle() {
   open.value = !open.value
@@ -50,7 +61,7 @@ function fmtSize(size: number) {
       <span class="t-chev" :class="{ open: open }">
         <AppIcon name="chevronRight" :size="10" />
       </span>
-      <AppIcon name="folder" :size="13" class="t-icon folder-icon" />
+      <AppIcon name="folder" :size="16" class="t-icon folder-icon" />
       <span class="t-name">{{ folder.name }}</span>
       <span class="t-count mono">{{ countFiles(folder) }}</span>
     </button>
@@ -61,6 +72,7 @@ function fmtSize(size: number) {
         :node="child"
         :depth="depth + 1"
         :is-new="isNew"
+        :collapse-signal="collapseSignal"
         @open="emitOpen"
         @action="emitAction"
       />
@@ -71,7 +83,7 @@ function fmtSize(size: number) {
     <div class="tree-row file-row" :style="indent">
       <span class="t-chev placeholder"></span>
       <button class="t-main" type="button" :title="file.file.path" @click="emitOpen(file.file)">
-        <AppIcon name="file" :size="13" class="t-icon file-icon" />
+        <FileTypeIcon class="t-icon" :name="file.name" :size="22" />
         <span class="t-name">{{ file.name }}</span>
         <span v-if="isNew?.(file.file)" class="new-tag">new</span>
       </button>
@@ -99,7 +111,7 @@ function fmtSize(size: number) {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 30px;
+  min-height: 34px;
   padding-right: 6px;
   border-radius: 7px;
 }
@@ -143,10 +155,6 @@ function fmtSize(size: number) {
 
 .folder-icon {
   color: var(--accent-cyan);
-}
-
-.file-icon {
-  color: var(--text-3);
 }
 
 .t-main {

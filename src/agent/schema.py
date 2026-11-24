@@ -262,6 +262,10 @@ class Message(BaseModel):
     tokens: Optional[Dict[str, int]] = Field(None, description="单轮 Token 消耗 input/output/total")
     # 助手消息：用户对这条回答的最新反馈，供刷新后回显。
     feedback: Optional[str] = Field(None, description="like / dislike / null")
+    # 用户消息：随消息发送的附件元信息（不含磁盘路径），供历史回放缩略图与图标。
+    attachments: Optional[List[Dict[str, Any]]] = Field(
+        None, description="附件元信息列表 id/name/ext/kind/mime/size"
+    )
 
 
 class Session(BaseModel):

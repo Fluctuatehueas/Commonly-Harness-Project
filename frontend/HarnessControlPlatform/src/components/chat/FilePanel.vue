@@ -7,6 +7,7 @@ import {
   Close,
   Download,
   EditPen,
+  Fold,
   FolderOpened,
   InfoFilled,
   Refresh,
@@ -16,10 +17,14 @@ import AppIcon from '@/components/console/AppIcon.vue'
 import HoloTooltip from '@/components/console/HoloTooltip.vue'
 import MarkdownView from './MarkdownView.vue'
 import HtmlPreview from './HtmlPreview.vue'
+import PdfPreview from './PdfPreview.vue'
 import FileTreeNode from './FileTreeNode.vue'
+import FileTypeIcon from './FileTypeIcon.vue'
 import { buildGroups, type FileGroup } from './fileTree'
 import { useFileStore, type FileMeta } from '@/stores/files'
 import { absoluteWorkspacePath, revealFile } from '@/api/workspace'
+import { API_BASE } from '@/api/client'
+import { USER_ID } from '@/stores/sessions'
 const props = defineProps<{ threadId: string | null; refreshKey?: number }>()
 const emit = defineEmits<{ close: [] }>()
 const files = useFileStore()
@@ -41,8 +46,28 @@ const isMarkdown = computed(() =>
 const isHtml = computed(() =>
   /\.(?:html?|xhtml)$/i.test(files.current?.path || ''),
 )
+// PDF 预览：pdfjs-dist 渲染，不依赖浏览器/Electron 的 PDF 插件
+const isPdf = computed(() => /\.pdf$/i.test(files.current?.path || ''))
 const isPreviewable = computed(() => isMarkdown.value || isHtml.value)
 const previewMode = ref(false)
+
+const pdfUrl = computed(() => {
+  const current = files.current
+  if (!current || !props.threadId) return ''
+  return (
+    `${API_BASE}/threads/${props.threadId}/files/download` +
+    `?user_id=${encodeURIComponent(USER_ID)}` +
+    `&path=${encodeURIComponent(current.path)}` +
+    `&source=${current.origin}&inline=true`
+  )
+})
+
+// 全部折叠：每次递增信号，让所有目录节点收起。
+const collapseSignal = ref(0)
+
+function collapseAll() {
+  collapseSignal.value += 1
+}
 
 watch(
   () => [props.threadId, props.refreshKey] as const,
@@ -171,6 +196,15 @@ onBeforeUnmount(stopResize)
       <span v-if="newCount" class="new-tag head-new">本轮 +{{ newCount }} new</span>
       <el-button
         class="icon-btn"
+        :icon="Fold"
+        text
+        circle
+        size="small"
+        title="全部折叠"
+        @click="collapseAll"
+      />
+      <el-button
+        class="icon-btn"
         :icon="Refresh"
         text
         circle
@@ -220,7 +254,7 @@ onBeforeUnmount(stopResize)
 
       <section v-for="group in groups" :key="group.origin" class="file-group">
         <header class="group-head">
-          <AppIcon name="folder" :size="13" class="group-icon" />
+          <AppIcon name="folder" :size="15" class="group-icon" />
           <span class="group-label">{{ group.label }}</span>
           <span class="group-count mono">{{ group.files.length }}</span>
           <span v-if="groupNewCount(group)" class="new-tag">本轮 +{{ groupNewCount(group) }}</span>
@@ -232,6 +266,7 @@ onBeforeUnmount(stopResize)
             :node="node"
             :depth="0"
             :is-new="isNew"
+            :collapse-signal="collapseSignal"
             @open="handleOpen"
             @action="handleAction"
           />
@@ -241,6 +276,7 @@ onBeforeUnmount(stopResize)
 
     <template v-else-if="files.current">
       <div class="fp-editor-head">
+        <FileTypeIcon class="f-icon" :name="files.current.path" :size="20" />
         <code class="f-path">{{ files.current.path }}</code>
         <div class="fp-actions">
           <span class="f-origin" :class="files.current.origin">
@@ -268,7 +304,10 @@ onBeforeUnmount(stopResize)
           </el-button>
         </div>
       </div>
-      <div v-if="previewMode && isMarkdown" class="fp-preview">
+      <div v-if="isPdf" class="fp-preview fp-preview-html">
+        <PdfPreview :url="pdfUrl" />
+      </div>
+      <div v-else-if="previewMode && isMarkdown" class="fp-preview">
         <MarkdownView :content="files.current.content" @open-file="openInlineFile" />
       </div>
       <div v-else-if="previewMode && isHtml" class="fp-preview fp-preview-html">
@@ -482,6 +521,10 @@ onBeforeUnmount(stopResize)
   font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.f-icon {
+  flex: none;
 }
 
 .f-origin {

@@ -94,12 +94,8 @@ export const useFileStore = defineStore('files', () => {
   const requested = ref<{ path: string; origin: FileOrigin; nonce: number } | null>(null)
   // threadId -> 本轮新增文件 key（origin:path）。每轮结束后整体替换。
   const newKeys = ref<Record<string, Set<string>>>({})
-  // `${threadId}::${turnKey}` -> 该轮产出清单。按轮保存，旧轮卡片不再被新轮覆盖。
-  const artifacts = ref<Record<string, FileMeta[]>>({})
-
-  function artifactKey(threadId: string, turnKey: string): string {
-    return `${threadId}::${turnKey || 'latest'}`
-  }
+  // threadId -> (助手消息 ID -> 该轮产出文件)。按消息持久化，刷新后仍固定在该轮。
+  const artifacts = ref<Record<string, Record<string, FileMeta[]>>>({})
 
   let activeThread: string | null = null
   // 上一轮结束时的文件快照；用于判断“本轮新增”。
@@ -170,12 +166,11 @@ export const useFileStore = defineStore('files', () => {
     }
   }
 
-  /** 一轮对话结束后刷新文件，并把本轮新增按轮归档。 */
-  async function markRound(threadId: string | null, turnKey = '') {
+  /** 一轮对话结束后刷新文件，并把本轮新增按「助手消息」归档并持久化。 */
+  async function markRound(threadId: string | null, messageId = '') {
     if (!threadId) return
     const pending = primePromises[threadId]
     if (pending) await pending
-    const storeKey = artifactKey(threadId, turnKey)
     try {
       const payload = await fetchList(threadId)
       const currentKeys = new Set((payload.files || []).map(fileKey))
@@ -188,28 +183,72 @@ export const useFileStore = defineStore('files', () => {
       }
       baselineByThread[threadId] = currentKeys
       newKeys.value = { ...newKeys.value, [threadId]: nextNew }
-      // 同一轮可能因 HITL 恢复多次收尾，产出按轮合并而不是覆盖。
+      // 同一轮可能因 HITL 恢复多次收尾，产出按消息合并而不是覆盖。
       const produced = hadBaseline
         ? (payload.files || []).filter(
             (file) => nextNew.has(fileKey(file)) && isUsefulArtifact(file),
           )
         : []
-      const merged = new Map<string, FileMeta>()
-      for (const file of [...(artifacts.value[storeKey] || []), ...produced]) {
-        merged.set(fileKey(file), file)
+      if (messageId) {
+        const merged = new Map<string, FileMeta>()
+        const existing = artifacts.value[threadId]?.[messageId] || []
+        for (const file of [...existing, ...produced]) merged.set(fileKey(file), file)
+        const list = [...merged.values()]
+        artifacts.value = {
+          ...artifacts.value,
+          [threadId]: { ...(artifacts.value[threadId] || {}), [messageId]: list },
+        }
+        if (list.length) void persistArtifacts(threadId, messageId, list)
       }
-      artifacts.value = { ...artifacts.value, [storeKey]: [...merged.values()] }
       if (activeThread === threadId) apply(payload)
     } catch {
       // 文件刷新失败不影响对话主流程；只清空本轮产出
-      artifacts.value = { ...artifacts.value, [storeKey]: [] }
+      if (messageId) {
+        artifacts.value = {
+          ...artifacts.value,
+          [threadId]: { ...(artifacts.value[threadId] || {}), [messageId]: [] },
+        }
+      }
     }
   }
 
-  /** 指定轮次的有用产出；turnKey 为该轮用户消息 id。 */
-  function artifactsFor(threadId: string | null, turnKey: string): FileMeta[] {
-    if (!threadId) return []
-    return artifacts.value[artifactKey(threadId, turnKey)] || []
+  /** 把本轮产出写到后端，刷新或换设备后仍能按消息 ID 还原卡片。 */
+  async function persistArtifacts(threadId: string, messageId: string, items: FileMeta[]) {
+    try {
+      await fetch(
+        `${API_BASE}/threads/${threadId}/artifacts?user_id=${encodeURIComponent(USER_ID)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message_id: messageId, files: items }),
+        },
+      )
+    } catch {
+      // 持久化失败时本地仍然展示，不阻塞对话
+    }
+  }
+
+  /** 打开会话时载入历史产出清单；只覆盖该 thread 的映射。 */
+  async function loadArtifacts(threadId: string | null) {
+    if (!threadId) return
+    try {
+      const res = await fetch(
+        `${API_BASE}/threads/${threadId}/artifacts?user_id=${encodeURIComponent(USER_ID)}`,
+      )
+      if (!res.ok) return
+      const data = (await res.json()) as {
+        artifacts?: Record<string, FileMeta[]>
+      }
+      artifacts.value = { ...artifacts.value, [threadId]: data.artifacts || {} }
+    } catch {
+      // 后端离线时保持本地缓存
+    }
+  }
+
+  /** 指定助手消息所在轮次的有用产出。 */
+  function artifactsFor(threadId: string | null, messageId: string): FileMeta[] {
+    if (!threadId || !messageId) return []
+    return artifacts.value[threadId]?.[messageId] || []
   }
 
   function isNew(threadId: string | null, file: FileMeta): boolean {
@@ -226,19 +265,20 @@ export const useFileStore = defineStore('files', () => {
       delete next[threadId]
       newKeys.value = next
     }
-    // 产出按 `${threadId}::${turnKey}` 存放，删除会话时按前缀清理。
-    const prefix = `${threadId}::`
-    if (Object.keys(artifacts.value).some((key) => key.startsWith(prefix))) {
-      const next: Record<string, FileMeta[]> = {}
-      for (const [key, value] of Object.entries(artifacts.value)) {
-        if (!key.startsWith(prefix)) next[key] = value
-      }
+    if (threadId in artifacts.value) {
+      const next = { ...artifacts.value }
+      delete next[threadId]
       artifacts.value = next
     }
   }
 
   async function open(threadId: string, path: string, origin: FileOrigin = 'sandbox') {
     error.value = ''
+    // PDF 走 pdf.js 按二进制渲染，不做文本解码，避免后端 415。
+    if (/\.pdf$/i.test(path)) {
+      current.value = { path, content: '', origin }
+      return
+    }
     try {
       const content = await fetchFileContent(threadId, path, origin)
       current.value = { path, content, origin }
@@ -291,6 +331,7 @@ export const useFileStore = defineStore('files', () => {
     list,
     prime,
     markRound,
+    loadArtifacts,
     isNew,
     artifactsFor,
     forget,

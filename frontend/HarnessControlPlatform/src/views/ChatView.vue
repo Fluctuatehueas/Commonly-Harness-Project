@@ -25,6 +25,8 @@ import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
+import MediaViewer from '@/components/chat/MediaViewer.vue'
+import FileTypeIcon from '@/components/chat/FileTypeIcon.vue'
 import ProducedFilesCard from '@/components/chat/ProducedFilesCard.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
 import {
@@ -176,6 +178,27 @@ const fileAccept = ref('')
 const urlMode = ref(false)
 const urlDraft = ref('')
 const urlLoading = ref(false)
+// 图片附件缩略图预览：复用全屏 MediaViewer。
+const mediaOpen = ref(false)
+const mediaSrc = ref('')
+const mediaTitle = ref('')
+const mediaFilename = ref('')
+
+/** 图片附件的展示地址：优先用本地预览，刷新后回退到后端原文接口。 */
+function attachmentSrc(att: ContextFile): string {
+  const local = previews.value[att.id]
+  if (local) return local
+  if (att.kind !== 'image') return ''
+  return `${API_BASE}/context/${att.id}/raw?user_id=${encodeURIComponent(USER_ID)}`
+}
+
+function openImagePreview(src: string, name: string) {
+  if (!src) return
+  mediaSrc.value = src
+  mediaTitle.value = name
+  mediaFilename.value = name
+  mediaOpen.value = true
+}
 
 // ---------- 未发送草稿持久化 ----------
 // 草稿按 thread_id 存进 localStorage：切换会话和重启程序后都能恢复。
@@ -500,6 +523,69 @@ async function removePending(id: string) {
   await deleteContextFile(id, USER_ID)
 }
 
+// 剪贴板图片的 MIME → 扩展名；后端只接受这几种图片格式。
+const PASTE_IMAGE_EXT: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+}
+
+/** 把剪贴板里的图片直接转成图片附件；只有图片时阻止默认粘贴行为。 */
+function onClipboardPaste(event: ClipboardEvent) {
+  const data = event.clipboardData
+  if (!data) return
+  const items = Array.from(data.items || [])
+  const images = items
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file))
+  if (!images.length) return
+  // 同时带文本时保留文本粘贴，图片额外作为附件加入。
+  const hasText = items.some((item) => item.kind === 'string' && item.type === 'text/plain')
+  if (!hasText) event.preventDefault()
+  if (uploading.value || chat.sending || chat.compacting) return
+  void appendClipboardImages(images)
+}
+
+async function appendClipboardImages(images: File[]) {
+  uploadError.value = ''
+  const limit = formats.value.max_file_mb * 1024 * 1024
+  const allowed = formats.value.accept
+    ? formats.value.accept.split(',').map((item) => item.trim()).filter(Boolean)
+    : []
+  for (const [index, image] of images.entries()) {
+    if (pendingFiles.value.length >= formats.value.max_files) {
+      ElMessage.warning(`一次最多上传 ${formats.value.max_files} 个文件`)
+      break
+    }
+    const mime = image.type || 'image/png'
+    const ext = PASTE_IMAGE_EXT[mime] || '.png'
+    if (allowed.length && !allowed.includes(ext)) {
+      ElMessage.warning(`不支持的文件类型 ${ext}`)
+      continue
+    }
+    if (image.size > limit) {
+      ElMessage.warning(`粘贴图片超过 ${formats.value.max_file_mb} MB`)
+      continue
+    }
+    const file = new File([image], `粘贴图片-${Date.now()}-${index}${ext}`, { type: mime })
+    uploading.value = true
+    try {
+      const record = await uploadContextFile(file, USER_ID)
+      pendingFiles.value.push(record)
+      if (record.kind === 'image') {
+        previews.value[record.id] = URL.createObjectURL(file)
+      }
+    } catch (error) {
+      ElMessage.error((error as Error).message)
+    } finally {
+      uploading.value = false
+    }
+  }
+}
+
 // ---------- 会话切换 ----------
 interface HistoryMessage {
   id: string
@@ -514,6 +600,8 @@ interface HistoryMessage {
   tokens?: { input: number; output: number; total: number }
   feedback?: 'like' | 'dislike' | null
   created_at?: string
+  // 用户消息随消息发送的附件元信息；旧会话没有该字段。
+  attachments?: ContextFile[]
 }
 
 /** 历史消息自带 created_at，转成毫秒供气泡底部显示时间。 */
@@ -550,6 +638,8 @@ async function selectSession(threadId: string) {
   syncGroupForAgent()
   // 记录切换前的文件基线，下一轮结束时才能准确判断“本轮新增”。
   void files.prime(threadId)
+  // 载入历史产出清单：刷新或重新进入会话后，产出卡片仍固定在自己那一轮。
+  void files.loadArtifacts(threadId)
   // 后台仍在运行的会话：保留实时缓冲，不能用 checkpoint 历史覆盖
   try {
     if (!chat.isThreadSending(threadId)) {
@@ -572,7 +662,15 @@ async function selectSession(threadId: string) {
       }
       const msgs: ChatMsg[] = data.messages.map((m, i) => {
         const at = messageTime(m.created_at)
-        if (m.role === 'user') return { id: `h-u-${i}`, kind: 'user', content: m.content, at }
+        if (m.role === 'user') {
+          return {
+            id: `h-u-${i}`,
+            kind: 'user',
+            content: m.content,
+            attachments: m.attachments,
+            at,
+          }
+        }
         if (m.role === 'reasoning') {
           return {
             id: m.id || `h-r-${i}`,
@@ -824,7 +922,7 @@ watch(
   () => {
     if (backendOnline.value) void sessions.refresh()
     const threadId = chat.lastTurnThreadId
-    if (threadId) void files.markRound(threadId, chat.lastTurnKeyFor(threadId))
+    if (threadId) void files.markRound(threadId, chat.lastFinalIdFor(threadId))
     fileRefreshKey.value++
   },
 )
@@ -1005,9 +1103,9 @@ function archivedCards(turn: TurnView): ChatMsg[] {
   return [...flows.values(), ...turn.schedulers].sort((a, b) => (a.at || 0) - (b.at || 0))
 }
 
-// 本轮产出文件：按轮归档，固定显示在真正产出它的那一轮回答下方。
+// 本轮产出文件：按助手消息 ID 归档，固定显示在真正产出它的那一轮回答下方。
 function turnFiles(turn: TurnView) {
-  return turn.user ? files.artifactsFor(chat.threadId, turn.user.id) : []
+  return turn.final ? files.artifactsFor(chat.threadId, turn.final.id) : []
 }
 
 // ---------- 终止原因提示 ----------
@@ -1712,10 +1810,12 @@ async function submit() {
     }
     sessions.activeThreadId = id
     chat.activateThread(id)
+    // 新会话先记录空基线，首轮结束才能识别出“本轮新增”的文件。
+    void files.prime(id)
   }
   // 先快照再清空：清空必须发生在发送之前，任何后续异常都不能让草稿残留。
   const text = draft.value
-  const files = [...pendingFiles.value]
+  const attachments = [...pendingFiles.value]
   // 已发送的草稿立即作废；之前没有会话时，同时清掉“未归属”草稿。
   clearDraft(chat.threadId)
   if (!previousThread) clearDraft(null)
@@ -1723,7 +1823,7 @@ async function submit() {
   // 已发送的附件不再重复引用；预览 URL 保留给消息气泡显示。
   pendingFiles.value = []
   uploadError.value = ''
-  chat.send(text, files)
+  chat.send(text, attachments)
   // 把本轮选择同步到本地会话索引，切走再切回时能恢复同一个 Agent / 组。
   // 这只是内存副本，失败不影响本轮发送（后端已持久化绑定）。
   try {
@@ -1999,8 +2099,16 @@ async function submit() {
                   <div class="bubble user-bubble">
                     <div v-if="turn.user.attachments?.length" class="bubble-atts">
                       <span v-for="att in turn.user.attachments" :key="att.id" class="bubble-att">
-                        <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
-                        <AppIcon v-else name="file" :size="11" />
+                        <button
+                          v-if="att.kind === 'image' && attachmentSrc(att)"
+                          class="att-thumb"
+                          type="button"
+                          :title="`查看 ${att.name}`"
+                          @click="openImagePreview(attachmentSrc(att), att.name)"
+                        >
+                          <img :src="attachmentSrc(att)" :alt="att.name" />
+                        </button>
+                        <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="22" />
                         <span>{{ att.name }}</span>
                       </span>
                     </div>
@@ -2279,8 +2387,16 @@ async function submit() {
 
           <div v-if="pendingFiles.length" class="pending-row">
             <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
-              <img v-if="previews[att.id]" :src="previews[att.id]" alt="" />
-              <AppIcon v-else name="file" :size="12" />
+              <button
+                v-if="att.kind === 'image' && attachmentSrc(att)"
+                class="att-thumb"
+                type="button"
+                :title="`查看 ${att.name}`"
+                @click="openImagePreview(attachmentSrc(att), att.name)"
+              >
+                <img :src="attachmentSrc(att)" :alt="att.name" />
+              </button>
+              <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="22" />
               <span class="p-name">{{ att.name }}</span>
               <el-button
                 class="chip-close"
@@ -2324,7 +2440,7 @@ async function submit() {
             />
           </div>
 
-          <div class="input-row">
+          <div class="input-row" @paste="onClipboardPaste">
             <div class="attach-wrap">
               <el-button
                 class="attach"
@@ -2481,6 +2597,14 @@ async function submit() {
           @close="showFiles = false"
         />
       </Transition>
+
+      <MediaViewer
+        v-model="mediaOpen"
+        kind="image"
+        :src="mediaSrc"
+        :title="mediaTitle"
+        :filename="mediaFilename"
+      />
     </div>
   </div>
 </template>
@@ -3885,6 +4009,26 @@ async function submit() {
   height: 22px;
   object-fit: cover;
   border-radius: 4px;
+}
+
+/* 图片缩略图按钮：点击交给全屏查看器，不参与附件 chip 的删除操作 */
+.att-thumb {
+  display: inline-flex;
+  flex: none;
+  padding: 0;
+  overflow: hidden;
+  cursor: zoom-in;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+
+.att-thumb img {
+  transition: transform 0.15s ease;
+}
+
+.att-thumb:hover img {
+  transform: scale(1.08);
 }
 
 .pending-chip > .el-icon {

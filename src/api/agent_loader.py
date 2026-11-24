@@ -38,6 +38,7 @@ from agent.feedback_store import (
     delete_feedback_thread,
     feedback_map_for_thread,
 )
+from agent.session_artifacts_store import delete_thread_artifacts
 
 
 logger = logging.getLogger(__name__)
@@ -987,6 +988,9 @@ class AgentLoader:
         await delete_trajectory(self._store, user_id=user_id, thread_id=thread_id)
         await delete_usage(self._store, user_id=user_id, thread_id=thread_id)
         await delete_feedback_thread(
+            self._store, user_id=user_id, thread_id=thread_id
+        )
+        await delete_thread_artifacts(
             self._store, user_id=user_id, thread_id=thread_id
         )
         group = self._user_groups.get(user_id)
