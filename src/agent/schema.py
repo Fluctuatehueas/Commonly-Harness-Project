@@ -266,6 +266,8 @@ class Message(BaseModel):
     attachments: Optional[List[Dict[str, Any]]] = Field(
         None, description="附件元信息列表 id/name/ext/kind/mime/size"
     )
+    # 用户消息：该轮实际应答的 Agent id，供前端按轮展示头像与名称。
+    agent_id: Optional[str] = Field(None, description="本轮使用的 Agent id")
 
 
 class Session(BaseModel):

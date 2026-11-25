@@ -565,7 +565,7 @@ async def _run_chat_turn(
         if flow_turn is not None:
             # 命中任务流：用户原文一条 + 任务流规范一条（内部标记，历史不渲染）。
             agent_input = {
-                "messages": _flow_messages(flow_turn, request.message),
+                "messages": _flow_messages(flow_turn, request.message, agent_id),
                 "task_flow": flow_turn.state,
             }
             await _carry_over_flow_progress(agent, config, flow_turn.state)
@@ -586,6 +586,8 @@ async def _run_chat_turn(
                         # 用户发送时刻就是这条消息的时间属性，供后续轮次回看。
                         additional_kwargs={
                             MESSAGE_TIME_KEY: now_iso(),
+                            # 本轮应答的 Agent 落 checkpoint，历史回放按轮展示头像与名称。
+                            "agent_id": agent_id,
                             **({"attachments": attachments_meta} if attachments_meta else {}),
                         },
                     )
@@ -718,7 +720,9 @@ async def _prepare_flow_turn(request: ChatRequest) -> FlowTurn | None:
 TASK_FLOW_INTERNAL_MARKER = "task_flow_spec"
 
 
-def _flow_messages(flow_turn: FlowTurn, user_text: str) -> list[Any]:
+def _flow_messages(
+    flow_turn: FlowTurn, user_text: str, agent_id: str = ""
+) -> list[Any]:
     """构造任务流一轮的输入消息。
 
     用户原文与任务流规范都是 HumanMessage，但职责不同：
@@ -729,7 +733,10 @@ def _flow_messages(flow_turn: FlowTurn, user_text: str) -> list[Any]:
     return [
         HumanMessage(
             content=user_text,
-            additional_kwargs={MESSAGE_TIME_KEY: now_iso()},
+            additional_kwargs={
+                MESSAGE_TIME_KEY: now_iso(),
+                **({"agent_id": agent_id} if agent_id else {}),
+            },
         ),
         HumanMessage(
             content=flow_turn.content,
@@ -1914,11 +1921,15 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     thread_id = request.thread_id or str(uuid.uuid4())
     if request.thread_id:
         await agent_loader.require_session(request.user_id, thread_id)
+    # 本轮实际应答的 Agent：先解析出来写进用户消息，历史回放时按轮展示。
+    turn_agent_id = await _resolve_agent_id(
+        request.user_id, thread_id, getattr(request, "agent_id", None)
+    )
     # 任务流路由：命中则把流程规范注入用户消息，仍由主 Agent 图执行。
     flow_turn = await _prepare_flow_turn(request)
     if flow_turn is not None:
         agent_input = {
-            "messages": _flow_messages(flow_turn, request.message),
+            "messages": _flow_messages(flow_turn, request.message, turn_agent_id),
             "task_flow": flow_turn.state,
         }
     else:
@@ -1938,6 +1949,8 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     # 用户发送时刻就是这条消息的时间属性，供后续轮次回看。
                     additional_kwargs={
                         MESSAGE_TIME_KEY: now_iso(),
+                        # 本轮应答的 Agent 落 checkpoint，历史回放按轮展示头像与名称。
+                        "agent_id": turn_agent_id,
                         **({"attachments": attachments_meta} if attachments_meta else {}),
                     },
                 )

@@ -178,6 +178,18 @@ html.dark {
   color: var(--text-3);
 }
 
+/* 聊天输入框：外层 .composer-shell 已经有单框描边，
+   内层文本域不再重复画边，悬停 / 聚焦也不出现第二层边框。 */
+.composer-shell .el-textarea__inner,
+.composer-shell .el-textarea__inner:hover,
+.composer-shell .el-textarea__inner:focus,
+.composer-shell .el-textarea.is-disabled .el-textarea__inner {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
 .el-input.is-disabled .el-input__wrapper,
 .el-textarea.is-disabled .el-textarea__inner,
 .el-select.is-disabled .el-select__wrapper {

@@ -17,6 +17,8 @@ export interface HistoryMessage {
   created_at?: string
   // 用户消息随消息发送的附件元信息；旧会话没有该字段。
   attachments?: ContextFile[]
+  // 本轮应答的 Agent id；旧会话没有该字段，前端回落到当前选择。
+  agent_id?: string
 }
 
 export interface HistorySessionUsage {
@@ -54,6 +56,7 @@ export function mapHistoryMessages(data: HistoryPayload): {
         kind: 'user',
         content: m.content,
         attachments: m.attachments,
+        agentId: m.agent_id,
         at,
       }
     }

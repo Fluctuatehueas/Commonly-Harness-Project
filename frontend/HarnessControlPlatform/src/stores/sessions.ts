@@ -27,6 +27,9 @@ export interface SessionItem {
 // 页面加载时读取当前演示用户；切换用户会整页重载，因此常量始终与身份一致。
 export const USER_ID = currentUserId()
 
+// 每个会话最后选择的 Agent 记在本地：切走再切回、重启程序后都能恢复。
+const AGENT_KEY_PREFIX = 'harness.session.agent.'
+
 export const useSessionStore = defineStore('sessions', () => {
   const sessions = ref<SessionItem[]>([])
   const archivedSessions = ref<SessionItem[]>([])
@@ -264,6 +267,12 @@ export const useSessionStore = defineStore('sessions', () => {
         (s) => s.thread_id !== threadId,
       )
       if (activeThreadId.value === threadId) activeThreadId.value = null
+      // 会话已删除：一并清掉本地记住的 Agent，避免同 ID 复用时串用。
+      try {
+        localStorage.removeItem(`${AGENT_KEY_PREFIX}${threadId}`)
+      } catch {
+        // 忽略存储异常
+      }
       return true
     } catch {
       /* 离线时静默 */
@@ -282,6 +291,34 @@ export const useSessionStore = defineStore('sessions', () => {
     if (!target) return
     target.agent_id = agentId || null
     target.group_id = groupId || null
+  }
+
+  /**
+   * 记住某个会话最后选择的 Agent（内存索引 + 本地存储）。
+   *
+   * 用户只是切换下拉、还没发消息时后端索引仍是旧值，这里先把选择落到本地，
+   * 切走再切回、甚至重启程序后都能恢复同一个 Agent。
+   */
+  function rememberAgent(threadId: string, agentId: string) {
+    const target = sessions.value.find((item) => item.thread_id === threadId)
+    if (target) target.agent_id = agentId || null
+    try {
+      if (agentId) localStorage.setItem(`${AGENT_KEY_PREFIX}${threadId}`, agentId)
+      else localStorage.removeItem(`${AGENT_KEY_PREFIX}${threadId}`)
+    } catch {
+      // 本地存储不可用时只保留内存索引
+    }
+  }
+
+  /** 读取会话最后使用的 Agent：本地选择优先，其次后端会话索引。 */
+  function lastAgent(threadId: string): string | null {
+    try {
+      const stored = localStorage.getItem(`${AGENT_KEY_PREFIX}${threadId}`)
+      if (stored) return stored
+    } catch {
+      // 忽略存储异常
+    }
+    return sessions.value.find((item) => item.thread_id === threadId)?.agent_id || null
   }
 
   return {
@@ -306,5 +343,7 @@ export const useSessionStore = defineStore('sessions', () => {
     markRunning,
     markWaiting,
     bindRouting,
+    rememberAgent,
+    lastAgent,
   }
 })

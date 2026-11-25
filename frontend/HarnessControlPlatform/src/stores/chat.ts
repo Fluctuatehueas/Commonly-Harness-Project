@@ -56,6 +56,8 @@ export interface ChatMsg {
   content?: string
   /** 实际发给后端的用户原文：仅附件时与气泡展示文本不同，撤回校验要用它。 */
   sentText?: string
+  /** 本轮应答的 Agent id：用于每轮展示头像与名称，历史回放时由后端回填。 */
+  agentId?: string
   attachments?: ContextFile[]
   streaming?: boolean
   tokens?: MessageTokens
@@ -1581,6 +1583,7 @@ export const useChatStore = defineStore('chat', () => {
       content: trimmed,
       sentText: message,
       attachments,
+      agentId: selectedAgentId.value,
       at: Date.now(),
     }
     state.messages.push(userMsg)

@@ -5,17 +5,14 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { InputInstance } from 'element-plus'
 import {
   ArrowDown,
+  ArrowUpBold,
   Check,
   Close,
   CopyDocument,
   Document,
-  Flag,
   Link,
-  Paperclip,
   Picture,
   Plus,
-  Promotion,
-  VideoPause,
 } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
@@ -29,6 +26,7 @@ import MediaViewer from '@/components/chat/MediaViewer.vue'
 import FileTypeIcon from '@/components/chat/FileTypeIcon.vue'
 import ProducedFilesCard from '@/components/chat/ProducedFilesCard.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
+import CurrentAgentPicker from '@/components/chat/CurrentAgentPicker.vue'
 import {
   TRAJECTORY_REGISTRY,
   type TrajectoryRegistry,
@@ -79,19 +77,26 @@ let disposeDesktopSession: (() => void) | undefined
 const trajectoryRegistry: TrajectoryRegistry = new Map()
 provide(TRAJECTORY_REGISTRY, trajectoryRegistry)
 
-// Agent 下拉项：补上头像与所属组的组标（队长组带小旗帜）。
-// 组信息以 /agent-groups 为准，/agents 列表不返回组籍。
-const agentOptions = computed(() =>
-  agents.options.map((opt) => ({
-    ...opt,
-    avatar: agents.byId(opt.value)?.avatar || '',
-    groups: agents.groupsOf(opt.value).map((group) => ({
-      group_id: group.group_id,
-      name: group.name,
-      role: group.leader_agent_id === opt.value ? ('leader' as const) : ('member' as const),
-    })),
-  })),
-)
+// 每轮答复者：优先用该轮发送时绑定的 Agent，旧数据回落到当前选择。
+// 这样同一会话里先 A 后 B 时，第一轮仍然显示 A 的头像与名称。
+function turnAgent(turn: TurnView): {
+  id: string
+  name: string
+  role: string
+  initial: string
+  gradient: string
+} {
+  const id = turn.user?.agentId || chat.selectedAgentId || 'default'
+  const profile = agents.byId(id)
+  const name = profile?.name || '默认智能体'
+  return {
+    id,
+    name,
+    role: profile?.role_title || '',
+    initial: avatarInitial(name, profile?.avatar || ''),
+    gradient: avatarGradient(id),
+  }
+}
 
 // 当前 Agent 可用的组；只有组长组能作为会话入口（组员由组长委派）。
 const groupOptions = computed(() =>
@@ -122,7 +127,11 @@ function syncGroupForAgent() {
 
 watch(
   () => chat.selectedAgentId,
-  () => syncGroupForAgent(),
+  (agentId) => {
+    syncGroupForAgent()
+    // 记住该会话最后选择的 Agent：即使还没发消息，切走再切回也保持同一个。
+    if (agentId && chat.threadId) sessions.rememberAgent(chat.threadId, agentId)
+  },
 )
 
 // 组列表异步到达后补一次校验：会话绑定的组可能属于别的 Agent。
@@ -177,6 +186,8 @@ const uploadError = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
 // 附件来源下拉：文件 / 图片 / 网络链接
 const attachMenu = ref(false)
+// 输入框左下「工具」弹层：思考模式 / 联网搜索
+const modeMenu = ref(false)
 const fileAccept = ref('')
 const urlMode = ref(false)
 const urlDraft = ref('')
@@ -616,7 +627,9 @@ async function selectSession(threadId: string) {
   chat.activateThread(threadId)
   // 会话绑定的 Agent 回填到选择器，避免跨会话串用员工。
   const bound = sessions.sessions.find((item) => item.thread_id === threadId)
-  chat.selectedAgentId = bound?.agent_id || agents.defaultAgentId || 'default'
+  // 恢复该会话上次使用的 Agent：本地选择优先，其次后端绑定，最后才回落默认。
+  chat.selectedAgentId =
+    sessions.lastAgent(threadId) || bound?.agent_id || agents.defaultAgentId || 'default'
   // 组随会话恢复；该会话没绑定过组就保持「无组」，不自动推断。
   chat.selectedGroupId = bound?.group_id || ''
   syncGroupForAgent()
@@ -1785,122 +1798,6 @@ async function submit() {
       />
 
       <section class="panel chat">
-        <header class="chat-head">
-          <div class="title">
-            <span class="title-icon"><AppIcon name="message" :size="14" /></span>
-            <div>
-              <strong>对话</strong>
-              <small>推理 / 工具轨迹树 · SSE 流式 · HITL 人工介入</small>
-            </div>
-          </div>
-          <div class="controls">
-            <el-select
-              v-model="chat.selectedAgentId"
-              class="agent-select holo-select holo-select--agent"
-              popper-class="holo-popper"
-              size="small"
-              placeholder="选择 Agent"
-              :disabled="archivedActive"
-            >
-              <el-option
-                v-for="opt in agentOptions"
-                :key="opt.value"
-                :label="opt.label"
-                :value="opt.value"
-              >
-                <div class="agent-option">
-                  <span
-                    class="agent-option-avatar"
-                    :style="{ background: avatarGradient(opt.value) }"
-                  >
-                    {{ avatarInitial(opt.label, opt.avatar) }}
-                  </span>
-                  <span class="agent-option-main">
-                    <strong>{{ opt.label }}</strong>
-                    <small>{{ opt.role }}</small>
-                  </span>
-                  <span v-if="opt.groups.length" class="agent-option-groups">
-                    <HoloTooltip
-                      v-for="group in opt.groups"
-                      :key="group.group_id"
-                      :title="group.name"
-                      :content="`角色：${group.role === 'leader' ? '组长' : '组员'}`"
-                      placement="left"
-                      :width="200"
-                    >
-                      <span
-                        class="group-badge"
-                        :style="{ background: avatarGradient(group.group_id) }"
-                      >
-                        {{ avatarInitial(group.name) }}
-                        <i v-if="group.role === 'leader'" class="group-badge-flag">
-                          <el-icon><Flag /></el-icon>
-                        </i>
-                      </span>
-                    </HoloTooltip>
-                  </span>
-                </div>
-              </el-option>
-            </el-select>
-            <el-select
-              v-if="groupOptions.length"
-              v-model="chat.selectedGroupId"
-              class="agent-select holo-select holo-select--group"
-              popper-class="holo-popper"
-              size="small"
-              placeholder="独立执行（不使用组）"
-              :disabled="archivedActive"
-            >
-              <el-option label="独立执行（不使用组）" value="">
-                <div class="agent-option">
-                  <span class="agent-option-avatar agent-option-avatar--none">—</span>
-                  <span class="agent-option-main">
-                    <strong>独立执行</strong>
-                    <small>不使用组</small>
-                  </span>
-                </div>
-              </el-option>
-              <el-option
-                v-for="opt in groupOptions"
-                :key="opt.value"
-                :label="opt.label"
-                :value="opt.value"
-              >
-                <div class="agent-option">
-                  <HoloTooltip
-                    :title="opt.name"
-                    :content="`角色：${opt.role}`"
-                    placement="left"
-                    :width="200"
-                  >
-                    <span
-                      class="group-badge group-badge--lg"
-                      :style="{ background: avatarGradient(opt.value) }"
-                    >
-                      {{ avatarInitial(opt.name) }}
-                      <i v-if="opt.isLeader" class="group-badge-flag">
-                        <el-icon><Flag /></el-icon>
-                      </i>
-                    </span>
-                  </HoloTooltip>
-                  <span class="agent-option-main">
-                    <strong>{{ opt.name }}</strong>
-                    <small>{{ opt.role }}</small>
-                  </span>
-                </div>
-              </el-option>
-            </el-select>
-            <span v-if="archivedActive" class="chip archived-chip">归档只读</span>
-            <span v-if="chat.threadId" class="chip">thread {{ chat.threadId.slice(0, 8) }}…</span>
-            <el-button size="small" :icon="Document" @click="showFiles = !showFiles">
-              文件
-            </el-button>
-            <el-button size="small" :icon="Plus" @click="createSession()">
-              新会话
-            </el-button>
-          </div>
-        </header>
-
         <div v-if="sandboxNotice && !sandboxBannerClosed" class="sandbox-warn">
           <AppIcon name="shield" :size="13" />
           <span class="warn-text">{{ sandboxNotice }}</span>
@@ -2061,8 +1958,20 @@ async function submit() {
 
               <!-- 任务流执行卡片已移到滚动区顶部常驻，这里不再内联渲染 -->
 
+              <!-- 本轮答复者：头像 + 智能体名称单独一行，轨迹与回答都在其下 -->
+              <div v-if="turn.final || turn.process.length || turn.live || turn.interrupt" class="row agent-row">
+                <span
+                  class="agent-avatar"
+                  :style="{ background: turnAgent(turn).gradient }"
+                >
+                  {{ turnAgent(turn).initial }}
+                </span>
+                <strong class="agent-name">{{ turnAgent(turn).name }}</strong>
+                <span v-if="turnAgent(turn).role" class="agent-role">{{ turnAgent(turn).role }}</span>
+              </div>
+
               <!-- 轨迹永远在正式回答之上：树状展开，结束后自动折叠 -->
-              <div v-if="turn.process.length || turn.live" class="row indent tree-row">
+              <div v-if="turn.process.length || turn.live" class="row tree-row">
                 <div class="tree-col">
                   <TrajectoryTree
                     :items="turn.process"
@@ -2076,7 +1985,7 @@ async function submit() {
               <div
                 v-for="card in archivedCards(turn)"
                 :key="card.id"
-                class="row indent tree-row"
+                class="row tree-row"
               >
                 <div class="tree-col">
                   <ExecutionCard
@@ -2107,7 +2016,6 @@ async function submit() {
               </div>
 
               <div v-if="turn.final" class="row">
-                <div class="avatar ai">AI</div>
                 <div class="msg-col ai">
                   <div class="bubble ai-bubble">
                     <MarkdownView
@@ -2200,7 +2108,7 @@ async function submit() {
                 </div>
               </div>
 
-              <div v-if="turn.interrupt" class="row indent">
+              <div v-if="turn.interrupt" class="row">
                 <InterruptCard :msg="turn.interrupt" :readonly="archivedActive" />
               </div>
 
@@ -2257,67 +2165,10 @@ async function submit() {
           <!-- 后台任务栏：默认收起，展开后可查看并终止当前会话的后台调度 -->
           <BackgroundTasksBar />
 
-          <!-- 发送框顶部：快速切换后端的思考模式与联网搜索 -->
-          <div class="input-head">
-            <div class="mode-toggles">
-              <span
-                class="mode-toggle"
-                :class="{ on: settings.thinking, disabled: settingsDisabled }"
-                :title="'开启后模型返回推理过程，前端在轨迹树里流式展示'"
-              >
-                <AppIcon name="sparkles" :size="12" />
-                <span>思考模式</span>
-                <el-switch
-                  :model-value="settings.thinking"
-                  size="small"
-                  :disabled="settingsDisabled"
-                  @update:model-value="(v: string | number | boolean) => toggleThinking(v === true)"
-                />
-              </span>
-              <span
-                class="mode-toggle"
-                :class="{ on: settings.webSearch, disabled: settingsDisabled }"
-                :title="'开启后 Agent 可调用 search_web / fetch_web，关闭时后端不再绑定搜索工具'"
-              >
-                <AppIcon name="globe" :size="12" />
-                <span>联网搜索</span>
-                <el-switch
-                  :model-value="settings.webSearch"
-                  size="small"
-                  :disabled="settingsDisabled"
-                  @update:model-value="(v: string | number | boolean) => toggleWebSearch(v === true)"
-                />
-              </span>
-            </div>
-            <span v-if="settingsHint" class="settings-hint">{{ settingsHint }}</span>
-          </div>
+          <p v-if="settingsHint" class="settings-hint">{{ settingsHint }}</p>
 
           <CompactionBanner :state="chat.compaction" />
 
-          <div v-if="pendingFiles.length" class="pending-row">
-            <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
-              <button
-                v-if="att.kind === 'image' && attachmentSrc(att)"
-                class="att-thumb"
-                type="button"
-                :title="`查看 ${att.name}`"
-                @click="openImagePreview(attachmentSrc(att), att.name)"
-              >
-                <img :src="attachmentSrc(att)" :alt="att.name" />
-              </button>
-              <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="22" />
-              <span class="p-name">{{ att.name }}</span>
-              <el-button
-                class="chip-close"
-                :icon="Close"
-                text
-                circle
-                size="small"
-                title="移除"
-                @click="removePending(att.id)"
-              />
-            </span>
-          </div>
           <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
 
           <div v-if="urlMode" class="url-row">
@@ -2349,56 +2200,32 @@ async function submit() {
             />
           </div>
 
-          <div class="input-row" @paste="onClipboardPaste">
-            <div class="attach-wrap">
-              <el-button
-                class="attach"
-                :class="{ active: attachMenu }"
-                size="large"
-                circle
-                :disabled="uploading || chat.sending || chat.compacting"
-                title="添加上下文：文件 / 图片 / 网络链接"
-                @click="attachMenu = !attachMenu"
-              >
-                <span v-if="uploading" class="attach-spin"></span>
-                <el-icon v-else><Paperclip /></el-icon>
-              </el-button>
-              <Transition name="pop">
-                <div v-if="attachMenu" class="attach-menu">
-                  <button class="attach-item" type="button" @click="pickAttach('file')">
-                    <span class="ai-icon"><el-icon><Document /></el-icon></span>
-                    <span class="ai-text">
-                      <span class="ai-label">文件</span>
-                      <small>文档 / 文本</small>
-                    </span>
-                  </button>
-                  <button class="attach-item" type="button" @click="pickAttach('image')">
-                    <span class="ai-icon"><el-icon><Picture /></el-icon></span>
-                    <span class="ai-text">
-                      <span class="ai-label">图片</span>
-                      <small>随消息多模态发送</small>
-                    </span>
-                  </button>
-                  <button class="attach-item" type="button" @click="openUrlMode">
-                    <span class="ai-icon"><el-icon><Link /></el-icon></span>
-                    <span class="ai-text">
-                      <span class="ai-label">网络链接</span>
-                      <small>抓取网页正文</small>
-                    </span>
-                  </button>
-                </div>
-              </Transition>
+          <div class="composer-shell" @paste="onClipboardPaste">
+            <div v-if="pendingFiles.length" class="pending-row">
+              <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
+                <button
+                  v-if="att.kind === 'image' && attachmentSrc(att)"
+                  class="att-thumb"
+                  type="button"
+                  :title="`查看 ${att.name}`"
+                  @click="openImagePreview(attachmentSrc(att), att.name)"
+                >
+                  <img :src="attachmentSrc(att)" :alt="att.name" />
+                </button>
+                <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="22" />
+                <span class="p-name">{{ att.name }}</span>
+                <el-button
+                  class="chip-close"
+                  :icon="Close"
+                  text
+                  circle
+                  size="small"
+                  title="移除"
+                  @click="removePending(att.id)"
+                />
+              </span>
             </div>
-            <div v-if="attachMenu" class="menu-mask" @click="attachMenu = false"></div>
-            <!-- 原生文件选择框无法用组件替代，继续隐藏后由按钮触发 -->
-            <input
-              ref="fileInput"
-              class="file-input"
-              type="file"
-              multiple
-              :accept="fileAccept || formats.accept"
-              @change="onFilesPicked"
-            />
+
             <el-input
               ref="inputEl"
               v-model="draft"
@@ -2406,27 +2233,142 @@ async function submit() {
               type="textarea"
               :autosize="{ minRows: 1, maxRows: 6 }"
               resize="none"
-              placeholder="输入消息，可附图片/文档/网页链接；Enter 发送 / Shift+Enter 换行"
+              placeholder="输入消息，可附图片 / 文档 / 网页链接；Enter 发送"
               :disabled="chat.sending || chat.compacting"
               @keydown.enter.exact.prevent="submit"
             />
-            <el-button
-              v-if="chat.sending"
-              class="stop holo-send-btn is-stop"
-              :icon="VideoPause"
-              size="large"
-              title="中止"
-              @click="chat.stop()"
-            />
-            <el-button
-              v-else
-              class="send holo-send-btn"
-              :icon="Promotion"
-              size="large"
-              title="发送"
-              :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
-              @click="submit"
-            />
+
+            <div class="composer-tools">
+              <div class="attach-wrap">
+                <button
+                  class="composer-tool"
+                  :class="{ active: attachMenu }"
+                  type="button"
+                  :disabled="uploading || chat.sending || chat.compacting"
+                  title="添加上下文：文件 / 图片 / 网络链接"
+                  @click="attachMenu = !attachMenu"
+                >
+                  <span v-if="uploading" class="attach-spin"></span>
+                  <el-icon v-else><Plus /></el-icon>
+                </button>
+                <div v-if="attachMenu" class="menu-mask" @click="attachMenu = false"></div>
+                <Transition name="pop">
+                  <div v-if="attachMenu" class="attach-menu">
+                    <button class="attach-item" type="button" @click="pickAttach('file')">
+                      <span class="ai-icon"><el-icon><Document /></el-icon></span>
+                      <span class="ai-text">
+                        <span class="ai-label">文件</span>
+                        <small>文档 / 文本</small>
+                      </span>
+                    </button>
+                    <button class="attach-item" type="button" @click="pickAttach('image')">
+                      <span class="ai-icon"><el-icon><Picture /></el-icon></span>
+                      <span class="ai-text">
+                        <span class="ai-label">图片</span>
+                        <small>随消息多模态发送</small>
+                      </span>
+                    </button>
+                    <button class="attach-item" type="button" @click="openUrlMode">
+                      <span class="ai-icon"><el-icon><Link /></el-icon></span>
+                      <span class="ai-text">
+                        <span class="ai-label">网络链接</span>
+                        <small>抓取网页正文</small>
+                      </span>
+                    </button>
+                  </div>
+                </Transition>
+              </div>
+
+              <!-- 原生文件选择框无法用组件替代，继续隐藏后由按钮触发 -->
+              <input
+                ref="fileInput"
+                class="file-input"
+                type="file"
+                multiple
+                :accept="fileAccept || formats.accept"
+                @change="onFilesPicked"
+              />
+
+              <!-- 思考 / 联网开关收进「工具」弹层，保持输入框单框布局 -->
+              <div class="composer-pop-wrap">
+                <button
+                  class="composer-pill"
+                  :class="{ open: modeMenu, on: settings.thinking || settings.webSearch }"
+                  type="button"
+                  title="思考模式 / 联网搜索"
+                  @click="modeMenu = !modeMenu"
+                >
+                  <AppIcon name="sliders" :size="12" />
+                  <span>工具</span>
+                </button>
+                <div v-if="modeMenu" class="composer-pop-mask" @click="modeMenu = false"></div>
+                <Transition name="pop">
+                  <div v-if="modeMenu" class="composer-pop">
+                    <label class="composer-pop-row" :title="'开启后模型返回推理过程，前端在轨迹树里流式展示'">
+                      <span class="composer-pop-label">
+                        <AppIcon name="sparkles" :size="12" />
+                        思考模式
+                      </span>
+                      <el-switch
+                        :model-value="settings.thinking"
+                        size="small"
+                        :disabled="settingsDisabled"
+                        @update:model-value="(v: string | number | boolean) => toggleThinking(v === true)"
+                      />
+                    </label>
+                    <label class="composer-pop-row" :title="'开启后 Agent 可调用 search_web / fetch_web，关闭时后端不再绑定搜索工具'">
+                      <span class="composer-pop-label">
+                        <AppIcon name="globe" :size="12" />
+                        联网搜索
+                      </span>
+                      <el-switch
+                        :model-value="settings.webSearch"
+                        size="small"
+                        :disabled="settingsDisabled"
+                        @update:model-value="(v: string | number | boolean) => toggleWebSearch(v === true)"
+                      />
+                    </label>
+                  </div>
+                </Transition>
+              </div>
+
+              <!-- 智能体 / 组选择：收进「当前智能体」面板，不再占用页面顶部 -->
+              <CurrentAgentPicker :disabled="archivedActive" />
+
+              <!-- 会话文件抽屉入口：与工具 / 当前智能体同行，独立一个按钮 -->
+              <button
+                class="composer-pill"
+                :class="{ open: showFiles }"
+                type="button"
+                title="会话文件"
+                @click="showFiles = !showFiles"
+              >
+                <AppIcon name="folder" :size="12" />
+                <span>文件</span>
+              </button>
+
+              <span class="composer-spacer"></span>
+              <span class="composer-hint">Enter 发送</span>
+              <button
+                v-if="chat.sending"
+                class="composer-send is-stop"
+                type="button"
+                title="中止"
+                @click="chat.stop()"
+              >
+                <span class="stop-square"></span>
+              </button>
+              <button
+                v-else
+                class="composer-send"
+                type="button"
+                title="发送"
+                :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
+                @click="submit"
+              >
+                <el-icon><ArrowUpBold /></el-icon>
+              </button>
+            </div>
           </div>
 
           <!-- 本会话累计消耗 + 本轮输入/输出 + 上下文窗口圆环 -->
@@ -2547,313 +2489,6 @@ async function submit() {
   background: transparent;
 }
 
-.chat-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 11px 18px;
-  border-bottom: 1px solid var(--line);
-  background: transparent;
-}
-
-.title {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-
-.title-icon {
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  color: var(--accent-cyan);
-  background: transparent;
-}
-
-.title strong {
-  display: block;
-  font-size: 14px;
-  letter-spacing: -0.01em;
-}
-
-.title small {
-  font-size: 10.5px;
-  color: var(--text-3);
-}
-
-.controls {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-
-.agent-select {
-  width: 168px;
-}
-
-/* ---------- 全息选择器 ----------
-   与青色 HOLO ARCHIVE 面板区分：紫 / 品红棱镜描边、斜向扫描纹、
-   缓慢掠过的高光带，以及单侧斜切的玻璃底。 */
-.holo-select {
-  --holo-a: rgba(167, 139, 250, 0.9);
-  --holo-b: rgba(244, 114, 182, 0.7);
-  --holo-c: rgba(96, 165, 250, 0.55);
-}
-
-.holo-select :deep(.el-select__wrapper) {
-  position: relative;
-  overflow: hidden;
-  min-height: 30px;
-  padding: 0 26px 0 11px;
-  border: 1px solid transparent;
-  border-radius: 7px 2px 7px 2px;
-  background:
-    linear-gradient(135deg, rgba(31, 18, 56, 0.9), rgba(11, 9, 26, 0.94)) padding-box,
-    linear-gradient(118deg, var(--holo-a), var(--holo-b) 46%, var(--holo-c)) border-box;
-  box-shadow:
-    inset 0 0 18px rgba(167, 139, 250, 0.14),
-    0 0 0 1px rgba(6, 5, 16, 0.55);
-  backdrop-filter: blur(12px);
-  transition: box-shadow 0.24s ease;
-}
-
-.holo-select :deep(.el-select__wrapper)::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(
-    116deg,
-    rgba(226, 214, 255, 0.055) 0 1px,
-    transparent 1px 6px
-  );
-  pointer-events: none;
-}
-
-.holo-select :deep(.el-select__wrapper)::after {
-  content: '';
-  position: absolute;
-  top: -70%;
-  left: -45%;
-  width: 38%;
-  height: 240%;
-  background: linear-gradient(90deg, transparent, rgba(244, 114, 182, 0.26), transparent);
-  transform: rotate(14deg);
-  animation: holo-sheen 5.2s ease-in-out infinite;
-  pointer-events: none;
-}
-
-@keyframes holo-sheen {
-  0%,
-  100% {
-    left: -45%;
-    opacity: 0;
-  }
-  18% {
-    opacity: 1;
-  }
-  60% {
-    left: 105%;
-    opacity: 1;
-  }
-  78% {
-    opacity: 0;
-  }
-}
-
-.holo-select :deep(.el-select__wrapper.is-hovering),
-.holo-select :deep(.el-select__wrapper.is-focused) {
-  box-shadow:
-    inset 0 0 26px rgba(244, 114, 182, 0.2),
-    0 0 16px rgba(167, 139, 250, 0.34);
-}
-
-.holo-select :deep(.el-select__selection),
-.holo-select :deep(.el-select__suffix) {
-  position: relative;
-  z-index: 1;
-}
-
-.holo-select :deep(.el-select__placeholder),
-.holo-select :deep(.el-select__selected-item) {
-  color: #ece6ff;
-  font-size: 11.5px;
-  letter-spacing: 0.02em;
-}
-
-.holo-select :deep(.el-select__placeholder.is-transparent) {
-  color: rgba(196, 181, 253, 0.62);
-}
-
-.holo-select :deep(.el-select__caret) {
-  color: #c4b5fd;
-  transition: transform 0.24s ease;
-}
-
-.holo-select :deep(.el-select__wrapper.is-focused) .el-select__caret {
-  transform: rotate(180deg);
-}
-
-/* 组选择器走暖调：琥珀 → 品红，和冷紫的 Agent 选择器区分。 */
-.holo-select--group {
-  --holo-a: rgba(251, 191, 36, 0.85);
-  --holo-b: rgba(244, 114, 182, 0.8);
-  --holo-c: rgba(167, 139, 250, 0.5);
-}
-
-.holo-select--group :deep(.el-select__wrapper) {
-  background:
-    linear-gradient(135deg, rgba(54, 28, 42, 0.9), rgba(14, 9, 24, 0.94)) padding-box,
-    linear-gradient(118deg, var(--holo-a), var(--holo-b) 46%, var(--holo-c)) border-box;
-  box-shadow:
-    inset 0 0 18px rgba(251, 191, 36, 0.12),
-    0 0 0 1px rgba(6, 5, 16, 0.55);
-}
-
-/* 下拉层 teleport 到 body，必须用全局选择器命中 popper-class。 */
-:global(.holo-popper) {
-  overflow: hidden;
-  border: 1px solid rgba(167, 139, 250, 0.42);
-  border-radius: 8px 2px 8px 2px;
-  background:
-    repeating-linear-gradient(
-      116deg,
-      rgba(226, 214, 255, 0.04) 0 1px,
-      transparent 1px 6px
-    ),
-    linear-gradient(160deg, rgba(24, 15, 44, 0.98), rgba(9, 8, 20, 0.98));
-  box-shadow:
-    0 18px 46px rgba(0, 0, 0, 0.62),
-    0 0 26px rgba(167, 139, 250, 0.2);
-  backdrop-filter: blur(14px);
-}
-
-:global(.holo-popper .el-select-dropdown__item) {
-  color: #cfc7ea;
-  font-size: 11.5px;
-}
-
-:global(.holo-popper .el-select-dropdown__item.is-hovering) {
-  background: linear-gradient(90deg, rgba(167, 139, 250, 0.16), rgba(244, 114, 182, 0.1));
-  color: #f5efff;
-}
-
-:global(.holo-popper .el-select-dropdown__item.is-selected) {
-  color: #f0abfc;
-  font-weight: 500;
-}
-
-:global(.holo-popper .el-popper__arrow::before) {
-  border-color: rgba(167, 139, 250, 0.42);
-  background: rgba(24, 15, 44, 0.98);
-}
-
-/* Agent / 组下拉项：头像 + 名称 + 所属组组标（队长组右下角带小旗帜） */
-.agent-option {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 34px;
-  line-height: 1.2;
-}
-
-.agent-option-avatar {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: 22px;
-  height: 22px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-  color: #041018;
-  border-radius: 50%;
-}
-
-.agent-option-avatar--none {
-  color: var(--text-3);
-  background: transparent;
-  border: 1px dashed var(--line);
-}
-
-.agent-option-main {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-
-.agent-option-main strong {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-1);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-option-main small {
-  flex: none;
-  font-size: 10px;
-  color: var(--text-3);
-}
-
-.agent-option-groups {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: none;
-}
-
-.group-badge {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  color: #041018;
-  border-radius: 6px;
-}
-
-.group-badge--lg {
-  width: 32px;
-  height: 32px;
-  font-size: 12px;
-  border-radius: 7px;
-}
-
-.group-badge-flag {
-  position: absolute;
-  right: -3px;
-  bottom: -3px;
-  display: grid;
-  place-items: center;
-  width: 11px;
-  height: 11px;
-  font-size: 7px;
-  font-style: normal;
-  color: #f6c85f;
-  border-radius: 50%;
-  background: #0b1622;
-}
-
-/* Element Plus 给相邻按钮默认加重叠边距，这里统一交给 flex gap */
-.controls .el-button + .el-button,
-.url-row .el-button + .el-button {
-  margin-left: 0;
-}
-
-.controls .el-button {
-  flex: none;
-}
-
 .status-chip {
   display: inline-flex;
   align-items: center;
@@ -2891,23 +2526,6 @@ async function submit() {
 
 .status-chip.checking {
   color: var(--text-3);
-}
-
-.chip {
-  flex: none;
-  padding: 3px 8px;
-  font-size: 10px;
-  white-space: nowrap;
-  color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-}
-
-.chip.archived-chip {
-  color: var(--amber);
-  border-color: rgba(255, 182, 72, 0.4);
-  background: rgba(255, 182, 72, 0.08);
 }
 
 .messages-wrap {
@@ -3257,30 +2875,39 @@ async function submit() {
   justify-content: flex-end;
 }
 
-.row.indent {
-  padding-left: 40px;
-}
-
 .row.center {
   justify-content: center;
 }
 
-.avatar {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  flex: none;
+/* 本轮答复者标识：头像 + 名称 + 角色，独占一行，正文与轨迹都在其下 */
+.agent-row {
+  align-items: center;
+  gap: 8px;
+  padding-left: 2px;
 }
 
-.avatar.ai {
-  color: var(--accent-cyan);
-  border: 1px solid var(--line-strong);
-  background: transparent;
+.agent-avatar {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: #041018;
+  border-radius: 50%;
+}
+
+.agent-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.agent-role {
+  font-size: 10.5px;
+  color: var(--text-3);
 }
 
 .bubble {
@@ -3389,6 +3016,9 @@ async function submit() {
   align-items: center;
   justify-content: center;
   gap: 10px;
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto;
   padding: 0 2px;
 }
 
@@ -3531,9 +3161,9 @@ async function submit() {
   color: var(--text-3);
 }
 
-/* 终止原因：与 AI 气泡左边缘对齐的一行状态条 */
+/* 终止原因：贴在回答下方的一行状态条 */
 .terminate-row {
-  padding-left: 38px;
+  padding-left: 2px;
 }
 
 .terminate-line {
@@ -3607,9 +3237,24 @@ async function submit() {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 10px 16px 12px;
   border-top: 1px solid var(--line);
   background: transparent;
+}
+
+/* 输入框按 Claude 桌面端的阅读宽度居中，窗口很宽时不会被拉得过长 */
+.input-bar > .composer-shell {
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto;
+}
+
+/* 输入框下方的提示与用量同理居中 */
+.input-bar > .settings-hint,
+.input-bar > .upload-error {
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto;
 }
 
 /* 归档会话的只读底栏：替代输入框，避免误以为还能继续对话 */
@@ -3651,46 +3296,6 @@ async function submit() {
   background: rgba(55, 208, 196, 0.1);
 }
 
-/* 发送框顶部：思考模式 / 联网搜索快速开关 */
-.input-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  min-height: 26px;
-}
-
-.mode-toggles {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-
-.mode-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11.5px;
-  color: var(--text-3);
-  white-space: nowrap;
-  transition: color 0.18s;
-}
-
-.mode-toggle :deep(svg) {
-  color: var(--text-3);
-  transition: color 0.18s;
-}
-
-.mode-toggle.on,
-.mode-toggle.on :deep(svg) {
-  color: var(--accent-cyan);
-}
-
-.mode-toggle.disabled {
-  opacity: 0.55;
-}
-
 .settings-hint {
   min-width: 0;
   overflow: hidden;
@@ -3700,50 +3305,15 @@ async function submit() {
   white-space: nowrap;
 }
 
-.input-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-}
-
 /* 附件选择：原生 input 隐藏，按钮触发 */
 .file-input {
   display: none;
-}
-
-.attach.el-button {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  flex: none;
-  margin-left: 0;
-  font-size: 16px;
-  color: var(--text-2);
-  border-color: var(--line-strong);
-}
-
-/* 圆形按钮内部可能出现的空白插槽包裹层，统一居中 */
-.attach.el-button > span {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  line-height: 1;
 }
 
 /* 附件下拉容器：菜单向上弹出，避免遮挡输入框 */
 .attach-wrap {
   position: relative;
   flex: none;
-}
-
-.attach.el-button.active {
-  color: var(--accent-cyan);
-  border-color: var(--accent);
-  background: var(--bg-hover);
 }
 
 .attach-menu {
@@ -3855,6 +3425,11 @@ async function submit() {
   padding: 0 4px;
 }
 
+/* Element Plus 给相邻按钮默认加重叠边距，这里统一交给 flex gap */
+.url-row .el-button + .el-button {
+  margin-left: 0;
+}
+
 .pop-enter-active,
 .pop-leave-active {
   transition: all 0.16s ease;
@@ -3866,22 +3441,10 @@ async function submit() {
   transform: translateY(6px) scale(0.97);
 }
 
-.attach:hover:not(:disabled) {
-  color: var(--accent-cyan);
-  border-color: var(--accent);
-  background: var(--bg-hover);
-}
-
-.attach:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
 .attach-spin {
-  position: absolute;
-  width: 34px;
-  height: 34px;
-  border: 2px solid transparent;
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid rgba(160, 240, 255, 0.25);
   border-top-color: var(--accent-cyan);
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
@@ -3895,6 +3458,7 @@ async function submit() {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  padding: 0 2px 4px;
 }
 
 .pending-chip {
@@ -3993,43 +3557,6 @@ async function submit() {
   height: 26px;
   object-fit: cover;
   border-radius: 4px;
-}
-
-.input-row .chat-input {
-  flex: 1;
-  min-width: 0;
-}
-
-.chat-input :deep(.el-textarea__inner) {
-  min-height: 40px !important;
-  padding: 10px 14px;
-  font-size: 13px;
-  font-family: inherit;
-  line-height: 1.6;
-  color: var(--text-1);
-  border-radius: var(--radius-md);
-  background: var(--bg-deep);
-  resize: none;
-}
-
-.send.el-button,
-.stop.el-button {
-  width: 40px;
-  height: 40px;
-  flex: none;
-  margin-left: 0;
-}
-
-.stop.el-button {
-  border-color: var(--danger);
-  background: var(--danger);
-  color: #fff;
-}
-
-.stop.el-button:hover {
-  border-color: var(--danger);
-  background: rgba(226, 96, 94, 0.82);
-  color: #fff;
 }
 
 .slide-enter-active,

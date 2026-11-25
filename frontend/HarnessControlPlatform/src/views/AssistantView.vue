@@ -4,10 +4,9 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { InputInstance } from 'element-plus'
 import {
+  ArrowUpBold,
   Document,
-  Paperclip,
-  Promotion,
-  VideoPause,
+  Plus,
 } from '@element-plus/icons-vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
@@ -17,6 +16,7 @@ import InterruptCard from '@/components/chat/InterruptCard.vue'
 import FileTypeIcon from '@/components/chat/FileTypeIcon.vue'
 import ProducedFilesCard from '@/components/chat/ProducedFilesCard.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
+import CurrentAgentPicker from '@/components/chat/CurrentAgentPicker.vue'
 import { mapHistoryMessages, type HistoryPayload } from '@/components/chat/history'
 import { useChatStore, type ChatMsg } from '@/stores/chat'
 import { USER_ID, useSessionStore } from '@/stores/sessions'
@@ -24,6 +24,7 @@ import { useDisplayStore } from '@/stores/display'
 import { useFileStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
 import { useAgentStore } from '@/stores/agents'
+import { avatarGradient, avatarInitial } from '@/components/myagent/avatar'
 import { API_BASE } from '@/api/client'
 import {
   deleteContextFile,
@@ -43,6 +44,27 @@ const files = useFileStore()
 const settings = useSettingsStore()
 const agents = useAgentStore()
 
+// 每轮答复者：优先用该轮发送时绑定的 Agent，旧数据回落到当前选择。
+// 这样同一会话里先 A 后 B 时，第一轮仍然显示 A 的头像与名称。
+function turnAgent(turn: TurnView): {
+  id: string
+  name: string
+  role: string
+  initial: string
+  gradient: string
+} {
+  const id = turn.user?.agentId || chat.selectedAgentId || 'default'
+  const profile = agents.byId(id)
+  const name = profile?.name || '默认智能体'
+  return {
+    id,
+    name,
+    role: profile?.role_title || '',
+    initial: avatarInitial(name, profile?.avatar || ''),
+    gradient: avatarGradient(id),
+  }
+}
+
 const LAST_THREAD_KEY = 'harness.chat.lastThread'
 
 function collapsePanel(): void {
@@ -50,6 +72,11 @@ function collapsePanel(): void {
   fileDrawer.value = false
   modesOpen.value = false
   desktop?.collapseAssistant()
+}
+
+/** 刷新窗口：重新挂载页面即会重新请求后端，拿到最新会话与配置。 */
+function refreshPanel(): void {
+  window.location.reload()
 }
 
 // ---------- 抽屉 ----------
@@ -90,7 +117,9 @@ async function openThread(threadId: string): Promise<void> {
   sessions.activeThreadId = threadId
   chat.activateThread(threadId)
   const bound = sessions.sessions.find((item) => item.thread_id === threadId)
-  chat.selectedAgentId = bound?.agent_id || agents.defaultAgentId || 'default'
+  // 恢复该会话上次使用的 Agent：本地选择优先，其次后端绑定，最后才回落默认。
+  chat.selectedAgentId =
+    sessions.lastAgent(threadId) || bound?.agent_id || agents.defaultAgentId || 'default'
   chat.selectedGroupId = bound?.group_id || ''
   void files.prime(threadId)
   void files.loadArtifacts(threadId)
@@ -115,6 +144,14 @@ async function openThread(threadId: string): Promise<void> {
   await nextTick()
   scrollBottom()
 }
+
+// 记住该会话最后选择的 Agent：即使还没发消息，切走再切回也保持同一个。
+watch(
+  () => chat.selectedAgentId,
+  (agentId) => {
+    if (agentId && chat.threadId) sessions.rememberAgent(chat.threadId, agentId)
+  },
+)
 
 async function createSession(): Promise<void> {
   const id = await sessions.createSession(
@@ -280,11 +317,44 @@ async function removePending(id: string): Promise<void> {
   await deleteContextFile(id, USER_ID)
 }
 
+// 剪贴板图片的 MIME → 扩展名；后端只接受这几种图片格式。
+const PASTE_IMAGE_EXT: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+}
+
+/** 粘贴板里的图片自动转成附件；只含图片时阻止默认粘贴行为。 */
+function onClipboardPaste(event: ClipboardEvent): void {
+  if (archivedActive.value) return
+  const data = event.clipboardData
+  if (!data) return
+  const items = Array.from(data.items || [])
+  const images = items
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file))
+  if (!images.length) return
+  // 同时带文本时保留文本粘贴，图片额外作为附件加入。
+  const hasText = items.some((item) => item.kind === 'string' && item.type === 'text/plain')
+  if (!hasText) event.preventDefault()
+  if (uploading.value || chat.sending || chat.compacting) return
+  const files = images.map((image, index) => {
+    const mime = image.type || 'image/png'
+    const ext = PASTE_IMAGE_EXT[mime] || '.png'
+    return new File([image], `粘贴图片-${Date.now()}-${index}${ext}`, { type: mime })
+  })
+  void addFiles(files)
+}
+
 // 拖拽整个助手窗体即可追加附件。
 let dragDepth = 0
 const dragging = ref(false)
 
 function onDragEnter(): void {
+  if (archivedActive.value) return
   dragDepth += 1
   dragging.value = true
 }
@@ -297,6 +367,7 @@ function onDragLeave(): void {
 async function onDrop(event: DragEvent): Promise<void> {
   dragDepth = 0
   dragging.value = false
+  if (archivedActive.value) return
   const dropped = Array.from(event.dataTransfer?.files || [])
   await addFiles(dropped)
 }
@@ -318,9 +389,11 @@ function onScroll(): void {
   const el = scroller.value
   if (!el) return
   stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  updateNavActive()
 }
 
 async function submit(): Promise<void> {
+  if (archivedActive.value) return
   if (chat.sending || chat.compacting) return
   if (!draft.value.trim() && pendingFiles.value.length === 0) return
   if (backendOnline.value === false) {
@@ -371,6 +444,19 @@ function toggleWebSearch(value: boolean): void {
 function sendSuggestion(text: string): void {
   draft.value = text
   void submit()
+}
+
+// 归档会话只读：仍可回看聊天记录，但不再向 Agent 发送消息（与对话页一致）。
+const archivedActive = computed(() =>
+  sessions.isArchived(chat.threadId || sessions.activeThreadId),
+)
+
+/** 当前只读的归档会话恢复回侧边栏，输入区随之恢复。 */
+async function restoreActiveSession(): Promise<void> {
+  const threadId = chat.threadId
+  if (!threadId) return
+  await sessions.setArchived(threadId, false)
+  ElMessage.success('已恢复会话')
 }
 
 // ---------- 消息分组 ----------
@@ -466,6 +552,90 @@ const turns = computed<TurnView[]>(() => {
   if (lastTurn && chat.sending) lastTurn.live = true
   return result
 })
+
+// ---------- 右侧轮次导航 ----------
+// 只为包含用户消息的轮次生成刻度：收起是一列刻度，悬停展开为该轮提问。
+interface TurnNavItem {
+  key: string
+  label: string
+}
+
+const turnNav = computed<TurnNavItem[]>(() =>
+  turns.value
+    .filter((turn) => Boolean(turn.user))
+    .map((turn) => ({
+      key: turn.key,
+      label: (turn.user?.content || '').replace(/\s+/g, ' ').trim() || '（附件消息）',
+    })),
+)
+
+const navActive = ref(0)
+const navOpen = ref(false)
+const navList = ref<HTMLElement | null>(null)
+
+function navAnchor(key: string): string {
+  return `data-turn-id="${String(key).replace(/"/g, '')}"`
+}
+
+/** 高亮当前视口顶部所在的轮次；与刻度共用一个索引空间。 */
+function updateNavActive(): void {
+  const el = scroller.value
+  if (!el) return
+  const items = turnNav.value
+  if (!items.length) {
+    navActive.value = 0
+    return
+  }
+  const indexByKey = new Map(items.map((item, index) => [item.key, index]))
+  const base = el.getBoundingClientRect().top
+  let active = 0
+  for (const node of el.querySelectorAll<HTMLElement>('[data-turn-id]')) {
+    const index = indexByKey.get(node.dataset.turnId || '')
+    if (index === undefined) continue
+    // 顶部留 40px 容差：轮次刚滚到视口上沿时就算已切入该轮。
+    if (node.getBoundingClientRect().top - base <= 40) active = index
+  }
+  navActive.value = active
+}
+
+/** 跳转到第 index 个轮次；保持用户阅读位置，不触发自动跟随到底部。 */
+function jumpToTurn(index: number): void {
+  const el = scroller.value
+  const item = turnNav.value[index]
+  if (!el || !item) return
+  const node = el.querySelector<HTMLElement>(`[${navAnchor(item.key)}]`)
+  if (!node) return
+  const top =
+    node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop - 10
+  stickToBottom.value = false
+  navActive.value = index
+  el.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+}
+
+/** 指针停在刻度上滚轮时，把滚动转交给消息区；展开态下让面板自己滚。 */
+function onNavWheel(event: WheelEvent): void {
+  if (navOpen.value) return
+  const el = scroller.value
+  if (!el) return
+  event.preventDefault()
+  el.scrollTop += event.deltaY
+}
+
+/** 展开后把当前轮次滚进面板可视区，避免长会话里看不到高亮项。 */
+async function onNavOpenChange(open: boolean): Promise<void> {
+  if (!open) return
+  await nextTick()
+  const list = navList.value
+  if (!list) return
+  const row = list.querySelector<HTMLElement>(`[data-nav-index="${navActive.value}"]`)
+  if (!row) return
+  const listRect = list.getBoundingClientRect()
+  const rowRect = row.getBoundingClientRect()
+  if (rowRect.top < listRect.top) list.scrollTop -= listRect.top - rowRect.top + 8
+  else if (rowRect.bottom > listRect.bottom) list.scrollTop += rowRect.bottom - listRect.bottom + 8
+}
+
+watch(navOpen, (open) => void onNavOpenChange(open))
 
 function turnDuration(turn: TurnView): number | undefined {
   return turn.user ? chat.turnDurations[turn.user.id] : undefined
@@ -591,6 +761,7 @@ watch(
 onMounted(async () => {
   chat.demoMode = false
   void agents.load()
+  void agents.loadGroups()
   backendOnline.value = await probeHealth()
   if (backendOnline.value) {
     await sessions.refresh()
@@ -638,6 +809,10 @@ onBeforeUnmount(() => {
           @click="sessionDrawer = !sessionDrawer; fileDrawer = false"
         >
           <AppIcon name="list" :size="14" />
+        </button>
+
+        <button class="as-icon" type="button" title="刷新窗口，重新拉取后端数据" @click="refreshPanel">
+          <AppIcon name="refresh" :size="14" />
         </button>
 
         <div class="as-title">
@@ -716,7 +891,10 @@ onBeforeUnmount(() => {
 
         <div
           class="as-messages"
-          :class="{ 'with-pins': Boolean(activeFlow || activeScheduler) }"
+          :class="{
+            'with-pins': Boolean(activeFlow || activeScheduler),
+            'with-nav': turnNav.length > 1,
+          }"
           ref="scroller"
           @scroll.passive="onScroll"
         >
@@ -775,7 +953,7 @@ onBeforeUnmount(() => {
           </div>
 
           <template v-for="turn in turns" :key="turn.key">
-            <div v-if="turn.user" class="as-row user">
+            <div v-if="turn.user" class="as-row user" :data-turn-id="turn.key">
               <div class="bubble user-bubble">
                 <div v-if="turn.user.attachments?.length" class="bubble-atts">
                   <span v-for="att in turn.user.attachments" :key="att.id" class="bubble-att">
@@ -793,6 +971,21 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
+            <!-- 本轮答复者：头像 + 智能体名称单独一行，轨迹与回答都在其下 -->
+            <div
+              v-if="turn.final || turn.process.length || turn.live || turn.interrupt"
+              class="as-row agent-row"
+            >
+              <span
+                class="agent-avatar"
+                :style="{ background: turnAgent(turn).gradient }"
+              >
+                {{ turnAgent(turn).initial }}
+              </span>
+              <strong class="agent-name">{{ turnAgent(turn).name }}</strong>
+              <span v-if="turnAgent(turn).role" class="agent-role">{{ turnAgent(turn).role }}</span>
+            </div>
+
             <div v-if="turn.process.length || turn.live" class="as-row tree-row">
               <TrajectoryTree
                 :items="turn.process"
@@ -802,7 +995,6 @@ onBeforeUnmount(() => {
             </div>
 
             <div v-if="turn.final" class="as-row ai">
-              <div class="ai-avatar">AI</div>
               <div class="ai-col">
                 <div class="bubble ai-bubble">
                   <MarkdownView
@@ -827,7 +1019,7 @@ onBeforeUnmount(() => {
             </div>
 
             <div v-if="turn.interrupt" class="as-row">
-              <InterruptCard :msg="turn.interrupt" />
+              <InterruptCard :msg="turn.interrupt" :readonly="archivedActive" />
             </div>
 
             <div v-for="note in turn.notes" :key="note.id" class="as-row note-row">
@@ -835,81 +1027,55 @@ onBeforeUnmount(() => {
             </div>
           </template>
         </div>
+
+        <!-- 右侧轮次导航：收起时是一列刻度，悬停展开为可读的轮次列表 -->
+        <div
+          v-if="turnNav.length > 1"
+          class="turn-nav"
+          :class="{ open: navOpen }"
+          @mouseenter="navOpen = true"
+          @mouseleave="navOpen = false"
+          @wheel="onNavWheel"
+        >
+          <div ref="navList" class="turn-nav-list">
+            <button
+              v-for="(item, i) in turnNav"
+              :key="item.key"
+              type="button"
+              class="turn-nav-row"
+              :class="{ active: navActive === i }"
+              :data-nav-index="i"
+              :aria-label="`第 ${i + 1} 轮：${item.label}`"
+              :aria-current="navActive === i ? 'true' : undefined"
+              @click="jumpToTurn(i)"
+            >
+              <span class="turn-nav-label">{{ item.label }}</span>
+              <span class="turn-nav-bar"></span>
+            </button>
+          </div>
+        </div>
       </div>
 
-      <footer class="composer">
-        <div class="mode-row">
-          <button
-            class="mode-trigger"
-            type="button"
-            :class="{ open: modesOpen }"
-            @click="modesOpen = !modesOpen"
-          >
-            <AppIcon name="sliders" :size="12" />
-            <span>模式</span>
-            <AppIcon name="chevronRight" :size="9" class="mode-chev" :class="{ open: modesOpen }" />
-          </button>
-          <Transition name="pop">
-            <div v-if="modesOpen" class="mode-checks">
-              <label class="check">
-                <input
-                  type="checkbox"
-                  :checked="settings.thinking"
-                  :disabled="chat.sending || settings.saving"
-                  @change="toggleThinking(($event.target as HTMLInputElement).checked)"
-                />
-                <span>思考模式</span>
-              </label>
-              <label class="check">
-                <input
-                  type="checkbox"
-                  :checked="settings.webSearch"
-                  :disabled="chat.sending || settings.saving"
-                  @change="toggleWebSearch(($event.target as HTMLInputElement).checked)"
-                />
-                <span>联网搜索</span>
-              </label>
-            </div>
-          </Transition>
-          <span class="composer-hint">Enter 发送 / Shift+Enter 换行</span>
-        </div>
-
-        <div v-if="pendingFiles.length" class="pending-row">
-          <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
-            <img
-              v-if="att.kind === 'image' && attachmentSrc(att)"
-              class="att-thumb"
-              :src="attachmentSrc(att)"
-              :alt="att.name"
-            />
-            <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="18" />
-            <span class="p-name">{{ att.name }}</span>
-            <button class="chip-close" type="button" title="移除" @click="removePending(att.id)">
-              <AppIcon name="close" :size="10" />
-            </button>
-          </span>
-        </div>
+      <footer v-if="!archivedActive" class="composer">
         <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
 
-        <div class="input-row">
-          <button
-            class="attach-btn"
-            type="button"
-            :disabled="uploading || chat.sending"
-            title="添加文件 / 图片"
-            @click="pickFiles"
-          >
-            <span v-if="uploading" class="attach-spin"></span>
-            <el-icon v-else><Paperclip /></el-icon>
-          </button>
-          <input
-            ref="fileInput"
-            class="file-input"
-            type="file"
-            multiple
-            :accept="fileAccept || formats.accept"
-            @change="onFilesPicked"
-          />
+        <div class="composer-shell" @paste="onClipboardPaste">
+          <div v-if="pendingFiles.length" class="pending-row">
+            <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
+              <img
+                v-if="att.kind === 'image' && attachmentSrc(att)"
+                class="att-thumb"
+                :src="attachmentSrc(att)"
+                :alt="att.name"
+              />
+              <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="18" />
+              <span class="p-name">{{ att.name }}</span>
+              <button class="chip-close" type="button" title="移除" @click="removePending(att.id)">
+                <AppIcon name="close" :size="10" />
+              </button>
+            </span>
+          </div>
+
           <el-input
             ref="inputEl"
             v-model="draft"
@@ -921,23 +1087,88 @@ onBeforeUnmount(() => {
             :disabled="chat.sending || chat.compacting"
             @keydown.enter.exact.prevent="submit"
           />
-          <el-button
-            v-if="chat.sending"
-            class="send holo-send-btn is-stop"
-            :icon="VideoPause"
-            size="large"
-            title="中止"
-            @click="chat.stop()"
-          />
-          <el-button
-            v-else
-            class="send holo-send-btn"
-            :icon="Promotion"
-            size="large"
-            title="发送"
-            :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
-            @click="submit"
-          />
+
+          <div class="composer-tools">
+            <button
+              class="composer-tool"
+              type="button"
+              :disabled="uploading || chat.sending"
+              title="添加文件 / 图片"
+              @click="pickFiles"
+            >
+              <span v-if="uploading" class="attach-spin"></span>
+              <el-icon v-else><Plus /></el-icon>
+            </button>
+            <input
+              ref="fileInput"
+              class="file-input"
+              type="file"
+              multiple
+              :accept="fileAccept || formats.accept"
+              @change="onFilesPicked"
+            />
+
+            <div class="composer-pop-wrap">
+              <button
+                class="composer-pill"
+                :class="{ open: modesOpen, on: settings.thinking || settings.webSearch }"
+                type="button"
+                title="思考模式 / 联网搜索"
+                @click="modesOpen = !modesOpen"
+              >
+                <AppIcon name="sliders" :size="12" />
+                <span>工具</span>
+              </button>
+              <div v-if="modesOpen" class="composer-pop-mask" @click="modesOpen = false"></div>
+              <Transition name="pop">
+                <div v-if="modesOpen" class="composer-pop">
+                  <label class="composer-pop-row">
+                    <span>思考模式</span>
+                    <el-switch
+                      :model-value="settings.thinking"
+                      size="small"
+                      :disabled="chat.sending || settings.saving"
+                      @update:model-value="(v: string | number | boolean) => toggleThinking(v === true)"
+                    />
+                  </label>
+                  <label class="composer-pop-row">
+                    <span>联网搜索</span>
+                    <el-switch
+                      :model-value="settings.webSearch"
+                      size="small"
+                      :disabled="chat.sending || settings.saving"
+                      @update:model-value="(v: string | number | boolean) => toggleWebSearch(v === true)"
+                    />
+                  </label>
+                </div>
+              </Transition>
+            </div>
+
+            <!-- 智能体 / 组选择：收进「当前智能体」面板 -->
+            <CurrentAgentPicker :disabled="archivedActive" />
+
+            <span class="composer-spacer"></span>
+            <span class="composer-hint">Enter 发送</span>
+            <button
+              v-if="chat.sending"
+              class="composer-send is-stop"
+              type="button"
+              title="中止"
+              @click="chat.stop()"
+            >
+              <span class="stop-square"></span>
+            </button>
+            <button
+              v-else
+              class="composer-send"
+              type="button"
+              title="发送"
+              :disabled="(!draft.trim() && pendingFiles.length === 0) || uploading || chat.compacting"
+              @click="submit"
+            >
+              <el-icon><ArrowUpBold /></el-icon>
+            </button>
+          </div>
         </div>
 
         <div class="composer-foot">
@@ -950,6 +1181,15 @@ onBeforeUnmount(() => {
           </span>
         </div>
       </footer>
+
+      <!-- 归档会话：输入区替换为只读提示，避免误以为还能继续对话 -->
+      <div v-else class="archived-readonly">
+        <span class="ar-icon"><AppIcon name="archive" :size="14" /></span>
+        <span class="ar-text">该会话已归档，仅支持查看聊天记录，不会再被 Agent 读取。</span>
+        <el-button class="ar-restore" size="small" @click="restoreActiveSession">
+          恢复会话
+        </el-button>
+      </div>
 
       <div v-if="dragging" class="drag-mask">
         <span class="drag-icon"><Document :size="22" /></span>
@@ -1214,6 +1454,149 @@ onBeforeUnmount(() => {
   padding-top: 46px;
 }
 
+/* 右侧出现轮次导航时，给气泡留出安全距离，避免与刻度重叠 */
+.as-messages.with-nav {
+  padding-right: 26px;
+}
+
+/* 右侧轮次导航：收起时是一列紧凑刻度，悬停向左展开为可读列表 */
+.turn-nav {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 14px;
+  max-height: calc(100% - 16px);
+  z-index: 11;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  transition:
+    width 0.16s ease,
+    background 0.16s ease,
+    border-color 0.16s ease;
+}
+
+.turn-nav-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+
+.turn-nav-list::-webkit-scrollbar {
+  display: none;
+}
+
+.turn-nav-row {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 14px;
+  height: 11px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.turn-nav-bar {
+  flex: none;
+  display: block;
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(126, 154, 198, 0.34);
+  transition:
+    width 0.15s ease,
+    background 0.15s ease;
+}
+
+.turn-nav-row:hover .turn-nav-bar {
+  width: 12px;
+  background: var(--text-2);
+}
+
+.turn-nav-row.active .turn-nav-bar {
+  width: 12px;
+  background: var(--accent-cyan);
+  box-shadow: 0 0 6px rgba(55, 208, 196, 0.6);
+}
+
+.turn-nav-label {
+  display: none;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+  text-align: right;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 展开态：以刻度组为中心向左撑开，覆盖在消息区右侧 */
+.turn-nav.open {
+  right: 4px;
+  width: 240px;
+  padding: 7px 6px;
+  border-color: rgba(55, 208, 196, 0.32);
+  background: rgba(4, 16, 26, 0.97);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.turn-nav.open .turn-nav-list {
+  width: 100%;
+  align-items: stretch;
+  gap: 2px;
+  scrollbar-width: thin;
+}
+
+.turn-nav.open .turn-nav-list::-webkit-scrollbar {
+  display: block;
+  width: 4px;
+}
+
+.turn-nav.open .turn-nav-list::-webkit-scrollbar-thumb {
+  border-radius: 2px;
+  background: rgba(126, 154, 198, 0.3);
+}
+
+.turn-nav.open .turn-nav-row {
+  width: 100%;
+  height: auto;
+  min-height: 26px;
+  gap: 10px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+}
+
+.turn-nav.open .turn-nav-row:hover {
+  background: rgba(55, 208, 196, 0.1);
+}
+
+.turn-nav.open .turn-nav-label {
+  display: block;
+  text-align: left;
+}
+
+.turn-nav.open .turn-nav-row:hover .turn-nav-label {
+  color: var(--text-1);
+}
+
+.turn-nav.open .turn-nav-row.active .turn-nav-label {
+  color: var(--accent-cyan);
+}
+
 .pin-stack {
   position: sticky;
   top: 0;
@@ -1455,19 +1838,35 @@ onBeforeUnmount(() => {
   align-items: flex-start;
 }
 
-.ai-avatar {
+/* 本轮答复者标识：头像 + 名称 + 角色，独占一行 */
+.as-row.agent-row {
+  align-items: center;
+  gap: 7px;
+  padding-left: 2px;
+}
+
+.agent-avatar {
   display: grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
-  margin-top: 2px;
+  width: 24px;
+  height: 24px;
   flex: none;
-  font-family: var(--font-mono);
-  font-size: 9px;
-  color: #032a2c;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: #041018;
   border-radius: 50%;
-  background: linear-gradient(135deg, #9ef5ea, #37d0c4);
-  box-shadow: 0 0 12px rgba(55, 208, 196, 0.35);
+}
+
+.agent-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.agent-role {
+  font-size: 10px;
+  color: var(--text-3);
 }
 
 .ai-col {
@@ -1525,79 +1924,58 @@ onBeforeUnmount(() => {
   z-index: 5;
   flex: none;
   padding: 6px 10px 8px;
-  border-top: 1px solid rgba(55, 208, 196, 0.22);
   background: rgba(4, 12, 22, 0.6);
 }
 
-.mode-row {
+/* 归档会话的只读底栏：替代输入框，避免误以为还能继续对话 */
+.archived-readonly {
   position: relative;
+  z-index: 5;
+  flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding-bottom: 6px;
-  min-height: 24px;
+  padding: 10px;
+  border-top: 1px solid rgba(255, 182, 72, 0.16);
+  background: rgba(255, 182, 72, 0.05);
 }
 
-.mode-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 7px;
-  font-size: 10px;
+.archived-readonly .ar-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--amber);
+}
+
+.archived-readonly .ar-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  line-height: 1.5;
   color: var(--text-2);
-  border: 1px solid rgba(126, 154, 198, 0.24);
-  border-radius: 999px;
+}
+
+.archived-readonly .ar-restore.el-button {
+  flex: none;
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--accent-cyan);
+  border-color: rgba(55, 208, 196, 0.36);
   background: transparent;
 }
 
-.mode-trigger:hover,
-.mode-trigger.open {
-  color: #dffaff;
-  border-color: rgba(55, 208, 196, 0.5);
-  background: rgba(55, 208, 196, 0.08);
-}
-
-.mode-chev {
-  transition: transform 0.18s ease;
-}
-
-.mode-chev.open {
-  transform: rotate(90deg);
-}
-
-.mode-checks {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.check {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10.5px;
-  color: var(--text-2);
-  cursor: pointer;
-}
-
-.check input {
-  width: 12px;
-  height: 12px;
-  accent-color: var(--accent-cyan);
-  cursor: pointer;
-}
-
-.composer-hint {
-  margin-left: auto;
-  font-size: 9px;
-  color: var(--text-3);
+.archived-readonly .ar-restore.el-button:hover {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  background: rgba(55, 208, 196, 0.1);
 }
 
 .pending-row {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
-  padding-bottom: 6px;
+  padding: 0 2px 6px;
 }
 
 .pending-chip {
@@ -1643,35 +2021,6 @@ onBeforeUnmount(() => {
   color: var(--danger);
 }
 
-.input-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 6px;
-}
-
-.attach-btn {
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  flex: none;
-  padding: 0;
-  color: var(--text-2);
-  border: 1px solid rgba(126, 154, 198, 0.24);
-  border-radius: 50%;
-  background: rgba(6, 14, 26, 0.5);
-}
-
-.attach-btn:hover {
-  color: #dffaff;
-  border-color: rgba(55, 208, 196, 0.55);
-}
-
-.attach-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .attach-spin {
   width: 12px;
   height: 12px;
@@ -1689,34 +2038,6 @@ onBeforeUnmount(() => {
 
 .file-input {
   display: none;
-}
-
-.chat-input {
-  flex: 1;
-}
-
-.chat-input :deep(.el-textarea__inner) {
-  min-height: 32px !important;
-  padding: 6px 10px;
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--text-1);
-  border: 1px solid rgba(126, 154, 198, 0.2);
-  border-radius: 16px;
-  background: rgba(6, 14, 26, 0.62);
-  box-shadow: none;
-}
-
-.chat-input :deep(.el-textarea__inner:focus) {
-  border-color: rgba(55, 208, 196, 0.55);
-  box-shadow: 0 0 0 1px rgba(55, 208, 196, 0.16);
-}
-
-.send {
-  width: 36px;
-  height: 36px;
-  flex: none;
-  margin-left: 0;
 }
 
 .composer-foot {

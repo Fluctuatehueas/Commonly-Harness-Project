@@ -221,95 +221,238 @@ html.desktop-overlay #app {
   overflow: hidden;
 }
 
-/* 全息发送按钮：对话页与悬浮助手共用同一套视觉。 */
-.holo-send-btn.el-button {
+/* ============================================================
+   聊天输入区：Claude 桌面端式单框布局（ChatView / AssistantView 共用）
+   外层大圆角单框，文本域透明，底部工具栏承载附件 / 工具 / 发送。
+   ============================================================ */
+.composer-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 10px 8px;
+  border: 1px solid rgba(126, 154, 198, 0.22);
+  border-radius: 18px;
+  background: rgba(9, 18, 31, 0.94);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 10px 26px rgba(0, 0, 0, 0.2);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.composer-shell:focus-within {
+  border-color: rgba(55, 208, 196, 0.45);
+  box-shadow:
+    0 0 0 3px rgba(55, 208, 196, 0.08),
+    0 12px 28px rgba(0, 0, 0, 0.24);
+}
+
+/* 文本域只负责输入：边框与底色交给外层单框 */
+.composer-shell .el-textarea__inner {
+  min-height: 26px !important;
+  padding: 3px 4px 1px;
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-1);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.composer-shell .el-textarea__inner:focus {
+  box-shadow: none;
+}
+
+.composer-shell .el-textarea__inner::placeholder {
+  color: var(--text-3);
+}
+
+/* 底部工具栏：左侧附件与工具，右侧提示与圆形发送键 */
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+}
+
+.composer-spacer {
+  flex: 1;
+  min-width: 4px;
+}
+
+.composer-tool {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  padding: 0;
+  color: var(--text-2);
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  cursor: pointer;
+  transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+}
+
+.composer-tool:hover:not(:disabled),
+.composer-tool.active {
+  color: var(--text-1);
+  border-color: rgba(126, 154, 198, 0.22);
+  background: rgba(126, 154, 198, 0.1);
+}
+
+.composer-tool:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.composer-pill {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 10px;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  border: 1px solid rgba(126, 154, 198, 0.22);
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+}
+
+.composer-pill:hover,
+.composer-pill.open {
+  color: var(--text-1);
+  border-color: rgba(55, 208, 196, 0.4);
+  background: rgba(55, 208, 196, 0.08);
+}
+
+.composer-pill.on {
+  color: var(--accent-cyan);
+  border-color: rgba(55, 208, 196, 0.45);
+}
+
+.composer-hint {
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* 圆形发送键：可发送时浅色填充 + 深色箭头，禁用时退为灰底 */
+.composer-send {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
   padding: 0;
-  color: #d6fffb;
-  border: 1px solid rgba(55, 208, 196, 0.55);
-  border-radius: 11px;
-  background:
-    repeating-linear-gradient(
-      0deg,
-      rgba(55, 208, 196, 0.06) 0,
-      rgba(55, 208, 196, 0.06) 1px,
-      transparent 1px,
-      transparent 4px
-    ),
-    linear-gradient(145deg, rgba(55, 208, 196, 0.28), rgba(91, 140, 255, 0.18)),
-    rgba(6, 18, 30, 0.94);
-  box-shadow:
-    0 0 12px rgba(55, 208, 196, 0.16),
-    inset 0 0 18px rgba(55, 208, 196, 0.16);
+  color: #05121f;
+  border: 0;
+  border-radius: 50%;
+  background: #ddf7f4;
+  box-shadow: 0 2px 10px rgba(55, 208, 196, 0.26);
+  cursor: pointer;
   transition:
-    color 0.18s ease,
-    border-color 0.18s ease,
-    background 0.18s ease,
-    box-shadow 0.18s ease;
+    background 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.12s ease;
 }
 
-.holo-send-btn.el-button .el-icon {
-  font-size: 18px;
-  filter: drop-shadow(0 0 6px rgba(55, 208, 196, 0.45));
+.composer-send .el-icon {
+  font-size: 16px;
 }
 
-.holo-send-btn.el-button:hover:not(.is-disabled) {
-  color: #f0fffe;
-  border-color: rgba(160, 240, 255, 0.9);
-  background:
-    repeating-linear-gradient(
-      0deg,
-      rgba(55, 208, 196, 0.08) 0,
-      rgba(55, 208, 196, 0.08) 1px,
-      transparent 1px,
-      transparent 4px
-    ),
-    linear-gradient(145deg, rgba(55, 208, 196, 0.34), rgba(91, 140, 255, 0.24)),
-    rgba(8, 22, 36, 0.96);
-  box-shadow:
-    0 0 18px rgba(55, 208, 196, 0.35),
-    inset 0 0 22px rgba(55, 208, 196, 0.22);
+.composer-send:hover:not(:disabled) {
+  background: #f4fffd;
+  box-shadow: 0 4px 16px rgba(55, 208, 196, 0.4);
 }
 
-.holo-send-btn.el-button:active:not(.is-disabled) {
+.composer-send:active:not(:disabled) {
   transform: translateY(1px);
 }
 
-.holo-send-btn.el-button.is-disabled,
-.holo-send-btn.el-button.is-disabled:hover {
-  color: var(--text-3);
-  border-color: rgba(126, 154, 198, 0.25);
-  background: rgba(8, 16, 28, 0.8);
+.composer-send:disabled {
+  color: rgba(147, 165, 196, 0.45);
+  background: rgba(126, 154, 198, 0.14);
   box-shadow: none;
-  opacity: 0.55;
+  cursor: not-allowed;
 }
 
-.holo-send-btn.is-stop.el-button {
-  color: #ffc9c8;
-  border-color: rgba(226, 96, 94, 0.55);
-  background:
-    repeating-linear-gradient(
-      0deg,
-      rgba(226, 96, 94, 0.06) 0,
-      rgba(226, 96, 94, 0.06) 1px,
-      transparent 1px,
-      transparent 4px
-    ),
-    linear-gradient(145deg, rgba(226, 96, 94, 0.22), rgba(120, 40, 48, 0.14)),
-    rgba(26, 10, 14, 0.92);
-  box-shadow:
-    0 0 0 1px rgba(226, 96, 94, 0.1),
-    inset 0 0 16px rgba(226, 96, 94, 0.14);
+.composer-send.is-stop {
+  color: #fff1f0;
+  background: rgba(226, 96, 94, 0.92);
+  box-shadow: 0 2px 12px rgba(226, 96, 94, 0.3);
 }
 
-.holo-send-btn.is-stop.el-button:hover:not(.is-disabled) {
-  color: #ffe9e8;
-  border-color: rgba(255, 150, 148, 0.9);
-  box-shadow:
-    0 0 18px rgba(226, 96, 94, 0.35),
-    inset 0 0 22px rgba(226, 96, 94, 0.22);
+.composer-send.is-stop:hover {
+  background: #f0706e;
+  box-shadow: 0 4px 16px rgba(226, 96, 94, 0.42);
+}
+
+.composer-send .stop-square {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+/* 工具弹层：向上弹出，点击遮罩关闭 */
+.composer-pop-wrap {
+  position: relative;
+  flex: none;
+}
+
+.composer-pop-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.composer-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 190px;
+  padding: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  box-shadow: 0 16px 36px rgba(2, 6, 14, 0.5);
+}
+
+.composer-pop-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 9px;
+  font-size: 12px;
+  color: var(--text-2);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.composer-pop-row:hover {
+  color: var(--text-1);
+  background: var(--bg-hover);
+}
+
+.composer-pop-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* 尊重减少动态偏好 */

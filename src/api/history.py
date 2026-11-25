@@ -307,6 +307,12 @@ def serialize_messages(
                 elif tool_message.role != "delegation":
                     tool_message.text = content
         elif role == "user":
+            # 本轮应答的 Agent 随用户消息落 checkpoint；旧数据没有该字段时留空。
+            stored_agent = (
+                additional_kwargs.get("agent_id")
+                if isinstance(additional_kwargs, dict)
+                else None
+            )
             serialized.append(
                 Message(
                     id=f"message-{index}",
@@ -314,6 +320,7 @@ def serialize_messages(
                     content=content,
                     created_at=_message_created_at(message),
                     attachments=_user_attachments(message),
+                    agent_id=str(stored_agent) if stored_agent else None,
                 )
             )
     return serialized
