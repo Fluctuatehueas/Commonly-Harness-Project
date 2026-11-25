@@ -67,6 +67,7 @@ SUPPORTED_FORMATS: dict[str, tuple[str, str]] = {
     ".js": ("text", "text/javascript"),
     ".ts": ("text", "text/typescript"),
     ".java": ("text", "text/x-java"),
+    ".cs": ("text", "text/plain"),
     ".sql": ("text", "text/plain"),
     ".ini": ("text", "text/plain"),
     ".toml": ("text", "text/plain"),
