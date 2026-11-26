@@ -50,6 +50,7 @@ SUPPORTED_FORMATS: dict[str, tuple[str, str]] = {
     ".gif": ("image", "image/gif"),
     # 文档：服务端抽取文本后注入上下文
     ".docx": ("document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ".doc": ("document", "application/vnd.ms-wordprocessing.document"),
     ".pdf": ("document", "application/pdf"),
     # 文本：直接以文本块注入
     ".txt": ("text", "text/plain"),

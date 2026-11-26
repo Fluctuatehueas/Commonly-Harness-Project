@@ -75,7 +75,7 @@ function formatDuration(ms?: number): string {
 const headerLabel = computed(() => {
   if (props.live) return '正在执行'
   const value = formatDuration(props.durationMs)
-  return value ? `本轮耗时 ${value}` : '本轮轨迹'
+  return value ? `本轮轨迹 · ${value}` : '本轮轨迹'
 })
 
 // 经验 / 任务流标记只是过程渲染，不计入轨迹步数。
@@ -92,18 +92,14 @@ const stepLabel = computed(
       :title="expanded ? '收起本轮轨迹' : '展开本轮轨迹'"
       @click="expanded = !expanded"
     >
-      <span class="tt-icon" :class="{ running: live }">
-        <AppIcon name="workflow" :size="12" />
-      </span>
       <span class="tt-title">{{ headerLabel }}</span>
-      <span v-if="live" class="tt-steps">{{ stepLabel }}</span>
-      <span class="tt-dots" v-if="live">
-        <i class="s-dot"></i><i class="s-dot"></i><i class="s-dot"></i>
-      </span>
-      <span class="tt-action">{{ expanded ? '收起轨迹' : '展开轨迹' }}</span>
+      <template v-if="live">
+        <span class="tt-steps">{{ stepLabel }}</span>
+        <span class="tt-dots"><i class="s-dot"></i><i class="s-dot"></i><i class="s-dot"></i></span>
+      </template>
       <AppIcon
         name="chevronRight"
-        :size="11"
+        :size="12"
         class="tt-chev"
         :class="{ open: expanded }"
       />
@@ -119,57 +115,30 @@ const stepLabel = computed(
 <style scoped>
 .trajectory-tree {
   width: 100%;
-  border-left: 2px solid transparent;
-  transition: border-color 0.2s;
 }
 
-.trajectory-tree.live {
-  border-left-color: rgba(53, 224, 255, 0.35);
-}
-
+/* Claude 风格：一行弱化的过程摘要，箭头紧随文字 */
 .tt-head {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 7px;
-  width: 100%;
-  padding: 5px 8px;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 6px 3px 2px;
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: 12px;
+  line-height: 1.55;
   text-align: left;
   border: none;
-  border-radius: 7px;
+  border-radius: 6px;
   background: transparent;
-  transition: color 0.16s, background 0.16s;
+  transition: color 0.16s;
 }
 
 .tt-head:hover {
   color: var(--text-2);
-  background: rgba(79, 140, 255, 0.06);
-}
-
-.tt-icon {
-  display: grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  flex: none;
-  border-radius: 6px;
-  color: var(--text-3);
-  background: rgba(79, 140, 255, 0.1);
-}
-
-.tt-icon.running {
-  color: var(--accent-cyan);
-  animation: tt-glow 1.4s ease-in-out infinite;
-}
-
-@keyframes tt-glow {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
 }
 
 .tt-title {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -178,22 +147,9 @@ const stepLabel = computed(
 
 .tt-steps {
   flex: none;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-3);
-}
-
-.tt-action {
-  flex: none;
-  padding: 1px 7px;
-  font-size: 10px;
-  color: var(--text-3);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-}
-
-.tt-head:hover .tt-action {
-  color: var(--accent-cyan);
-  border-color: rgba(53, 224, 255, 0.4);
+  opacity: 0.85;
 }
 
 .tt-dots {
@@ -203,10 +159,10 @@ const stepLabel = computed(
 }
 
 .s-dot {
-  width: 4px;
-  height: 4px;
+  width: 3px;
+  height: 3px;
   border-radius: 50%;
-  background: var(--accent-cyan);
+  background: currentColor;
   animation: bounce 1.15s infinite;
 }
 
@@ -214,13 +170,14 @@ const stepLabel = computed(
 .s-dot:nth-child(3) { animation-delay: 0.28s; }
 
 @keyframes bounce {
-  0%, 60%, 100% { transform: none; opacity: 0.45; }
+  0%, 60%, 100% { transform: none; opacity: 0.4; }
   30% { transform: translateY(-3px); opacity: 1; }
 }
 
 .tt-chev {
   flex: none;
-  color: var(--text-3);
+  color: currentColor;
+  opacity: 0.7;
   transition: transform 0.18s;
 }
 
@@ -231,14 +188,13 @@ const stepLabel = computed(
 .tt-body {
   display: flex;
   flex-direction: column;
-  gap: 1px;
-  padding: 2px 4px 6px 6px;
+  padding: 1px 0 4px;
 }
 
 .tt-empty {
   margin: 0;
-  padding: 4px 10px;
-  font-size: 11px;
+  padding: 3px 0 3px 2px;
+  font-size: 11.5px;
   color: var(--text-3);
 }
 </style>

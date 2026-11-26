@@ -12,7 +12,9 @@ import AppIcon from '@/components/console/AppIcon.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
+import MediaViewer from '@/components/chat/MediaViewer.vue'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
+import CollapsibleText from '@/components/chat/CollapsibleText.vue'
 import FileTypeIcon from '@/components/chat/FileTypeIcon.vue'
 import ProducedFilesCard from '@/components/chat/ProducedFilesCard.vue'
 import TrajectoryTree from '@/components/chat/TrajectoryTree.vue'
@@ -26,6 +28,8 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAgentStore } from '@/stores/agents'
 import { avatarGradient, avatarInitial } from '@/components/myagent/avatar'
 import { API_BASE } from '@/api/client'
+import { withdrawLatestMessage } from '@/api/chat'
+import { fetchFeedbackSettings } from '@/api/settings'
 import {
   deleteContextFile,
   fetchContextFormats,
@@ -256,6 +260,20 @@ function attachmentSrc(att: ContextFile): string {
   if (local) return local
   if (att.kind !== 'image') return ''
   return `${API_BASE}/context/${att.id}/raw?user_id=${encodeURIComponent(USER_ID)}`
+}
+
+// 图片附件缩略图预览：复用全屏 MediaViewer。
+const mediaOpen = ref(false)
+const mediaSrc = ref('')
+const mediaTitle = ref('')
+const mediaFilename = ref('')
+
+function openImagePreview(src: string, name: string) {
+  if (!src) return
+  mediaSrc.value = src
+  mediaTitle.value = name
+  mediaFilename.value = name
+  mediaOpen.value = true
 }
 
 function pickFiles(): void {
@@ -650,6 +668,148 @@ function openSessionFile(file: { path: string; origin: 'project' | 'sandbox' }):
   fileDrawer.value = true
 }
 
+// ---------- 回答底部：时间 / 复制 / 赞同 / 不赞同 / 重试（与对话页一致） ----------
+/** 气泡底部时间只显示时:分，完整时间放在 title 里。 */
+function clockOf(value?: number): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function timeTitle(value?: number): string {
+  return value ? new Date(value).toLocaleString() : ''
+}
+
+const copiedId = ref('')
+let copyTimer: number | undefined
+
+async function copyMessage(msg: ChatMsg) {
+  const text = msg.content || ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 非安全上下文（http://IP）没有 clipboard API，退回 execCommand
+    const area = document.createElement('textarea')
+    area.value = text
+    document.body.appendChild(area)
+    area.select()
+    document.execCommand('copy')
+    area.remove()
+  }
+  copiedId.value = msg.id
+  if (copyTimer) window.clearTimeout(copyTimer)
+  copyTimer = window.setTimeout(() => (copiedId.value = ''), 1600)
+}
+
+// 反馈总开关；关闭时隐藏赞同/不赞同/重试，仅保留复制。
+const feedbackEnabled = ref(true)
+const feedbackBusy = ref<Record<string, boolean>>({})
+const RETRY_HINT_LIMIT = 3
+const retryHintShown = new Set<string>()
+
+function toolsOf(turn: TurnView): string[] {
+  return turn.process
+    .filter((message) => message.kind === 'tool' && message.toolName)
+    .map((message) => String(message.toolName))
+    .filter((name, index, list) => list.indexOf(name) === index)
+    .slice(0, 8)
+}
+
+async function toggleFeedback(turn: TurnView, action: 'like' | 'dislike') {
+  const final = turn.final
+  if (!final || final.streaming || archivedActive.value || chat.demoMode) return
+  if (!feedbackEnabled.value) return
+  if (feedbackBusy.value[final.id]) return
+  feedbackBusy.value = { ...feedbackBusy.value, [final.id]: true }
+  try {
+    await chat.sendFeedback(final, action, {
+      userId: USER_ID,
+      userExcerpt: turn.user?.content || '',
+      tools: toolsOf(turn),
+    })
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '反馈提交失败')
+  } finally {
+    const next = { ...feedbackBusy.value }
+    delete next[final.id]
+    feedbackBusy.value = next
+  }
+}
+
+function canRetry(turn: TurnView, index: number): boolean {
+  if (!feedbackEnabled.value || archivedActive.value || chat.sending || chat.demoMode) return false
+  if (!turn.final || turn.final.streaming || turn.interrupt) return false
+  // 只允许最后一条最终回答：历史回答重试会丢弃其后的轮次。
+  return index === turns.value.length - 1
+}
+
+function handleRetry(turn: TurnView) {
+  const final = turn.final
+  if (!final) return
+  if (!chat.retryLast(final)) return
+  const turnKey = turn.user?.id || ''
+  if (
+    turnKey &&
+    chat.retryCountFor(turnKey) >= RETRY_HINT_LIMIT &&
+    !retryHintShown.has(turnKey)
+  ) {
+    retryHintShown.add(turnKey)
+    chat.addNote('如果还是不对，直接说希望我在哪方面调整：更短、更细、换个角度都可以。')
+  }
+}
+
+// ---------- 撤回最新用户消息 ----------
+function canWithdraw(turn: TurnView, index: number): boolean {
+  if (!turn.user || archivedActive.value || chat.sending || chat.demoMode) {
+    return false
+  }
+  // 只能撤回最新一条；撤回后上一条自然成为最新，可继续逐条撤回。
+  return index === turns.value.length - 1
+}
+
+async function withdrawLatest(turn: TurnView, index: number) {
+  if (!canWithdraw(turn, index) || !turn.user) return
+  try {
+    await ElMessageBox.confirm(
+      '撤回后，这条消息及其之后的 AI 回复会从会话中移除。已产生的 Token 计费和已写入磁盘或沙箱的文件不会回滚。',
+      '撤回这条消息？',
+      {
+        confirmButtonText: '撤回',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
+  try {
+    const threadId = chat.threadId || sessions.activeThreadId
+    if (!threadId) throw new Error('会话不存在')
+    // 带上这一轮的原文：后端据此确认 head 的最新用户消息就是它，
+    // 避免把没写入检查点的出错轮误撤成上一轮。
+    const result = await withdrawLatestMessage(
+      threadId,
+      USER_ID,
+      '控制台用户',
+      turn.user.sentText ?? turn.user.content,
+    )
+    // 重新拉取历史，确保消息、中断与用量都以后端 head 为准。
+    await openThread(threadId)
+    const withdrawn = result.content || turn.user.content || ''
+    // 撤回内容放回输入框；若原本还有未发送草稿，保留在后面。
+    const restored = draft.value.trim()
+    draft.value = restored ? `${withdrawn}\n\n${restored}` : withdrawn
+    await nextTick()
+    inputEl.value?.focus()
+    void sessions.refresh()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '撤回失败')
+  }
+}
+
 const TERMINATE_TEXT: Record<string, string> = {
   user: '你已手动终止本次回答',
   network: '连接中断，回答未完成',
@@ -757,6 +917,31 @@ watch(
   },
 )
 
+// 运行中 / 等待介入 标识按 thread 同步到会话栏（与对话页一致）
+watch(
+  () => chat.runningThreadIds,
+  (ids) => {
+    const next = new Set(ids)
+    Array.from(sessions.runningThreads).forEach((tid) => {
+      if (!next.has(tid)) sessions.markRunning(tid, false)
+    })
+    ids.forEach((tid) => sessions.markRunning(tid, true))
+  },
+  { immediate: true },
+)
+
+watch(
+  () => chat.waitingThreadIds,
+  (ids) => {
+    const next = new Set(ids)
+    Array.from(sessions.waitingThreads).forEach((tid) => {
+      if (!next.has(tid)) sessions.markWaiting(tid, false)
+    })
+    ids.forEach((tid) => sessions.markWaiting(tid, true))
+  },
+  { immediate: true },
+)
+
 // ---------- 生命周期 ----------
 onMounted(async () => {
   chat.demoMode = false
@@ -768,6 +953,11 @@ onMounted(async () => {
     void sessions.refreshArchived()
     formats.value = await fetchContextFormats()
     void settings.load()
+    void fetchFeedbackSettings()
+      .then((config) => {
+        feedbackEnabled.value = config.enabled
+      })
+      .catch(() => undefined)
   }
   let target: string | null = null
   try {
@@ -952,22 +1142,57 @@ onBeforeUnmount(() => {
             <small>直接输入问题，或拖入图片 / 文档开始一轮对话。</small>
           </div>
 
-          <template v-for="turn in turns" :key="turn.key">
+          <template v-for="(turn, turnIndex) in turns" :key="turn.key">
             <div v-if="turn.user" class="as-row user" :data-turn-id="turn.key">
-              <div class="bubble user-bubble">
-                <div v-if="turn.user.attachments?.length" class="bubble-atts">
-                  <span v-for="att in turn.user.attachments" :key="att.id" class="bubble-att">
-                    <img
-                      v-if="att.kind === 'image' && attachmentSrc(att)"
-                      class="att-thumb"
-                      :src="attachmentSrc(att)"
-                      :alt="att.name"
-                    />
-                    <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="18" />
-                    <span>{{ att.name }}</span>
-                  </span>
+              <div class="user-col">
+                <div class="bubble user-bubble">
+                  <div v-if="turn.user.attachments?.length" class="bubble-atts">
+                    <template v-for="att in turn.user.attachments" :key="att.id">
+                      <button
+                        v-if="att.kind === 'image' && attachmentSrc(att)"
+                        class="att-image"
+                        type="button"
+                        :title="`查看 ${att.name}`"
+                        @click="openImagePreview(attachmentSrc(att), att.name)"
+                      >
+                        <img :src="attachmentSrc(att)" :alt="att.name" />
+                      </button>
+                      <span v-else class="bubble-att">
+                        <FileTypeIcon :ext="att.ext" :name="att.name" :size="18" />
+                        <span class="att-name">{{ att.name }}</span>
+                      </span>
+                    </template>
+                  </div>
+                  <CollapsibleText v-if="turn.user.content" :text="turn.user.content" />
                 </div>
-                <span v-if="turn.user.content">{{ turn.user.content }}</span>
+                <div v-if="turn.user.content || canWithdraw(turn, turnIndex)" class="msg-meta user">
+                  <span
+                    v-if="clockOf(turn.user.at)"
+                    class="msg-time"
+                    :title="timeTitle(turn.user.at)"
+                  >
+                    {{ clockOf(turn.user.at) }}
+                  </span>
+                  <button
+                    v-if="turn.user.content"
+                    class="meta-icon"
+                    :class="{ active: copiedId === turn.user.id }"
+                    :title="copiedId === turn.user.id ? '已复制' : '复制'"
+                    :aria-label="copiedId === turn.user.id ? '已复制' : '复制'"
+                    @click="copyMessage(turn.user)"
+                  >
+                    <AppIcon :name="copiedId === turn.user.id ? 'check' : 'copy'" :size="13" />
+                  </button>
+                  <button
+                    v-if="canWithdraw(turn, turnIndex)"
+                    class="meta-icon"
+                    aria-label="撤回"
+                    title="撤回这条消息"
+                    @click="withdrawLatest(turn, turnIndex)"
+                  >
+                    <AppIcon name="undo" :size="13" />
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -1011,6 +1236,57 @@ onBeforeUnmount(() => {
                   :files="turnFiles(turn)"
                   @open-file="openSessionFile"
                 />
+                <div v-if="turn.final.content && !turn.final.streaming" class="msg-meta">
+                  <span
+                    v-if="clockOf(turn.final.at)"
+                    class="msg-time"
+                    :title="timeTitle(turn.final.at)"
+                  >
+                    {{ clockOf(turn.final.at) }}
+                  </span>
+                  <button
+                    class="meta-icon"
+                    :class="{ active: copiedId === turn.final.id }"
+                    :title="copiedId === turn.final.id ? '已复制' : '复制'"
+                    :aria-label="copiedId === turn.final.id ? '已复制' : '复制'"
+                    @click="copyMessage(turn.final)"
+                  >
+                    <AppIcon :name="copiedId === turn.final.id ? 'check' : 'copy'" :size="13" />
+                  </button>
+                  <button
+                    v-if="feedbackEnabled"
+                    class="meta-icon"
+                    :class="{ active: turn.final.feedback === 'like' }"
+                    :disabled="archivedActive || chat.demoMode || feedbackBusy[turn.final.id]"
+                    :aria-pressed="turn.final.feedback === 'like'"
+                    aria-label="赞同"
+                    title="赞同"
+                    @click="toggleFeedback(turn, 'like')"
+                  >
+                    <AppIcon name="thumbUp" :size="13" />
+                  </button>
+                  <button
+                    v-if="feedbackEnabled"
+                    class="meta-icon"
+                    :class="{ active: turn.final.feedback === 'dislike', dislike: true }"
+                    :disabled="archivedActive || chat.demoMode || feedbackBusy[turn.final.id]"
+                    :aria-pressed="turn.final.feedback === 'dislike'"
+                    aria-label="不赞同"
+                    title="不赞同"
+                    @click="toggleFeedback(turn, 'dislike')"
+                  >
+                    <AppIcon name="thumbDown" :size="13" />
+                  </button>
+                  <button
+                    v-if="canRetry(turn, turnIndex)"
+                    class="meta-icon"
+                    aria-label="重新回答"
+                    title="重新回答"
+                    @click="handleRetry(turn)"
+                  >
+                    <AppIcon name="refresh" :size="13" />
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -1197,6 +1473,14 @@ onBeforeUnmount(() => {
         <small>支持图片与文档，可直接拖入整个助手窗口</small>
       </div>
     </section>
+
+    <MediaViewer
+      v-model="mediaOpen"
+      kind="image"
+      :src="mediaSrc"
+      :title="mediaTitle"
+      :filename="mediaFilename"
+    />
   </div>
 </template>
 
@@ -1787,6 +2071,25 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
 }
 
+/* 用户气泡 + 下方复制栏的纵向容器 */
+.user-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: 88%;
+  min-width: 0;
+}
+
+.user-col .bubble {
+  max-width: 100%;
+}
+
+.msg-meta.user {
+  justify-content: flex-end;
+  gap: 2px;
+  margin-top: 2px;
+}
+
 .bubble {
   max-width: 88%;
   padding: 8px 10px;
@@ -1806,8 +2109,38 @@ onBeforeUnmount(() => {
 .bubble-atts {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
+  align-items: flex-end;
+  gap: 6px;
   margin-bottom: 5px;
+}
+
+/* 图片附件：Claude 式圆角缩略图，点击打开全屏预览 */
+.att-image {
+  display: inline-flex;
+  flex: none;
+  max-width: 140px;
+  max-height: 140px;
+  padding: 0;
+  overflow: hidden;
+  cursor: zoom-in;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.04);
+  transition: border-color 0.15s ease, filter 0.15s ease;
+}
+
+.att-image img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 140px;
+  max-height: 140px;
+  object-fit: cover;
+}
+
+.att-image:hover {
+  border-color: rgba(255, 255, 255, 0.3);
+  filter: brightness(1.06);
 }
 
 .bubble-att {
@@ -1821,6 +2154,13 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(126, 154, 198, 0.24);
   border-radius: 5px;
   background: rgba(6, 14, 26, 0.5);
+}
+
+.bubble-att .att-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .att-thumb {
@@ -1883,6 +2223,58 @@ onBeforeUnmount(() => {
   white-space: normal;
   border: 0;
   background: transparent;
+}
+
+/* 回答气泡底部：时间 + 复制 / 赞同 / 不赞同 / 重试 */
+.msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: -2px;
+}
+
+.msg-time {
+  margin-right: 4px;
+  font-size: 10px;
+  line-height: 20px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.meta-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+}
+
+.meta-icon:hover:not(:disabled) {
+  color: var(--accent-cyan);
+  background: var(--bg-hover);
+}
+
+.meta-icon.active {
+  color: var(--accent-cyan);
+  background: color-mix(in srgb, var(--accent-cyan) 12%, transparent);
+}
+
+.meta-icon.dislike.active {
+  color: var(--el-color-warning);
+  background: color-mix(in srgb, var(--el-color-warning) 14%, transparent);
+}
+
+.meta-icon:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .cursor {

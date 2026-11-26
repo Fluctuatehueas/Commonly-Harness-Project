@@ -123,7 +123,8 @@ function chooseRemove() {
     class="srow"
     :class="{
       active: props.active,
-      running: props.running && !props.active,
+      running: props.running,
+      waiting: props.waiting,
       indent: props.indent,
       'menu-open': Boolean(menu),
     }"
@@ -133,9 +134,15 @@ function chooseRemove() {
     @keydown.enter="emit('select', props.session.thread_id)"
   >
     <span class="flag" aria-hidden="true">
-      <AppIcon v-if="props.session.pinned" name="pin" :size="10" />
-      <i v-else-if="props.waiting" class="dot wait"></i>
-      <i v-else-if="props.running" class="dot run"></i>
+      <!-- 正在工作 / 等待人工介入：旋转的等待图标 -->
+      <AppIcon
+        v-if="props.running || props.waiting"
+        name="wait"
+        :size="11"
+        class="flag-spin"
+        :class="{ waiting: props.waiting }"
+      />
+      <AppIcon v-else-if="props.session.pinned" name="pin" :size="10" />
     </span>
 
     <el-input
@@ -239,21 +246,9 @@ function chooseRemove() {
   background: var(--bg-active);
 }
 
-.srow.running .title::after {
-  content: '';
-  display: inline-block;
-  width: 4px;
-  height: 4px;
-  margin-left: 5px;
-  vertical-align: 2px;
-  border-radius: 50%;
-  background: var(--accent-cyan);
-  animation: pulse 1.4s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 1; }
+.srow.running .title,
+.srow.waiting .title {
+  color: var(--text-1);
 }
 
 .flag {
@@ -264,15 +259,20 @@ function chooseRemove() {
   color: var(--accent-cyan);
 }
 
-.dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--accent-cyan);
+/* 等待图标：旋转一周的开口圆弧 */
+.flag-spin {
+  color: var(--accent-cyan);
+  transform-origin: 50% 50%;
+  animation: flag-spin 0.9s linear infinite;
 }
 
-.dot.wait {
-  background: var(--amber);
+.flag-spin.waiting {
+  color: var(--amber);
+  animation-duration: 2.2s;
+}
+
+@keyframes flag-spin {
+  to { transform: rotate(360deg); }
 }
 
 .title {

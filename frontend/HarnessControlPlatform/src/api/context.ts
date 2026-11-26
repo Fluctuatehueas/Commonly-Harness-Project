@@ -19,12 +19,12 @@ export interface ContextFormats {
 
 // 后端不可达时的兜底，保证离线也能选择常见文件并给出上传失败提示
 const FALLBACK_FORMATS: ContextFormats = {
-  accept: '.png,.jpg,.jpeg,.webp,.gif,.docx,.pdf,.txt,.md,.csv,.json,.yaml,.yml,.cs',
+  accept: '.png,.jpg,.jpeg,.webp,.gif,.docx,.doc,.pdf,.txt,.md,.csv,.json,.yaml,.yml,.cs',
   max_files: 6,
   max_file_mb: 20,
   groups: {
     image: ['.png', '.jpg', '.jpeg', '.webp', '.gif'],
-    document: ['.docx', '.pdf'],
+    document: ['.docx', '.doc', '.pdf'],
     text: ['.txt', '.md', '.markdown', '.csv', '.json', '.yaml', '.yml', '.log', '.xml', '.html', '.htm', '.py', '.js', '.ts', '.java', '.sql', '.ini', '.toml', '.cs'],
   },
 }

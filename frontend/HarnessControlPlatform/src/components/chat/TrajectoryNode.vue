@@ -191,9 +191,12 @@ onBeforeUnmount(() => registry?.delete(props.node.msg.id))
       :data-traj-level="level"
       @click="hasDetail && (open = !open)"
     >
-      <span class="rail-dot" :class="{ active: msg.streaming }">
-        <AppIcon :name="icon" :size="11" />
-      </span>
+      <AppIcon
+        :name="icon"
+        :size="12"
+        class="tnode-icon"
+        :class="{ active: msg.streaming }"
+      />
       <span class="tnode-label">{{ label }}</span>
       <span v-if="effectiveAgent && !delegation && msg.kind !== 'subagent'" class="tnode-agent">
         {{ effectiveAgent }}
@@ -219,7 +222,7 @@ onBeforeUnmount(() => registry?.delete(props.node.msg.id))
       <AppIcon
         v-if="hasDetail"
         name="chevronRight"
-        :size="10"
+        :size="11"
         class="tnode-chev"
         :class="{ open }"
       />
@@ -257,18 +260,19 @@ onBeforeUnmount(() => registry?.delete(props.node.msg.id))
 <style scoped>
 .tnode {
   position: relative;
-  padding-left: 4px;
 }
 
+/* Claude 风格：无彩色徽章的单行文本 + 右侧箭头 */
 .tnode-row {
   display: flex;
   align-items: center;
   gap: 7px;
-  min-height: 26px;
+  min-height: 27px;
   padding: 2px 4px;
   border-radius: 6px;
-  color: var(--text-3);
-  font-size: 11.5px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
   transition: background 0.15s, color 0.15s;
 }
 
@@ -277,120 +281,82 @@ onBeforeUnmount(() => registry?.delete(props.node.msg.id))
 }
 
 .tnode-row.clickable:hover {
-  color: var(--text-2);
-  background: rgba(79, 140, 255, 0.06);
+  color: var(--text-1);
+  background: rgba(255, 255, 255, 0.04);
 }
 
-.rail-dot {
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
+.tnode-icon {
   flex: none;
-  border-radius: 50%;
   color: var(--text-3);
-  background: rgba(79, 140, 255, 0.1);
 }
 
-.tnode.reasoning .rail-dot {
-  color: #9fb4ff;
-}
-
-.tnode.delegation .rail-dot {
-  color: #b3a4ff;
-  background: rgba(143, 123, 255, 0.14);
-}
-
-.tnode.tool .rail-dot {
+.tnode-icon.active {
   color: var(--accent-cyan);
-  background: rgba(53, 224, 255, 0.1);
-}
-
-.tnode.interrupt .rail-dot {
-  color: #7fe0b0;
-  background: rgba(72, 214, 140, 0.12);
-}
-
-.rail-dot.active {
   animation: node-pulse 1.3s ease-in-out infinite;
 }
 
 @keyframes node-pulse {
-  0%, 100% { opacity: 0.55; }
+  0%, 100% { opacity: 0.5; }
   50% { opacity: 1; }
 }
 
 .tnode-label {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: inherit;
 }
 
 .tnode-status {
   flex: none;
-  font-size: 10px;
+  font-size: 11px;
+  color: var(--text-3);
 }
 
-/* 子 Agent 名称徽标：让每个工具节点都能看出是谁调用的 */
+/* 子 Agent 名称：弱化为纯文字，不使用彩色胶囊 */
 .tnode-agent {
   flex: none;
-  padding: 0 6px;
-  font-size: 9.5px;
-  line-height: 16px;
-  color: #c3b6ff;
-  border: 1px solid rgba(143, 123, 255, 0.35);
-  border-radius: 999px;
-  background: rgba(143, 123, 255, 0.08);
+  font-size: 11px;
+  color: var(--text-3);
   white-space: nowrap;
+}
+
+.tnode-agent::before {
+  content: '· ';
+  opacity: 0.6;
 }
 
 /* 折叠委派节点的一行过程预览 */
 .tnode-preview {
-  flex: 2 1 0;
+  flex: 1 1 0;
   min-width: 0;
   overflow: hidden;
-  font-size: 10.5px;
+  font-size: 11.5px;
   color: var(--text-3);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 /* 经验 / 任务流命中标记：仅过程渲染，不进入轨迹存储 */
-.tnode.marker .rail-dot {
-  color: #9ff3df;
-  background: rgba(55, 208, 196, 0.12);
-}
-
-.tnode.marker .tnode-label {
-  flex: none;
-  color: #9ff3df;
-}
-
 .tnode-marker-chips {
   display: flex;
   flex: 1;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
 }
 
 .marker-chip {
-  padding: 1px 7px;
-  font-size: 9.5px;
+  font-size: 11.5px;
   line-height: 1.5;
-  color: #9ff3df;
-  border: 1px solid rgba(55, 208, 196, 0.4);
-  border-radius: 999px;
-  background: rgba(55, 208, 196, 0.08);
+  color: var(--text-3);
   white-space: nowrap;
 }
 
 .marker-chip.flow {
-  color: #c3b6ff;
-  border-color: rgba(143, 123, 255, 0.45);
-  background: rgba(143, 123, 255, 0.1);
+  color: var(--text-2);
 }
 
 .tnode-status.calling {
@@ -402,20 +368,21 @@ onBeforeUnmount(() => registry?.delete(props.node.msg.id))
 }
 
 .tnode-status.resolved {
-  color: #58e0a0;
+  color: var(--text-2);
 }
 
 .tnode-time {
   flex: none;
-  font-size: 9.5px;
+  font-size: 10px;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
-  opacity: 0.75;
+  opacity: 0.7;
 }
 
 .tnode-chev {
   flex: none;
   color: var(--text-3);
+  opacity: 0.75;
   transition: transform 0.18s;
 }
 
@@ -423,60 +390,56 @@ onBeforeUnmount(() => registry?.delete(props.node.msg.id))
   transform: rotate(90deg);
 }
 
+/* 展开内容：仅一条细竖线 + 缩进，不加底色 */
 .tnode-body {
-  margin: 2px 0 4px 25px;
-  padding: 7px 9px;
+  margin: 0 0 4px 23px;
+  padding: 4px 0 4px 12px;
   border-left: 1px solid var(--line);
-  background: rgba(6, 13, 28, 0.45);
-  border-radius: 0 6px 6px 0;
 }
 
 .prose {
-  font-size: 11.5px;
-  line-height: 1.65;
+  font-size: 12px;
+  line-height: 1.75;
   color: var(--text-2);
   white-space: pre-wrap;
   word-break: break-word;
 }
 
 .part + .part {
-  margin-top: 6px;
+  margin-top: 8px;
 }
 
 .part small {
   display: block;
-  margin-bottom: 3px;
-  font-size: 9.5px;
+  margin-bottom: 4px;
+  font-size: 11px;
   color: var(--text-3);
 }
 
 .part pre {
   margin: 0;
-  padding: 6px 8px;
-  max-height: 180px;
+  padding: 8px 10px;
+  max-height: 220px;
   overflow: auto;
   font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
-  font-size: 10.5px;
-  line-height: 1.5;
+  font-size: 11px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--text-2);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: rgba(4, 10, 22, 0.7);
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.045);
 }
 
 .part pre.result {
-  color: #a9d3ff;
+  color: var(--text-2);
 }
 
-/* 子节点缩进 + 左侧竖线，形成树状结构 */
+/* 子节点：缩进 + 细竖线，层级靠线与留白表达 */
 .tnode-children {
-  position: relative;
-  margin-left: 17px;
-  padding-left: 11px;
-  border-left: 1px solid rgba(143, 123, 255, 0.35);
-  background: rgba(143, 123, 255, 0.025);
-  border-radius: 0 6px 6px 0;
+  margin-left: 23px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
 }
 </style>

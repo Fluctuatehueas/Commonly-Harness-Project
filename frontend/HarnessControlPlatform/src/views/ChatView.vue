@@ -18,6 +18,7 @@ import TopNav from '@/components/console/TopNav.vue'
 import AppIcon from '@/components/console/AppIcon.vue'
 import type { IconName } from '@/components/console/icons'
 import InterruptCard from '@/components/chat/InterruptCard.vue'
+import CollapsibleText from '@/components/chat/CollapsibleText.vue'
 import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
@@ -1904,21 +1905,23 @@ async function submit() {
                 <div class="msg-col user">
                   <div class="bubble user-bubble">
                     <div v-if="turn.user.attachments?.length" class="bubble-atts">
-                      <span v-for="att in turn.user.attachments" :key="att.id" class="bubble-att">
+                      <template v-for="att in turn.user.attachments" :key="att.id">
                         <button
                           v-if="att.kind === 'image' && attachmentSrc(att)"
-                          class="att-thumb"
+                          class="att-image"
                           type="button"
                           :title="`查看 ${att.name}`"
                           @click="openImagePreview(attachmentSrc(att), att.name)"
                         >
                           <img :src="attachmentSrc(att)" :alt="att.name" />
                         </button>
-                        <FileTypeIcon v-else :ext="att.ext" :name="att.name" :size="22" />
-                        <span>{{ att.name }}</span>
-                      </span>
+                        <span v-else class="bubble-att">
+                          <FileTypeIcon :ext="att.ext" :name="att.name" :size="20" />
+                          <span class="att-name">{{ att.name }}</span>
+                        </span>
+                      </template>
                     </div>
-                    <span v-if="turn.user.content">{{ turn.user.content }}</span>
+                    <CollapsibleText v-if="turn.user.content" :text="turn.user.content" />
                   </div>
                   <div
                     v-if="turn.user.content || canWithdraw(turn, turnIndex)"
@@ -2542,41 +2545,38 @@ async function submit() {
   padding: 10px 20px 0;
 }
 
-/* 轨迹粘性折叠条：整条点击切换，层级用 L1/L2 标记 + 缩进表达 */
+/* 轨迹粘性折叠条：整条点击切换，弱化为一行过程摘要 */
 .traj-pin {
   flex: none;
   display: flex;
   align-items: center;
   gap: 7px;
   margin: 6px 20px 0;
-  padding: 5px 8px;
+  padding: 4px 9px;
   font-family: inherit;
   font-size: 11.5px;
-  color: var(--text-2);
+  color: var(--text-3);
   text-align: left;
   cursor: pointer;
   border: 1px solid var(--line);
-  border-left: 2px solid rgba(53, 224, 255, 0.45);
-  border-radius: 7px;
+  border-radius: 8px;
   background: rgba(9, 16, 29, 0.94);
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
-  transition: border-color 0.16s, background 0.16s;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
 }
 
 .traj-pin:hover {
-  border-color: rgba(53, 224, 255, 0.45);
+  color: var(--text-2);
+  border-color: var(--line-strong);
   background: rgba(12, 22, 38, 0.96);
 }
 
 .traj-pin-level {
   flex: none;
-  padding: 0 4px;
   font-family: var(--font-mono);
-  font-size: 9px;
-  line-height: 15px;
-  color: var(--accent-cyan);
-  border: 1px solid rgba(53, 224, 255, 0.32);
-  border-radius: 4px;
+  font-size: 10px;
+  color: var(--text-3);
+  opacity: 0.8;
 }
 
 .traj-pin-label {
@@ -2598,7 +2598,7 @@ async function submit() {
 }
 
 .traj-pin:hover .traj-pin-chev {
-  color: var(--accent-cyan);
+  color: var(--text-2);
 }
 
 /* 未配置沙箱时的本机执行安全提示 */
@@ -3538,25 +3538,56 @@ async function submit() {
 .bubble-atts {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  align-items: flex-end;
+  gap: 8px;
   margin-bottom: 6px;
+}
+
+/* 图片附件：Claude 式圆角缩略图，点击打开全屏预览 */
+.att-image {
+  display: inline-flex;
+  flex: none;
+  max-width: 180px;
+  max-height: 180px;
+  padding: 0;
+  overflow: hidden;
+  cursor: zoom-in;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  transition: border-color 0.15s ease, filter 0.15s ease;
+}
+
+.att-image img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 180px;
+  max-height: 180px;
+  object-fit: cover;
+}
+
+.att-image:hover {
+  border-color: rgba(255, 255, 255, 0.26);
+  filter: brightness(1.06);
 }
 
 .bubble-att {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  max-width: 220px;
   padding: 3px 8px 3px 4px;
   font-size: 10.5px;
   border-radius: 7px;
   background: rgba(0, 0, 0, 0.18);
 }
 
-.bubble-att img {
-  width: 26px;
-  height: 26px;
-  object-fit: cover;
-  border-radius: 4px;
+.bubble-att .att-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .slide-enter-active,
