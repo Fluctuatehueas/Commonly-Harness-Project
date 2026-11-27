@@ -22,6 +22,7 @@ import CollapsibleText from '@/components/chat/CollapsibleText.vue'
 import CompactionBanner from '@/components/chat/CompactionBanner.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
+import PluginSlotRail from '@/components/plugins/PluginSlotRail.vue'
 import MarkdownView from '@/components/chat/MarkdownView.vue'
 import MediaViewer from '@/components/chat/MediaViewer.vue'
 import FileTypeIcon from '@/components/chat/FileTypeIcon.vue'
@@ -2439,6 +2440,8 @@ async function submit() {
           </el-button>
         </div>
       </section>
+
+      <PluginSlotRail slot="chat.sidebar" />
 
       <Transition name="slide">
         <FilePanel

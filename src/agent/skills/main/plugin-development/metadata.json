@@ -1,0 +1,4 @@
+{
+  "name": "plugin-development",
+  "description": "开发、冒烟测试和打包 Harness 插件（stdio 外部插件或进程内内置插件），产出可安装 ZIP 与自检结果，安装前必须由用户确认。"
+}

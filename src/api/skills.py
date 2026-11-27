@@ -1,19 +1,23 @@
 """技能管理 HTTP 接口。
 
-技能库以磁盘目录为唯一事实源：
+技能以磁盘目录为唯一事实源：
 
-    <SKILLS_ROOT>/main/{skill}
-    <SKILLS_ROOT>/subagents/{agent}/{skill}
-    <DISABLED_SKILLS_ROOT>/main/{skill}
+    <HARNESS_HOME>/skills/builtin/main/{skill}                 # 只读
+    <HARNESS_HOME>/skills/builtin/subagents/{agent}/{skill}    # 只读
+    <HARNESS_HOME>/skills/users/{uid}/main/{skill}
+    <HARNESS_HOME>/skills/users/{uid}/subagents/{agent}/{skill}
+    <HARNESS_HOME>/skills/users/{uid}/skills-disabled/
 
-关闭技能时把整个目录移到 ``skills-disabled`` 下，Agent 与沙箱同步就
-不会再发现它；重新启用时再移回。删除是硬删除（直接从磁盘移除）。
+用户技能停用时移动到 ``skills-disabled``；内置技能按用户记录在
+``skills-state.json`` 的 ``disabled_builtin`` 里，不移动文件。
+删除是硬删除，仅对用户技能生效。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -31,6 +35,8 @@ import yaml
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
+from agent import config as agent_config
+from agent import file_index
 from agent.tools.skill_tools import (
     MAIN_SKILLS_DIRECTORY,
     SKILL_NAME_PATTERN,
@@ -41,14 +47,24 @@ from agent.tools.skill_tools import (
     parse_skill_metadata,
     validate_archive_members,
 )
+from agent.user_data import (
+    builtin_disabled_keys,
+    builtin_skills_root,
+    read_skills_state,
+    write_skills_state,
+)
 from api.agent_loader import agent_loader
 
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
+logger = logging.getLogger(__name__)
+
 PROTECTED_SKILL = "skill-management"
 MAX_PACKAGE_BYTES = 32 * 1024 * 1024
 MAX_MARKDOWN_CHARS = 2_000_000
+MAX_USER_SKILL_BYTES = 200 * 1024 * 1024
+MAX_USER_SKILL_FILES = 2000
 TARGET_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
@@ -94,10 +110,10 @@ def _relative_parts(target: str, name: str) -> tuple[str, ...]:
     return (*_target_parts(target), _validate_skill_name(name))
 
 
-def _roots() -> tuple[Path, Path]:
+def _roots(user_id: str | None = None) -> tuple[Path, Path]:
     """当前用户的（启用, 停用）技能根目录。
 
-    技能库和停用目录都位于 ``USER_DATA_DIR/users/{user_id}/`` 下，
+    技能库和停用目录都位于 ``HARNESS_HOME/skills/users/{user_id}/`` 下，
     不同用户的增删改互不可见。
     """
     from agent.identity import current_user_id
@@ -106,16 +122,24 @@ def _roots() -> tuple[Path, Path]:
         user_skills_root,
     )
 
-    uid = current_user_id()
+    uid = user_id or current_user_id()
     return user_skills_root(uid), user_disabled_skills_root(uid)
 
 
-def _enabled_path(target: str, name: str) -> Path:
-    return _roots()[0].joinpath(*_relative_parts(target, name))
+def _enabled_path(
+    target: str, name: str, user_id: str | None = None
+) -> Path:
+    return _roots(user_id)[0].joinpath(*_relative_parts(target, name))
 
 
-def _disabled_path(target: str, name: str) -> Path:
-    return _roots()[1].joinpath(*_relative_parts(target, name))
+def _disabled_path(
+    target: str, name: str, user_id: str | None = None
+) -> Path:
+    return _roots(user_id)[1].joinpath(*_relative_parts(target, name))
+
+
+def _builtin_path(target: str, name: str) -> Path:
+    return builtin_skills_root().joinpath(*_relative_parts(target, name))
 
 
 def _read_frontmatter(directory: Path) -> dict[str, Any]:
@@ -191,7 +215,14 @@ def _directory_stats(directory: Path) -> tuple[int, int, str]:
     return files, size, updated
 
 
-def _item(target: str, name: str, directory: Path, enabled: bool) -> dict[str, Any]:
+def _item(
+    target: str,
+    name: str,
+    directory: Path,
+    enabled: bool,
+    *,
+    source: str = "user",
+) -> dict[str, Any]:
     title, description = _skill_summary(directory)
     file_count, size_bytes, updated_at = _directory_stats(directory)
     return {
@@ -201,6 +232,9 @@ def _item(target: str, name: str, directory: Path, enabled: bool) -> dict[str, A
         "description": description,
         "target": target,
         "enabled": enabled,
+        "source": source,
+        "editable": source == "user",
+        "deletable": source == "user" and name.casefold() != PROTECTED_SKILL,
         "protected": name.casefold() == PROTECTED_SKILL,
         "file_count": file_count,
         "size_bytes": size_bytes,
@@ -209,14 +243,29 @@ def _item(target: str, name: str, directory: Path, enabled: bool) -> dict[str, A
     }
 
 
-def _collect(root: Path, enabled: bool) -> list[dict[str, Any]]:
+def _collect(
+    root: Path,
+    enabled: bool,
+    *,
+    source: str = "user",
+) -> list[dict[str, Any]]:
     """扫描一个技能根目录下的 main 与 subagents。"""
     items: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return items
     main_dir = root / MAIN_SKILLS_DIRECTORY
     if main_dir.is_dir():
         for directory in main_dir.iterdir():
             if directory.is_dir() and (directory / "SKILL.md").is_file():
-                items.append(_item(MAIN_SKILLS_DIRECTORY, directory.name, directory, enabled))
+                items.append(
+                    _item(
+                        MAIN_SKILLS_DIRECTORY,
+                        directory.name,
+                        directory,
+                        enabled,
+                        source=source,
+                    )
+                )
     subagents_dir = root / SUBAGENTS_DIRECTORY
     if subagents_dir.is_dir():
         for agent_dir in subagents_dir.iterdir():
@@ -225,31 +274,81 @@ def _collect(root: Path, enabled: bool) -> list[dict[str, Any]]:
             target = f"{SUBAGENTS_DIRECTORY}/{agent_dir.name}"
             for directory in agent_dir.iterdir():
                 if directory.is_dir() and (directory / "SKILL.md").is_file():
-                    items.append(_item(target, directory.name, directory, enabled))
+                    items.append(
+                        _item(
+                            target,
+                            directory.name,
+                            directory,
+                            enabled,
+                            source=source,
+                        )
+                    )
     return items
 
 
-def _list_all() -> list[dict[str, Any]]:
-    """合并当前用户的启用/停用技能；同名同归属以启用版本为准。"""
-    root, disabled_root = _roots()
-    enabled_items = _collect(root, True)
-    disabled_items = _collect(disabled_root, False)
-    seen = {(item["target"], item["name"]) for item in enabled_items}
-    merged = enabled_items + [
-        item for item in disabled_items if (item["target"], item["name"]) not in seen
-    ]
+def _scan_all(user_id: str) -> list[dict[str, Any]]:
+    """合并用户技能与内置技能：用户同名技能覆盖内置。"""
+    user_root, disabled_root = _roots(user_id)
+    enabled_items = _collect(user_root, True, source="user")
+    disabled_items = _collect(disabled_root, False, source="user")
+    builtin_items = _collect(builtin_skills_root(), True, source="builtin")
+
+    user_keys = {
+        (item["target"], item["name"])
+        for item in [*enabled_items, *disabled_items]
+    }
+    disabled_builtin = builtin_disabled_keys(user_id)
+    merged_builtin: list[dict[str, Any]] = []
+    for item in builtin_items:
+        if (item["target"], item["name"]) in user_keys:
+            continue
+        key = f"{item['target']}:{item['name']}"
+        item["enabled"] = key not in disabled_builtin
+        merged_builtin.append(item)
+
+    merged = enabled_items + disabled_items + merged_builtin
     merged.sort(key=lambda item: (item["target"], item["title"].casefold(), item["name"]))
     return merged
 
 
-def _locate(target: str, name: str) -> tuple[Path, bool]:
-    """返回技能目录与是否启用。"""
-    enabled = _enabled_path(target, name)
+def _list_all() -> list[dict[str, Any]]:
+    """通过文件索引读取技能列表；索引失效时自动重建。"""
+    from agent.identity import current_user_id
+
+    uid = current_user_id()
+    user_root, disabled_root = _roots(uid)
+    roots = [
+        user_root,
+        disabled_root,
+        builtin_skills_root(),
+        user_root / "skills-state.json",
+    ]
+    return file_index.get(
+        "skills",
+        uid,
+        roots,
+        lambda: _scan_all(uid),
+    )
+
+
+def _locate(
+    target: str,
+    name: str,
+    user_id: str | None = None,
+) -> tuple[Path, bool, str]:
+    """返回技能目录、是否启用、来源（user / builtin）。"""
+    from agent.identity import current_user_id
+
+    uid = user_id or current_user_id()
+    enabled = _enabled_path(target, name, uid)
     if enabled.is_dir():
-        return enabled, True
-    disabled = _disabled_path(target, name)
+        return enabled, True, "user"
+    disabled = _disabled_path(target, name, uid)
     if disabled.is_dir():
-        return disabled, False
+        return disabled, False, "user"
+    builtin = _builtin_path(target, name)
+    if builtin.is_dir():
+        return builtin, f"{target}:{name}" not in builtin_disabled_keys(uid), "builtin"
     raise HTTPException(status_code=404, detail="技能不存在")
 
 
@@ -274,6 +373,45 @@ def _remove_directory(path: Path) -> None:
 async def _refresh_agents() -> None:
     """技能目录变化后清空图缓存，让下一轮对话重新发现技能。"""
     await agent_loader.reset_agents()
+
+
+def _usage(root: Path) -> tuple[int, int]:
+    """返回 (文件数, 字节数)，忽略 __pycache__ 与 .pyc。"""
+    files = 0
+    size = 0
+    if not root.is_dir():
+        return files, size
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+        for filename in filenames:
+            if filename.endswith(".pyc"):
+                continue
+            try:
+                stat = (Path(dirpath) / filename).stat()
+            except OSError:
+                continue
+            files += 1
+            size += stat.st_size
+    return files, size
+
+
+def _enforce_quota(user_root: Path, cleanup: Path | None = None) -> None:
+    """用户技能库配额检查；超限时可清理本次刚安装的目录。"""
+    files, size = _usage(user_root)
+    if size <= MAX_USER_SKILL_BYTES and files <= MAX_USER_SKILL_FILES:
+        return
+    if cleanup is not None and cleanup.is_dir():
+        try:
+            _remove_directory(cleanup)
+        except OSError:
+            logger.warning("清理超配额技能失败：%s", cleanup, exc_info=True)
+    raise HTTPException(
+        status_code=413,
+        detail=(
+            f"用户技能库超过配额（{size // (1024 * 1024)} MB / {files} 个文件），"
+            f"上限 {MAX_USER_SKILL_BYTES // (1024 * 1024)} MB / {MAX_USER_SKILL_FILES} 个文件"
+        ),
+    )
 
 
 def _move_skill(target: str, name: str, *, enabled: bool) -> dict[str, Any]:
@@ -391,15 +529,19 @@ def _fail_job(job_id: str, message: str) -> None:
 
 async def _run_download_job(job_id: str, url: str) -> None:
     """后台执行 URL 技能安装，并把阶段写回任务表。"""
+    from agent.identity import current_user_id
+
     _update_job(job_id, status="running", stage="downloading", message="正在下载技能包")
     try:
         installed = await asyncio.to_thread(download_skill, _roots()[0], url)
         _update_job(job_id, stage="validating", message="正在校验技能元信息")
         name = str(installed.get("skill_name") or "")
         try:
-            directory, enabled = _locate(MAIN_SKILLS_DIRECTORY, name)
+            directory, enabled, _source = _locate(MAIN_SKILLS_DIRECTORY, name)
         except HTTPException as error:
             raise RuntimeError("技能已下载但无法定位安装目录") from error
+        _enforce_quota(_roots()[0], cleanup=directory)
+        file_index.invalidate("skills", current_user_id())
         _update_job(job_id, stage="refreshing", message="正在刷新 Agent 技能")
         await _refresh_agents()
         item = _item(MAIN_SKILLS_DIRECTORY, name, directory, enabled)
@@ -420,6 +562,8 @@ async def _run_download_job(job_id: str, url: str) -> None:
 
 async def _run_archive_job(job_id: str, data: bytes, fallback: str) -> None:
     """后台执行 ZIP 技能包安装。"""
+    from agent.identity import current_user_id
+
     _update_job(job_id, status="running", stage="extracting", message="正在解压技能包")
     try:
         root, disabled_root = _roots()
@@ -430,6 +574,8 @@ async def _run_archive_job(job_id: str, data: bytes, fallback: str) -> None:
             fallback_name=fallback,
             disabled_root=disabled_root,
         )
+        _enforce_quota(root, cleanup=Path(item["path"]))
+        file_index.invalidate("skills", current_user_id())
         _update_job(job_id, stage="refreshing", message="正在刷新 Agent 技能")
         await _refresh_agents()
         _update_job(
@@ -519,10 +665,14 @@ async def get_storage() -> dict[str, Any]:
     """返回当前用户技能库真实落盘位置与安装限制。"""
     root, disabled_root = _roots()
     return {
+        "harness_home": str(agent_config.HARNESS_HOME),
         "skills_root": str(root),
         "main_root": str(root / MAIN_SKILLS_DIRECTORY),
+        "builtin_root": str(builtin_skills_root()),
         "disabled_root": str(disabled_root),
         "max_package_mb": MAX_PACKAGE_BYTES // (1024 * 1024),
+        "max_user_mb": MAX_USER_SKILL_BYTES // (1024 * 1024),
+        "max_user_files": MAX_USER_SKILL_FILES,
     }
 
 
@@ -586,7 +736,7 @@ async def get_skill_content(
     name: str = Query(..., min_length=1, max_length=64),
 ) -> dict[str, Any]:
     """读取技能详情：SKILL.md 正文 + 元信息。"""
-    directory, enabled = _locate(target, name)
+    directory, enabled, source = _locate(target, name)
     skill_file = directory / "SKILL.md"
     if not skill_file.is_file():
         raise HTTPException(status_code=404, detail="技能缺少 SKILL.md")
@@ -599,7 +749,7 @@ async def get_skill_content(
     if truncated:
         content = content[:MAX_MARKDOWN_CHARS]
     return {
-        "skill": _item(target, name, directory, enabled),
+        "skill": _item(target, name, directory, enabled, source=source),
         "content": content,
         "truncated": truncated,
     }
@@ -612,12 +762,38 @@ async def get_skill_content(
 
 @router.post("/toggle")
 async def toggle_skill(body: SkillToggleRequest) -> dict[str, Any]:
-    """启用或停用技能（物理移动目录）。"""
-    _safe_skill_name(body.name)
-    directory, current = _locate(body.target, body.name)
+    """启用或停用技能；内置技能写用户级停用列表，用户技能移动目录。"""
+    from agent.identity import current_user_id
+
+    _validate_skill_name(body.name)
+    uid = current_user_id()
+    directory, current, source = _locate(body.target, body.name, uid)
+
+    if source == "builtin":
+        if current == body.enabled:
+            return _item(body.target, body.name, directory, current, source="builtin")
+        state = read_skills_state(uid)
+        disabled = set(state["disabled_builtin"])
+        key = f"{body.target}:{body.name}"
+        if body.enabled:
+            disabled.discard(key)
+        else:
+            disabled.add(key)
+        write_skills_state(
+            uid,
+            {
+                "builtin_version": state["builtin_version"] or "1.1",
+                "disabled_builtin": sorted(disabled),
+            },
+        )
+        file_index.invalidate("skills", uid)
+        await _refresh_agents()
+        return _item(body.target, body.name, directory, body.enabled, source="builtin")
+
     if current == body.enabled:
-        return _item(body.target, body.name, directory, current)
+        return _item(body.target, body.name, directory, current, source=source)
     item = await asyncio.to_thread(_move_skill, body.target, body.name, enabled=body.enabled)
+    file_index.invalidate("skills", uid)
     await _refresh_agents()
     return item
 
@@ -627,7 +803,12 @@ async def delete_skill(
     target: str = Query(MAIN_SKILLS_DIRECTORY, max_length=80),
     name: str = Query(..., min_length=1, max_length=64),
 ) -> dict[str, bool]:
-    """硬删除技能目录（启用与停用位置的同名技能都会清理）。"""
+    """硬删除用户技能；内置技能只能停用，不能删除。"""
+    from agent.identity import current_user_id
+
+    directory, _enabled, source = _locate(target, name)
+    if source == "builtin":
+        raise HTTPException(status_code=400, detail="内置技能不可删除，请使用停用")
     _safe_skill_name(name)
     removed = False
     for path in (_enabled_path(target, name), _disabled_path(target, name)):
@@ -639,6 +820,7 @@ async def delete_skill(
             removed = True
     if not removed:
         raise HTTPException(status_code=404, detail="技能不存在")
+    file_index.invalidate("skills", current_user_id())
     await _refresh_agents()
     return {"ok": True}
 
@@ -676,6 +858,10 @@ async def create_skill(body: SkillCreateRequest) -> dict[str, Any]:
                 pass
         raise HTTPException(status_code=500, detail=f"创建技能失败: {error}") from error
 
+    from agent.identity import current_user_id
+
+    _enforce_quota(_roots()[0], cleanup=directory)
+    file_index.invalidate("skills", current_user_id())
     await _refresh_agents()
     return _item(MAIN_SKILLS_DIRECTORY, name, directory, True)
 
@@ -756,7 +942,7 @@ async def download_skill_from_url(body: SkillDownloadRequest) -> dict[str, Any]:
 @router.post("/reveal")
 async def reveal_skill(body: SkillTargetRequest) -> dict[str, bool]:
     """在服务器所在机器的资源管理器中打开技能目录。"""
-    directory, _ = _locate(body.target, body.name)
+    directory, _, _source = _locate(body.target, body.name)
     path = str(directory)
     try:
         if sys.platform == "win32":

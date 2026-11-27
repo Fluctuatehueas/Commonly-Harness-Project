@@ -1,17 +1,23 @@
 """用户级数据目录、配置与资源隔离。
 
-目录约定（与项目现有 ``projects.json`` 保持一致）::
+目录约定::
 
     <USER_DATA_DIR>/users/<user_id>/
         settings.json          # 模型 / 沙箱 / 上下文 / 归档等系统配置
-        agents.json            # MyAgent 档案由 PostgreSQL 存储，此文件仅保留说明
-        mcp/servers.json       # 该用户的 MCP 服务配置
-        rag/providers.json     # 该用户的 RAG Provider 配置
-        skills/                # 该用户的技能库（首次从内置技能复制）
-        skills-disabled/       # 该用户停用的技能
         projects.json          # 该用户的项目登记（由 project_store 维护）
+        rag/providers.json     # 该用户的 RAG Provider 配置
 
-所有读写都做目录名清洗与原子写入，避免路径穿越或写坏配置。
+    <HARNESS_HOME>/mcp/users/<user_id>/
+        servers.json           # 该用户的 MCP 服务配置
+        runtime/<server_id>/   # npm 缓存与 stdio 日志
+
+    <HARNESS_HOME>/skills/
+        builtin/               # 内置技能（只读）
+        users/<user_id>/       # 用户技能与 skills-disabled
+        users/<user_id>/skills-state.json
+
+``HARNESS_HOME`` 由 PUBLISH_PROGRAM_PATH 决定，未设置或不可写时回退
+``USER_DATA_DIR``。所有读写都做目录名清洗与原子写入。
 """
 
 from __future__ import annotations
@@ -260,13 +266,23 @@ def _copy_file_once(source: Path, target: Path) -> None:
 
 def user_mcp_config_path(user_id: str | None) -> Path:
     config = _config_module()
-    target = user_root(user_id) / "mcp" / "servers.json"
+    from agent.storage_migration import migrate_user
+
+    migrate_user(user_id)
+    target = (
+        Path(config.HARNESS_HOME)
+        / "mcp"
+        / "users"
+        / safe_user_id(user_id)
+        / "servers.json"
+    )
     _copy_file_once(Path(config.MCP_CONFIG_PATH), target)
     return target
 
 
 def user_mcp_root(user_id: str | None) -> Path:
-    return user_root(user_id) / "mcp"
+    config = _config_module()
+    return Path(config.HARNESS_HOME) / "mcp" / "users" / safe_user_id(user_id)
 
 
 def user_rag_config_path(user_id: str | None) -> Path:
@@ -277,37 +293,76 @@ def user_rag_config_path(user_id: str | None) -> Path:
 
 
 def user_skills_root(user_id: str | None) -> Path:
-    """首次访问时把内置技能复制到用户自己的技能库。"""
+    """用户技能库：``<HARNESS_HOME>/skills/users/{uid}``。
+
+    内置技能不再复制进来，Agent 读取时先用户、后 builtin。
+    """
     config = _config_module()
-    target = user_root(user_id) / "skills"
-    if not target.exists():
-        source = Path(getattr(config, "BUNDLED_SKILLS_ROOT", config.SKILLS_ROOT))
-        try:
-            if source.is_dir() and source.resolve() != target.resolve():
-                shutil.copytree(source, target)
-            else:
-                target.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            logger.warning("复制用户技能库失败，创建空目录：%s", target, exc_info=True)
-            target.mkdir(parents=True, exist_ok=True)
-    return target.resolve()
+    from agent.storage_migration import migrate_user
 
-
-def user_disabled_skills_root(user_id: str | None) -> Path:
-    target = user_root(user_id) / "skills-disabled"
+    migrate_user(user_id)
+    target = (
+        Path(config.HARNESS_HOME) / "skills" / "users" / safe_user_id(user_id)
+    )
     target.mkdir(parents=True, exist_ok=True)
     return target.resolve()
 
 
+def user_disabled_skills_root(user_id: str | None) -> Path:
+    target = user_skills_root(user_id) / "skills-disabled"
+    target.mkdir(parents=True, exist_ok=True)
+    return target.resolve()
+
+
+def builtin_skills_root() -> Path:
+    """随包内置技能根目录（只读）。"""
+    return Path(_config_module().SKILLS_ROOT).resolve()
+
+
+def skills_state_path(user_id: str | None) -> Path:
+    return user_skills_root(user_id) / "skills-state.json"
+
+
+def read_skills_state(user_id: str | None) -> dict[str, Any]:
+    raw = read_json(skills_state_path(user_id), {})
+    disabled = raw.get("disabled_builtin") if isinstance(raw, dict) else None
+    return {
+        "builtin_version": str(
+            (raw.get("builtin_version") if isinstance(raw, dict) else "") or ""
+        ),
+        "disabled_builtin": [
+            str(item) for item in (disabled or []) if str(item or "").strip()
+        ],
+    }
+
+
+def write_skills_state(user_id: str | None, state: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "builtin_version": str(state.get("builtin_version") or ""),
+        "disabled_builtin": sorted(
+            {str(item) for item in (state.get("disabled_builtin") or []) if item}
+        ),
+    }
+    write_json(skills_state_path(user_id), payload)
+    return payload
+
+
+def builtin_disabled_keys(user_id: str | None) -> set[str]:
+    return set(read_skills_state(user_id)["disabled_builtin"])
+
+
 def user_paths(user_id: str | None) -> dict[str, str]:
     """设置页展示用的用户级路径集合。"""
+    config = _config_module()
     return {
         "user_root": str(user_root(user_id)),
+        "harness_home": str(config.HARNESS_HOME),
         "settings": str(user_settings_path(user_id)),
         "projects": str(user_project_path(user_id)),
         "mcp_config": str(user_mcp_config_path(user_id)),
         "mcp_root": str(user_mcp_root(user_id)),
         "rag_config": str(user_rag_config_path(user_id)),
         "skills_root": str(user_skills_root(user_id)),
+        "builtin_skills_root": str(builtin_skills_root()),
         "skills_disabled_root": str(user_disabled_skills_root(user_id)),
     }

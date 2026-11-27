@@ -1,0 +1,22 @@
+{
+  "plugin_id": "my-plugin",
+  "name": "我的插件",
+  "version": "1.0.0",
+  "protocolVersion": "1.0",
+  "description": "替换为插件用途。",
+  "author": { "name": "your-name" },
+  "license": "MIT",
+  "tag": ["示例"],
+  "capabilities": ["tool"],
+  "runtime": {
+    "kind": "subprocess",
+    "language": "python",
+    "command": "python",
+    "args": ["plugin.py"]
+  },
+  "transport": { "kind": "stdio" },
+  "permissions": [],
+  "env": { "python": ">=3.11" },
+  "harnessVersion": { "min": "1.1.0", "max": "1.x" },
+  "dist": {}
+}

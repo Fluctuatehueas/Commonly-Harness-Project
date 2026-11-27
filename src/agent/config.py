@@ -5,6 +5,7 @@
 # ============================================================
 import asyncio # Windows 事件循环策略，以及提供异步 API。
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -603,6 +604,57 @@ USER_DATA_DIR, USER_DATA_FALLBACK = _resolve_user_data_dir()
 USER_DATA_ERROR = _USER_DATA_ERROR
 
 
+# ============================================================
+# 部署基准目录（v1.1 存储结构）
+# ============================================================
+
+
+def _publish_program_path() -> Path | None:
+    """发布程序基准目录：只有显式设置 PUBLISH_PROGRAM_PATH 才启用。"""
+    raw = (os.getenv("PUBLISH_PROGRAM_PATH") or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except OSError:
+        logger.warning("PUBLISH_PROGRAM_PATH 无法解析：%s", raw)
+        return None
+
+
+PUBLISH_PROGRAM_PATH = _publish_program_path()
+
+
+def _resolve_harness_home() -> Path:
+    """可写运行根：部署目录可写时用它，否则回退 USER_DATA_DIR。"""
+    if PUBLISH_PROGRAM_PATH is None:
+        return USER_DATA_DIR
+    try:
+        _probe_writable(PUBLISH_PROGRAM_PATH)
+    except OSError as error:
+        logger.warning(
+            "PUBLISH_PROGRAM_PATH 不可写，回退 %s（%s）",
+            USER_DATA_DIR,
+            type(error).__name__,
+        )
+        return USER_DATA_DIR
+    return PUBLISH_PROGRAM_PATH
+
+
+HARNESS_HOME = _resolve_harness_home()
+
+
+def harness_home_info() -> dict[str, Any]:
+    """设置页展示用的存储根信息。"""
+    return {
+        "publish_program_path": (
+            str(PUBLISH_PROGRAM_PATH) if PUBLISH_PROGRAM_PATH else ""
+        ),
+        "harness_home": str(HARNESS_HOME),
+        "fallback": PUBLISH_PROGRAM_PATH is None or HARNESS_HOME != PUBLISH_PROGRAM_PATH,
+        "user_data_dir": str(USER_DATA_DIR),
+    }
+
+
 def _user_data_dir() -> Path:
     """兼容旧调用点：返回已解析的用户数据目录。"""
     return USER_DATA_DIR
@@ -625,19 +677,18 @@ def user_data_info() -> dict[str, Any]:
 def _mcp_root() -> Path:
     """MCP 统一管理目录。
 
-    源码模式放在项目 ``mcp/``；打包后安装目录通常只读，因此跟随
-    用户数据目录，保证本地 stdio MCP 也有一处稳定的工作目录。
+    默认跟随 ``HARNESS_HOME``：显式设置 PUBLISH_PROGRAM_PATH 时落在部署目录，
+    否则沿用 USER_DATA_DIR；``HARNESS_MCP_ROOT`` 仍可覆盖。
     """
     override = (os.getenv("HARNESS_MCP_ROOT") or "").strip()
     if override:
         root = Path(override).expanduser()
     else:
-        frozen = bool(getattr(sys, "frozen", False))
-        root = (USER_DATA_DIR / "mcp") if frozen else (PROJECT_ROOT / "mcp")
+        root = HARNESS_HOME / "mcp"
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        fallback = Path(tempfile.gettempdir()) / "CommonHarness" / "mcp"
+        fallback = USER_DATA_DIR / "mcp"
         fallback.mkdir(parents=True, exist_ok=True)
         logger.warning(
             "MCP 目录创建失败，已回退到 %s（%s）", fallback, type(error).__name__
@@ -647,11 +698,36 @@ def _mcp_root() -> Path:
 
 
 MCP_ROOT = _mcp_root()
-# 所有 MCP 服务的 JSON 配置统一写入这一个文件。
-MCP_CONFIG_PATH = Path(
-    (os.getenv("HARNESS_MCP_CONFIG_PATH") or "").strip()
-    or MCP_ROOT / "servers.json"
-)
+
+
+def _mcp_template_path(root: Path) -> Path:
+    """MCP 初始配置模板：新布局优先 template，其次旧的 servers.json。"""
+    override = (os.getenv("HARNESS_MCP_CONFIG_PATH") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    candidates = (
+        root / "servers.template.json",
+        root / "servers.json",
+        PROJECT_ROOT / "mcp" / "servers.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    # 全新部署且没有模板时，写一份空配置，保证用户首次使用有合法 JSON。
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 2, "servers": {}, "main_servers": []}
+        candidates[0].write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.debug("写入 MCP 空模板失败：%s", candidates[0], exc_info=True)
+    return candidates[0]
+
+
+# 所有用户的初始 MCP 配置都从这份模板复制。
+MCP_CONFIG_PATH = _mcp_template_path(MCP_ROOT)
 
 
 def _rag_root() -> Path:
@@ -688,11 +764,10 @@ _MCP_WORKSPACE_ROOT: Path | None = None
 
 
 def mcp_workspace_root() -> Path:
-    """MCP 服务运行态文件的根目录。
+    """MCP 服务运行态根目录。
 
-    默认放在项目根的 ``.mcp/``，让服务配置与它下载的包、产物集中在一处；
-    安装目录只读（打包运行）或当前用户权限不足时回退到用户数据目录，
-    避免因为一处目录不可写导致整个 MCP 链路连不上。
+    默认与 MCP_ROOT 同一个可写根（``HARNESS_HOME/mcp``），用户级运行态
+    统一落 ``users/{user_id}/runtime/{server_id}``；显式覆盖时仍优先。
     """
     global _MCP_WORKSPACE_ROOT
     if _MCP_WORKSPACE_ROOT is not None:
@@ -705,28 +780,13 @@ def mcp_workspace_root() -> Path:
             _probe_writable(root)
         except OSError as error:
             logger.warning(
-                "HARNESS_MCP_WORKSPACE_ROOT 不可写：%s（%s）",
-                root,
+                "HARNESS_MCP_WORKSPACE_ROOT 不可写，回退 %s（%s）",
+                MCP_ROOT,
                 type(error).__name__,
             )
+            root = MCP_ROOT
     else:
-        root = None
-        # 源码模式优先项目内目录；打包后安装目录通常只读，回退用户数据目录。
-        for candidate in (PROJECT_ROOT / ".mcp", USER_DATA_DIR / ".mcp"):
-            try:
-                _probe_writable(candidate)
-            except OSError as error:
-                logger.warning(
-                    "MCP 工作目录不可写，尝试下一个候选 %s（%s）",
-                    candidate,
-                    type(error).__name__,
-                )
-                continue
-            root = candidate
-            break
-        if root is None:
-            root = USER_DATA_DIR / ".mcp"
-            logger.error("MCP 工作目录均不可写，仍使用 %s", root)
+        root = MCP_ROOT
 
     _MCP_WORKSPACE_ROOT = root.resolve()
     logger.info("MCP 工作目录：%s", _MCP_WORKSPACE_ROOT)
@@ -740,17 +800,23 @@ def _safe_mcp_dir_name(server_id: str) -> str:
 
 
 def _mcp_user_dir(server_id: str) -> Path:
-    """MCP 运行态目录按用户隔离，避免同名服务的缓存与日志互相覆盖。"""
+    """MCP 运行态目录按用户隔离：users/{uid}/runtime/{server_id}。"""
     from agent.identity import current_user_id, safe_user_id
 
     user_dir = safe_user_id(current_user_id())
-    return mcp_workspace_root() / "users" / user_dir / _safe_mcp_dir_name(server_id)
+    return (
+        mcp_workspace_root()
+        / "users"
+        / user_dir
+        / "runtime"
+        / _safe_mcp_dir_name(server_id)
+    )
 
 
 def mcp_npm_cache_dir(server_id: str) -> Path:
     """npx / npm 型 stdio 服务的专用 npm 缓存目录。
 
-    目录布局：``<MCP 工作目录>/users/<user_id>/<server_id>/npm-cache``。
+    目录布局：``<MCP 根>/users/<user_id>/runtime/<server_id>/npm-cache``。
     """
     return _mcp_user_dir(server_id) / "npm-cache"
 
@@ -760,58 +826,158 @@ def mcp_stdio_log_path(server_id: str) -> Path:
     return _mcp_user_dir(server_id) / "logs" / "stdio.log"
 
 
-def _resolve_skills_root() -> Path:
-    """解析可写的技能库根目录。
+def _tree_signature(root: Path) -> str:
+    """目录签名：用文件数、总大小与最大 mtime 判断内置技能是否更新。"""
+    latest = 0
+    total = 0
+    count = 0
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix == ".pyc":
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            latest = max(latest, stat.st_mtime_ns)
+            total += stat.st_size
+            count += 1
+    except OSError:
+        pass
+    return f"{count}:{total}:{latest}"
 
-    源码运行时沿用 ``src/agent/skills``，保证与仓库里的技能一致；
-    打包运行时安装目录通常只读且可能被清理，因此改写到用户数据目录，
-    首次启动时把内置技能复制过去，后续增删改都作用在用户自己的技能库。
+
+def _seed_builtin_skills(root: Path) -> None:
+    """把随包技能同步到只读内置目录；随版本变化时整体刷新。"""
+    source = BUNDLED_SKILLS_ROOT
+    if not source.is_dir():
+        root.mkdir(parents=True, exist_ok=True)
+        return
+    signature = _tree_signature(source)
+    marker = root / ".builtin-version"
+    try:
+        if root.is_dir() and marker.is_file():
+            if marker.read_text(encoding="utf-8").strip() == signature:
+                return
+    except OSError:
+        pass
+
+    temporary = root.with_name(f"{root.name}.new-{os.getpid()}")
+    try:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        shutil.copytree(source, temporary)
+        (temporary / ".builtin-version").write_text(signature, encoding="utf-8")
+        if root.exists():
+            shutil.rmtree(root)
+        temporary.replace(root)
+        logger.info("内置技能已刷新：%s", root)
+    except OSError:
+        logger.exception("刷新内置技能失败，继续使用现有目录：%s", root)
+        try:
+            if temporary.exists() and not root.exists():
+                shutil.copytree(temporary, root)
+        except OSError:
+            logger.debug("恢复内置技能临时目录失败", exc_info=True)
+        try:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+        except OSError:
+            pass
+        root.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_skills_root() -> Path:
+    """内置技能根目录（只读）：``<HARNESS_HOME>/skills/builtin``。
+
+    用户技能不再复制内置技能，统一放在 ``skills/users/{user_id}``，
+    读取时先用户、后内置，同名以用户为准。
     """
     override = (os.getenv("HARNESS_SKILLS_ROOT") or "").strip()
     if override:
         root = Path(override).expanduser()
         root.mkdir(parents=True, exist_ok=True)
-        logger.info("技能库目录（HARNESS_SKILLS_ROOT）：%s", root)
+        logger.info("内置技能目录（HARNESS_SKILLS_ROOT）：%s", root)
         return root.resolve()
 
-    frozen = bool(getattr(sys, "frozen", False))
-    if not frozen:
-        try:
-            BUNDLED_SKILLS_ROOT.mkdir(parents=True, exist_ok=True)
-            if os.access(BUNDLED_SKILLS_ROOT, os.W_OK):
-                logger.info("技能库目录（源码模式）：%s", BUNDLED_SKILLS_ROOT)
-                return BUNDLED_SKILLS_ROOT.resolve()
-        except OSError:
-            logger.warning("内置技能目录不可写，回退到用户数据目录")
-
-    target = _user_data_dir() / "skills"
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists():
-            try:
-                shutil.copytree(BUNDLED_SKILLS_ROOT, target)
-            except OSError:
-                logger.exception("复制内置技能失败，将创建空技能库")
-                target.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        logger.warning(
-            "用户技能库目录不可写，回退到系统临时目录（%s）", type(error).__name__
-        )
-        target = Path(tempfile.gettempdir()) / "CommonHarness" / "skills"
-        target.mkdir(parents=True, exist_ok=True)
-    logger.info("技能库目录（用户数据）：%s", target)
-    return target.resolve()
+    root = HARNESS_HOME / "skills" / "builtin"
+    _seed_builtin_skills(root)
+    logger.info("内置技能目录：%s", root)
+    return root.resolve()
 
 
-# 技能文件仅保存在项目内的受限目录。主 Agent 和每个子 Agent 使用独立子目录，
-# 分配技能时会把文件从主 Agent 的暂存目录移动到对应子 Agent 的目录。
-# 这里是技能的隔离机制，子智能体要保留主智能体的技能文件，必须在主智能体的技能目录里复制一份。
+# 技能文件只保存在 HARNESS_HOME 下：builtin 只读，用户技能按 user_id 隔离。
 SKILLS_ROOT = _resolve_skills_root()
-# 被用户关闭的技能整体移出技能库，Agent 与沙箱同步都不会再发现它们；
-# 重新启用时再移回原目标目录。
-DISABLED_SKILLS_ROOT = SKILLS_ROOT.with_name(f"{SKILLS_ROOT.name}-disabled")
+BUILTIN_SKILLS_ROOT = SKILLS_ROOT
+# 兼容旧导入；用户级停用目录由 user_data 按用户计算。
+DISABLED_SKILLS_ROOT = HARNESS_HOME / "skills" / "disabled"
 MAIN_SKILLS_PATH = "/skills/main/"
+BUILTIN_SKILLS_PATH = "/skills-builtin/main/"
 SUBAGENT_SKILLS_PATH = "/skills/subagents"
+
+# ============================================================
+# 插件系统（v1.1 第一章）
+# ============================================================
+# 插件目录从 HARNESS_HOME 推导：<HARNESS_HOME>/plugins。
+# 发布级（builtin/catalog）只读，用户级按 user_id 隔离。
+PLUGINS_ENABLED = _env_flag("HARNESS_PLUGINS_ENABLED", True)
+PLUGIN_MARKET_ENABLED = _env_flag("HARNESS_PLUGIN_MARKET_ENABLED", True)
+PLUGIN_REGISTRY_URL = (os.getenv("HARNESS_PLUGIN_REGISTRY_URL") or "").strip()
+PLUGIN_CATALOG_URL = (os.getenv("HARNESS_PLUGIN_CATALOG_URL") or "").strip()
+# 私有/公共目录白名单；非空时只展示和安装列表内的 plugin_id。
+PLUGIN_REGISTRY_WHITELIST = _env_list("HARNESS_PLUGIN_REGISTRY_WHITELIST")
+PLUGIN_HTTP_TIMEOUT_SECONDS = int(
+    os.getenv("HARNESS_PLUGIN_HTTP_TIMEOUT_SECONDS", "10")
+)
+PLUGIN_DSH_ENABLED = _env_flag("HARNESS_PLUGIN_DSH_ENABLED", True)
+PLUGIN_DSH_CATALOG_URL = (os.getenv("HARNESS_PLUGIN_DSH_CATALOG_URL") or "").strip()
+PLUGIN_VERSION_KEEP = int(os.getenv("HARNESS_PLUGIN_VERSION_KEEP", "2"))
+PLUGIN_CATALOG_CACHE_SECONDS = int(
+    os.getenv("HARNESS_PLUGIN_CATALOG_CACHE_SECONDS", "600")
+)
+PLUGIN_MAX_PROCESSES = int(os.getenv("HARNESS_PLUGIN_MAX_PROCESSES", "8"))
+PLUGIN_IDLE_TTL_SECONDS = int(os.getenv("HARNESS_PLUGIN_IDLE_TTL_SECONDS", "300"))
+PLUGIN_START_TIMEOUT_SECONDS = int(
+    os.getenv("HARNESS_PLUGIN_START_TIMEOUT_SECONDS", "15")
+)
+PLUGIN_CALL_TIMEOUT_SECONDS = int(
+    os.getenv("HARNESS_PLUGIN_CALL_TIMEOUT_SECONDS", "60")
+)
+PLUGIN_SANDBOX_VERIFY = _env_flag("HARNESS_PLUGIN_SANDBOX_VERIFY", True)
+PLUGIN_MAX_PACKAGE_BYTES = int(os.getenv("HARNESS_PLUGIN_MAX_PACKAGE_MB", "32")) * 1024 * 1024
+PLUGIN_USER_QUOTA_BYTES = int(os.getenv("HARNESS_PLUGIN_USER_QUOTA_MB", "1024")) * 1024 * 1024
+PLUGIN_USER_MAX_PLUGINS = int(os.getenv("HARNESS_PLUGIN_USER_MAX_PLUGINS", "50"))
+PLUGIN_AUTO_DISABLE_AFTER_FAILURES = int(
+    os.getenv("HARNESS_PLUGIN_AUTO_DISABLE_AFTER_FAILURES", "5")
+)
+# 宿主版本：用于 manifest.harnessVersion 兼容检查。
+HARNESS_VERSION = (os.getenv("HARNESS_VERSION") or "1.1.0").strip()
+
+
+def _plugin_root() -> Path:
+    """插件根目录：显式覆盖优先，否则跟随 HARNESS_HOME。"""
+    override = (os.getenv("HARNESS_PLUGIN_ROOT") or "").strip()
+    return Path(override).expanduser().resolve() if override else (HARNESS_HOME / "plugins").resolve()
+
+
+PLUGIN_ROOT = _plugin_root()
+PLUGIN_BUILTIN_ROOT = PLUGIN_ROOT / "builtin"
+PLUGIN_CATALOG_ROOT = PLUGIN_ROOT / "catalog"
+PLUGIN_CATALOG_PATH = PLUGIN_CATALOG_ROOT / "catalog.json"
+PLUGIN_USERS_ROOT = PLUGIN_ROOT / "users"
+
+
+def plugin_user_root(user_id: str) -> Path:
+    """用户插件根：``<PLUGIN_ROOT>/users/{uid}``。"""
+    from agent.identity import safe_user_id
+
+    return PLUGIN_USERS_ROOT / safe_user_id(user_id)
+
+
+def plugin_state_path(user_id: str) -> Path:
+    """用户级插件状态文件（仅用于缓存/兜底，权威状态在 PG）。"""
+    return plugin_user_root(user_id) / "plugins-state.json"
+
 
 # ============================================================
 # PostgreSQL 持久化配置

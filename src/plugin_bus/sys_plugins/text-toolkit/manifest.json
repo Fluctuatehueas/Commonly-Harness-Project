@@ -1,0 +1,20 @@
+{
+  "plugin_id": "text-toolkit",
+  "name": "文本工具箱",
+  "version": "1.0.0",
+  "protocolVersion": "1.0",
+  "description": "统计、转换与字面替换文本，适合写作、日志清洗和数据处理。",
+  "author": { "name": "Harness" },
+  "license": "MIT",
+  "tag": ["文本", "内置工具"],
+  "capabilities": ["tool"],
+  "runtime": {
+    "kind": "inprocess",
+    "language": "python",
+    "entry": "plugin:handle"
+  },
+  "transport": { "kind": "inprocess" },
+  "permissions": [],
+  "harnessVersion": { "min": "1.1.0", "max": "1.x" },
+  "dist": {}
+}

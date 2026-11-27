@@ -21,21 +21,41 @@ MCP_SERVERS_JSON = PROJECT_ROOT / "mcp" / "servers.json"
 
 
 def skill_exists(name: str) -> Optional[bool]:
-    """SKILL 是否存在：查当前用户技能库 main/ 与 subagents/*/ 下的目录。"""
+    """SKILL 是否存在：查用户技能库与内置技能（用户同名覆盖内置）。"""
     try:
         from agent.identity import current_user_id
-        from agent.user_data import user_skills_root
+        from agent.user_data import (
+            builtin_disabled_keys,
+            builtin_skills_root,
+            user_skills_root,
+        )
 
-        skills_root = user_skills_root(current_user_id())
-        for target in (skills_root / "main" / name,):
-            if target.is_dir():
-                return True
+        uid = current_user_id()
+        skills_root = user_skills_root(uid)
+        if (skills_root / "main" / name).is_dir():
+            return True
         subagents_root = skills_root / "subagents"
         if subagents_root.is_dir():
             for agent_dir in subagents_root.iterdir():
                 if agent_dir.is_dir() and (agent_dir / name).is_dir():
                     return True
-        # skills-disabled 里的视为不存在（已停用，Agent 不会发现）
+
+        # 用户目录没有时再查内置技能；内置技能按用户停用的视为不存在。
+        builtin_root = builtin_skills_root()
+        disabled = builtin_disabled_keys(uid)
+        if (
+            (builtin_root / "main" / name).is_dir()
+            and f"main:{name}" not in disabled
+        ):
+            return True
+        builtin_subagents = builtin_root / "subagents"
+        if builtin_subagents.is_dir():
+            for agent_dir in builtin_subagents.iterdir():
+                if not agent_dir.is_dir() or not (agent_dir / name).is_dir():
+                    continue
+                key = f"subagents/{agent_dir.name}:{name}"
+                if key not in disabled:
+                    return True
         return False
     except Exception:
         logger.exception("SKILL 注册表不可用")

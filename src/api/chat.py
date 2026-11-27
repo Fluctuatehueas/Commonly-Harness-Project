@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -81,6 +82,7 @@ from api.settings import router as settings_router
 from api.trajectory import router as trajectory_router
 from api.skills import router as skills_router
 from api.mcp import router as mcp_router
+from api.plugins import router as plugins_router
 from api.projects import router as projects_router
 from api.rag import router as rag_router
 from api.scheduler import router as scheduler_router
@@ -111,6 +113,27 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """在 FastAPI 生命周期中初始化并清理 Agent 加载器。"""
     # 持久化连接属于应用级资源，不能在每个请求中重复创建。
     await agent_loader.initialize()
+    # v1.1 存储结构迁移与维护：旧目录只复制不删除，失败不阻断启动。
+    try:
+        from agent.storage_migration import migrate_all
+
+        await asyncio.to_thread(migrate_all)
+    except Exception:
+        logger.warning("存储结构迁移失败，继续使用现有目录", exc_info=True)
+    maintenance_task = None
+    try:
+        from agent.storage_maintenance import start_storage_maintenance
+
+        maintenance_task = await start_storage_maintenance()
+    except Exception:
+        logger.warning("存储维护任务启动失败", exc_info=True)
+    # 插件工具集变化后重建 Agent 图；按用户运行时在首次访问时创建。
+    try:
+        from plugin_bus.runtime import set_plugin_structure_handler
+
+        set_plugin_structure_handler(agent_loader.reset_agents)
+    except Exception:
+        logger.warning("插件运行时结构回调注册失败", exc_info=True)
     # 后台调度只存在于进程内：重启后把上一进程遗留的 created/running
     # 运行标记为中断，避免前端一直等待一个不会再推进的 run。
     try:
@@ -128,6 +151,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        try:
+            from plugin_bus.runtime import shutdown_plugin_runtimes
+
+            await shutdown_plugin_runtimes()
+        except Exception:
+            logger.warning("关闭插件运行时失败", exc_info=True)
+        try:
+            from agent.storage_maintenance import stop_storage_maintenance
+
+            await stop_storage_maintenance(maintenance_task)
+        except Exception:
+            logger.warning("停止存储维护任务失败", exc_info=True)
         await agent_loader.shutdown()
 
 
@@ -2126,6 +2161,7 @@ app.include_router(trajectory_router)
 app.include_router(evolution_router)
 app.include_router(skills_router)
 app.include_router(mcp_router)
+app.include_router(plugins_router)
 app.include_router(rag_router)
 app.include_router(scheduler_router)
 app.include_router(projects_router)

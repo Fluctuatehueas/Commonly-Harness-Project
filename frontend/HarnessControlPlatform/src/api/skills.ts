@@ -9,6 +9,9 @@ export interface SkillItem {
   target: string
   enabled: boolean
   protected: boolean
+  source?: 'user' | 'builtin'
+  editable?: boolean
+  deletable?: boolean
   file_count: number
   size_bytes: number
   updated_at: string

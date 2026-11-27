@@ -19,8 +19,26 @@ SKILL_PERSISTENCE_LOCK = RLock()
 # 被sandbox_skill_management.py的skillNamagement类使用，是一个同步器
 class SandboxSkillSynchronizer:
     """以本地技能目录为权威来源，同时让 Agent 只读取沙箱副本。"""
-    def __init__(self, skills_root: Path, agents_file: Path) -> None:
-        self._skills_root = skills_root
+
+    def __init__(
+        self,
+        skills_roots: Path | list[Path],
+        agents_file: Path,
+        *,
+        sandbox_prefixes: list[str] | None = None,
+        excluded: list[set[str]] | None = None,
+    ) -> None:
+        if isinstance(skills_roots, (str, Path)):
+            roots = [Path(skills_roots)]
+        else:
+            roots = [Path(item) for item in skills_roots]
+        prefixes = list(sandbox_prefixes or ["/skills"] * len(roots))
+        excludes = [set(item) for item in (excluded or [set() for _ in roots])]
+        if len(prefixes) != len(roots) or len(excludes) != len(roots):
+            raise ValueError("skills_roots / sandbox_prefixes / excluded 长度必须一致")
+        self._roots = roots
+        self._prefixes = prefixes
+        self._excluded = excludes
         self._agents_file = agents_file
 
     def sync(self, backend: SandboxBackendProxy) -> bool:
@@ -40,29 +58,51 @@ class SandboxSkillSynchronizer:
         if path.is_symlink() or path.is_junction() or not path.resolve().is_relative_to(root):
             raise ValueError("技能目录包含符号链接、目录联接或越界路径，已停止同步")
 
+    @staticmethod
+    def _is_excluded(relative: str, excluded: set[str]) -> bool:
+        """按 ``main:<name>`` / ``subagents/<agent>:<name>`` 判断是否跳过。"""
+        if not excluded:
+            return False
+        parts = relative.split("/")
+        if len(parts) >= 2 and parts[0] == "main":
+            return f"main:{parts[1]}" in excluded
+        if len(parts) >= 3 and parts[0] == "subagents":
+            return f"subagents/{parts[1]}:{parts[2]}" in excluded
+        return False
+
     # 读取本地技能目录
     def _local_files(self) -> dict[str, bytes]:
         """
-        只读取项目文件，并拒绝链接和越过配置根目录的路径。
+        读取所有技能根目录（后面的根覆盖前面的同名文件），并拒绝链接和越界路径。
         """
-        root = self._skills_root.resolve()
-        self._validate_local_path(self._skills_root, root)
-        files: dict[str, bytes] = {"/AGENTS.md": self._agents_file.read_bytes()} # AGENTS.md 也被同步，作为主 Agent 的只读指引文件
-        # 先裁剪目录再继续遍历，防止 Windows 目录联接绕过 followlinks=False。
-        for directory, directories, filenames in os.walk(self._skills_root, followlinks=False):
-            parent = Path(directory)
-            self._validate_local_path(parent, root)
-            for name in directories:
-                self._validate_local_path(parent / name, root)
-            directories[:] = [name for name in directories if name != "__pycache__"]
-            for name in filenames:
-                path = parent / name
-                self._validate_local_path(path, root)
-                # 跳过 .pyc 和非普通文件（虽然前面校验过，但 is_file() 再确认一次）。
-                if path.suffix == ".pyc" or not path.is_file():
-                    continue
-                relative = path.relative_to(self._skills_root).as_posix()
-                files[f"{SANDBOX_SKILLS_ROOT}/{relative}"] = path.read_bytes()
+        files: dict[str, bytes] = {"/AGENTS.md": self._agents_file.read_bytes()}
+        for root, prefix, excluded in zip(
+            self._roots, self._prefixes, self._excluded, strict=True
+        ):
+            if not root.is_dir():
+                continue
+            resolved = root.resolve()
+            self._validate_local_path(root, resolved)
+            # 先裁剪目录再继续遍历，防止 Windows 目录联接绕过 followlinks=False。
+            for directory, directories, filenames in os.walk(root, followlinks=False):
+                parent = Path(directory)
+                self._validate_local_path(parent, resolved)
+                for name in directories:
+                    self._validate_local_path(parent / name, resolved)
+                directories[:] = [
+                    name for name in directories if name != "__pycache__"
+                ]
+                for name in filenames:
+                    path = parent / name
+                    self._validate_local_path(path, resolved)
+                    if path.suffix == ".pyc" or not path.is_file():
+                        continue
+                    if name == ".builtin-version":
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    if self._is_excluded(relative, excluded):
+                        continue
+                    files[f"{prefix.rstrip('/')}/{relative}"] = path.read_bytes()
         return files
 
     @staticmethod
@@ -92,9 +132,10 @@ class SandboxSkillSynchronizer:
         for path, digest in value.items():
             # 沙箱内容不可信：禁止目录穿越，也禁止指向其他宿主机根路径。
             parts = path.split("/")
-            is_skill_file = path.startswith(f"{SANDBOX_SKILLS_ROOT}/") and all(
-                part not in {"", ".", ".."} for part in parts[2:]
-            )
+            is_skill_file = any(
+                path.startswith(f"{prefix.rstrip('/')}/")
+                for prefix in self._prefixes
+            ) and all(part not in {"", ".", ".."} for part in parts[2:])
             if (
                 (path != "/AGENTS.md" and not is_skill_file)
                 or "\x00" in path

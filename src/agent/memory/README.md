@@ -4,4 +4,4 @@
 
 - 用户偏好：采用{userid}/preferences.md来保存（StoreBackend）
 
-- 记忆使用RedisStore存储
+- 记忆使用 PostgreSQL Store 存储（LangGraph Store，namespace=user_id）

@@ -228,8 +228,8 @@ async function reveal(item: SkillItem) {
 
 // 删除确认：交给 ElMessageBox，确认后再走原有删除流程
 async function askDelete(item: SkillItem) {
-  if (item.protected) {
-    flash('受保护的管理技能不能删除', 'err')
+  if (item.deletable === false || item.protected) {
+    flash('内置或受保护的技能不能删除，只能停用', 'err')
     return
   }
   deleting.value = item
@@ -671,7 +671,7 @@ onBeforeUnmount(() => {
             size="small"
             type="danger"
             :icon="Delete"
-            :disabled="active.protected"
+            :disabled="active.protected || active.deletable === false"
             @click="askDelete(active)"
           >
             删除

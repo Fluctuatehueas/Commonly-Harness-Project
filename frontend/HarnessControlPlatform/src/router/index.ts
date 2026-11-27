@@ -4,7 +4,7 @@ import ChatView from '@/views/ChatView.vue'
 import HomeView from '@/views/HomeView.vue'
 import McpView from '@/views/McpView.vue'
 import MyAgentView from '@/views/MyAgentView.vue'
-import PlaceholderView from '@/views/PlaceholderView.vue'
+import PluginsView from '@/views/PluginsView.vue'
 import RagView from '@/views/RagView.vue'
 import SettingsView from '@/views/SettingsView.vue'
 import SkillsView from '@/views/SkillsView.vue'
@@ -29,7 +29,7 @@ const router = createRouter({
     { path: '/trajectory', name: 'workflow', component: TrajectoryView },
     { path: '/tasks', name: 'tasks', component: TaskFlowListView },
     { path: '/tasks/:id', name: 'taskflow-detail', component: TaskFlowDetailView },
-    { path: '/plugins', name: 'plugins', component: PlaceholderView, props: { title: '插件市场', icon: 'plug' } },
+    { path: '/plugins', name: 'plugins', component: PluginsView },
     { path: '/skills', name: 'skills', component: SkillsView },
     { path: '/mcp', name: 'mcp', component: McpView },
     { path: '/kb', name: 'kb', component: RagView },

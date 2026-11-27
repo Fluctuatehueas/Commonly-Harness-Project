@@ -1,0 +1,20 @@
+{
+  "plugin_id": "my-builtin-plugin",
+  "name": "我的内置插件",
+  "version": "1.0.0",
+  "protocolVersion": "1.0",
+  "description": "随系统发布的内置插件，仅在 source=builtin 时可用。",
+  "author": { "name": "your-name" },
+  "license": "MIT",
+  "tag": ["内置"],
+  "capabilities": ["tool"],
+  "runtime": {
+    "kind": "inprocess",
+    "language": "python",
+    "entry": "plugin:handle"
+  },
+  "transport": { "kind": "inprocess" },
+  "permissions": [],
+  "harnessVersion": { "min": "1.1.0", "max": "1.x" },
+  "dist": {}
+}

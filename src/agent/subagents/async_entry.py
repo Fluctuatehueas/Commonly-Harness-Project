@@ -75,12 +75,14 @@ def build_async_subagent_graph(
     user_id: str = "anonymous",
 ) -> Any:
     """用共享沙箱后端构建一个异步子 Agent 图。"""
-    from agent.user_data import user_skills_root
+    from agent.user_data import builtin_disabled_keys, user_skills_root
 
     backend = CompositeBackend(default=sandbox_backend, routes={})
     skill_synchronizer = SandboxSkillSynchronizer(
-        user_skills_root(user_id),
+        [Path(SKILLS_ROOT), user_skills_root(user_id)],
         Path(__file__).parent.parent / "memory" / "AGENTS.md",
+        sandbox_prefixes=["/skills-builtin", "/skills"],
+        excluded=[builtin_disabled_keys(user_id), set()],
     )
     skills = subagent_config.get("skills", [])
     return create_deep_agent(

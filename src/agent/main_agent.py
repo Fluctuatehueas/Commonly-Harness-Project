@@ -27,13 +27,19 @@ import agent.config as agent_config
 from agent.config import (
     AGENTS_MD_FILENAME,
     ASYNC_AGENT_PROTOCOL_URL,
+    BUILTIN_SKILLS_PATH,
     MAIN_AGENT_MODEL_RUN_LIMIT,
     MAIN_AGENT_TOOL_RUN_LIMIT,
     MAIN_SKILLS_PATH,
+    SKILLS_ROOT,
     build_model,
     context_limit_for,
 )
-from agent.user_data import model_settings, user_skills_root
+from agent.user_data import (
+    builtin_disabled_keys,
+    model_settings,
+    user_skills_root,
+)
 from agent.memory.prompts import build_web_search_policy
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware
@@ -45,6 +51,7 @@ from agent.middlewares.model_concurrency import ModelConcurrencyMiddleware
 from agent.middlewares.pdc_guard import PdcGuardMiddleware
 from agent.middlewares.skills_sync import SandboxSkillsMiddleware
 from agent.middlewares.subagent_progress import SubagentProgressMiddleware
+from agent.middlewares.plugin_hooks import PluginHookMiddleware
 from agent.middlewares.time_awareness import TimeAwarenessMiddleware
 from agent.middlewares.token_usage import TokenUsageMiddleware
 from agent.middlewares.trajectory import TrajectoryMiddleware
@@ -262,8 +269,10 @@ async def create_main_agent(
     effective_context_limit = int(
         effective_model.get("context_limit") or context_limit_for(user_id)
     )
-    # 技能库按用户隔离；首次使用时由 user_data 从内置技能复制。
+    # 技能库按用户隔离；内置技能只读共享，通过 overlay 与用户技能合并。
     skills_root = user_skills_root(user_id)
+    builtin_skills_root = Path(SKILLS_ROOT)
+    has_builtin_skills = (builtin_skills_root / "main").is_dir()
     mcp_server_ids = list(context.capabilities.mcp_server_ids) or None
 
     # 文件路径决定存储位置：/memories/ 写 PostgreSQL，/artifacts/ 留在图状态，
@@ -280,6 +289,10 @@ async def create_main_agent(
         # 无沙箱时把宿主技能目录只读挂载到 /skills/：
         # 技能仍能渐进式加载，但 Agent 不能改写宿主上的 SKILL.md。
         routes["/skills/"] = ReadOnlyFilesystemBackend(root_dir=skills_root)
+        if has_builtin_skills:
+            routes["/skills-builtin/"] = ReadOnlyFilesystemBackend(
+                root_dir=builtin_skills_root
+            )
     # 文件默认落当前项目目录，命令只走沙箱；没有沙箱时执行会被明确拒绝。
     default_backend = ProjectWorkspaceBackend(sandbox_backend)
     backend = CompositeBackend(
@@ -294,12 +307,19 @@ async def create_main_agent(
     skill_middleware: list[Any] = []
     # 主图只发现主技能目录；每个子 Agent 从自己的配置读取独立技能目录。
     # 有沙箱时由同步中间件把技能推到沙箱；无沙箱时直接读只读挂载。
-    skills_sources: list[str] = [MAIN_SKILLS_PATH]
+    skills_sources: list[str] = (
+        [BUILTIN_SKILLS_PATH, MAIN_SKILLS_PATH]
+        if has_builtin_skills
+        else [MAIN_SKILLS_PATH]
+    )
     if sandbox_enabled:
-        # 同步器把宿主维护的技能和固定 AGENTS.md 增量复制到用户沙箱。
+        # 同步器把 builtin 与用户技能分别镜像到 /skills-builtin 与 /skills；
+        # 用户同名技能覆盖内置，被用户停用的内置技能不同步。
         skill_synchronizer = SandboxSkillSynchronizer(
-            skills_root,
+            [builtin_skills_root, skills_root],
             Path(__file__).parent / "memory" / "AGENTS.md",
+            sandbox_prefixes=["/skills-builtin", "/skills"],
+            excluded=[builtin_disabled_keys(user_id), set()],
         )
 
         # 异步子 Agent 的图不嵌入主图；这里只注册提交工具，调用后立即返回 task_id。
@@ -323,7 +343,7 @@ async def create_main_agent(
         skill_middleware = [
             SandboxSkillsMiddleware(
                 backend=backend,
-                sources=[MAIN_SKILLS_PATH],
+                sources=skills_sources,
                 synchronizer=skill_synchronizer,
             ),
         ]
@@ -367,6 +387,14 @@ async def create_main_agent(
         integration_server_id,
         mcp_server_ids,
     )
+    # 插件工具：只读能力快照注入，构图阶段不拉起插件进程。
+    plugin_tools: list[Any] = []
+    try:
+        from plugin_bus.runtime import get_plugin_runtime
+
+        plugin_tools = await get_plugin_runtime(user_id).tools_for_main_agent()
+    except Exception:
+        logger.warning("插件工具注入失败，本轮不加载插件", exc_info=True)
     # RAG 工具始终可用；无 Provider 时返回空结果，不阻断普通对话。
     rag_tools = create_rag_tools()
     # 宿主能力默认关闭；开启后每个工具内部都会 interrupt 等待人工审批。
@@ -394,6 +422,7 @@ async def create_main_agent(
     build_tools = create_build_tools(sandbox_backend)
     main_tools = [
         *mcp_tools,
+        *plugin_tools,
         *async_tools,
         *rag_tools,
         *get_basic_tools(),
@@ -627,6 +656,8 @@ async def create_main_agent(
             ),
             # after_agent 阶段反序执行，最后写回用户长期偏好。
             MemoryUpdateMiddleware(summary_model),
+            # 插件提示词、hook 与工具拦截；放在最内层靠近模型与工具。
+            PluginHookMiddleware(),
             # 时间感知放在最内层：上下文压缩会重写消息列表，渲染必须作用在
             # 最终发给模型的消息副本上，才能保留每条消息的时间属性。
             TimeAwarenessMiddleware(),

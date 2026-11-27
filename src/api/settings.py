@@ -398,6 +398,7 @@ async def get_sandbox_settings(
         },
         "paths": {
             **agent_config.user_data_info(),
+            **agent_config.harness_home_info(),
             "workspace_root": str(agent_config.USER_DATA_DIR),
             **user_data.user_paths(uid),
         },

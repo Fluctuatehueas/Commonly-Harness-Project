@@ -30,7 +30,6 @@ from opensandbox.sync.manager import SandboxManagerSync
 
 from agent.backends.open_sandbox import OpenSandboxBackend
 from agent.backends.sandbox_proxy import SandboxBackendProxy
-from agent.backends.skill_sync import SandboxSkillSynchronizer
 from agent import config as agent_config
 
 
@@ -316,18 +315,10 @@ class SandboxManager:
 
     def _create_reserve(self) -> OpenSandboxBackend:
         """
-        在暴露未分配实例前，先同步项目技能和 Agent 指令。
+        预热实例只创建空沙箱；技能由主 Agent 构图时按用户同步，
+        避免预热阶段把全局技能视图带进用户沙箱。
         """
-        backend = self._create_backend()
-        try:
-            SandboxSkillSynchronizer(
-                agent_config.SKILLS_ROOT,
-                Path(__file__).resolve().parents[1] / "memory" / "AGENTS.md",
-            ).sync(SandboxBackendProxy(backend))
-        except BaseException:
-            self._discard_reserve(backend)
-            raise
-        return backend
+        return self._create_backend()
 
     def _discard_reserve(self, backend: OpenSandboxBackend) -> None:
         """
