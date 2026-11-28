@@ -88,9 +88,24 @@ class UserPreferences:
 # ============================================================
 
 
+class CommandBinding(BaseModel):
+    """命令系统本轮资源绑定；空列表表示不限制。"""
+
+    skills: List[str] = Field(default_factory=list, description="本轮优先技能名")
+    mcp_ids: List[str] = Field(default_factory=list, description="本轮限定 MCP 服务")
+    plugin_ids: List[str] = Field(default_factory=list, description="本轮限定插件")
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "CommandBinding":
+        for name in ("skills", "mcp_ids", "plugin_ids"):
+            values = getattr(self, name)
+            cleaned = [str(item).strip() for item in values if str(item).strip()]
+            setattr(self, name, list(dict.fromkeys(cleaned))[:8])
+        return self
+
+
 class ChatRequest(BaseModel):
     """接收单轮对话请求，并兼容 name 字段。"""
-
     message: str = Field(..., min_length=1, description="用户消息")
     thread_id: Optional[str] = Field(None, description="会话 ID，为空则创建新会话")
     user_id: str = Field("anonymous", min_length=1, description="用户唯一标识")
@@ -110,6 +125,10 @@ class ChatRequest(BaseModel):
     agent_id: Optional[str] = Field(None, description="执行本轮任务的 MyAgent ID")
     # 生效组；为空时沿用会话绑定。多组组长必须显式指定。
     group_id: Optional[str] = Field(None, description="执行本轮任务的 AgentTeam 组 ID")
+    # 命令系统绑定：只作用于本轮，发送后由前端清空。
+    binding: Optional[CommandBinding] = Field(
+        None, description="本轮绑定的技能 / MCP / 插件"
+    )
     # PDCA 的 L2 确定性验证：可选，提供后最终回答会被强制校验。
     output_schema: Optional[Dict[str, Any]] = Field(
         None,
@@ -362,6 +381,8 @@ class UserGroup:
     thread_ids: set[str] = field(default_factory=set)  # 用户关联的会话 ID
     # 按工具范围缓存 Agent："" 为普通会话，集成 MCP 的 server_id 为绑定后端。
     agents: dict[str, Any] = field(default_factory=dict)
+    # 命令绑定构建的临时图，按插入顺序淘汰，避免缓存无限增长。
+    bound_keys: list[str] = field(default_factory=list)
 
 # ============================================================
 # 网络搜索数据模型

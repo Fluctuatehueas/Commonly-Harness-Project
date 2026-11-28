@@ -40,6 +40,7 @@ from agent.user_data import (
     model_settings,
     user_skills_root,
 )
+from agent.tools.command_tools import create_command_tools
 from agent.memory.prompts import build_web_search_policy
 from agent.middlewares.agent_protection import build_agent_protection_middleware
 from agent.middlewares.context_injection import ContextInjectionMiddleware
@@ -213,6 +214,45 @@ async def _load_sync_subagents(
     return loaded
 
 
+def _binding_skill_section(user_id: str, names: list[str]) -> str:
+    """把 /skills 绑定的技能摘要拼成系统提示段（软绑定）。"""
+    if not names:
+        return ""
+    user_root = user_skills_root(user_id) / "main"
+    builtin_root = Path(SKILLS_ROOT) / "main"
+    disabled = builtin_disabled_keys(user_id)
+    parts: list[str] = []
+    total = 0
+    for name in names[:8]:
+        skill_dir = user_root / name
+        source = "用户"
+        if not (skill_dir / "SKILL.md").is_file():
+            skill_dir = builtin_root / name
+            source = "内置"
+            if f"main:{name}" in disabled:
+                continue
+        skill_file = skill_dir / "SKILL.md"
+        if not skill_file.is_file():
+            continue
+        try:
+            text = skill_file.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        remaining = 8000 - total
+        if remaining <= 0:
+            break
+        chunk = text[: min(4000, remaining)]
+        total += len(chunk)
+        parts.append(f"- {name}（{source}技能）：\n{chunk}")
+    if not parts:
+        return ""
+    return (
+        "## 本轮指定技能\n"
+        "用户通过 /skills 指定了本轮优先技能；优先按这些技能执行，其它技能仍可用。\n"
+        + "\n".join(parts)
+    )
+
+
 def _ensure_unique_tool_names(tools: list[Any]) -> None:
     """拒绝主 Agent 内同名工具，避免模型调用时出现歧义。"""
     names = [str(getattr(tool, "name", "")) for tool in tools]
@@ -238,6 +278,7 @@ async def create_main_agent(
     agent_profile: dict[str, Any] | None = None,
     agent_context: HarnessAgentContextBase | None = None,
     scheduler_enabled: bool = True,
+    command_binding: dict[str, Any] | None = None,
 ) -> Any:
     """创建绑定用户身份、持久化资源和共享沙箱的主 Agent 图。
 
@@ -262,6 +303,19 @@ async def create_main_agent(
     sandbox_enabled = sandbox_backend is not None
 
     context = agent_context or AgentContextFactory.from_profile(agent_profile)
+    # 命令系统绑定：只影响本轮构图，缓存键由 agent_loader 追加 binding hash。
+    binding = dict(command_binding or {})
+    bound_mcp_ids = [
+        str(item).strip() for item in (binding.get("mcp_ids") or []) if str(item).strip()
+    ]
+    bound_plugin_ids = [
+        str(item).strip()
+        for item in (binding.get("plugin_ids") or [])
+        if str(item).strip()
+    ]
+    bound_skills = [
+        str(item).strip() for item in (binding.get("skills") or []) if str(item).strip()
+    ]
     # 模型三级继承：Agent → 组 → 用户默认。
     effective_model = context.resolve_model(model_settings(user_id))
     model = build_model(effective_model, role="main", user_id=user_id)
@@ -273,7 +327,7 @@ async def create_main_agent(
     skills_root = user_skills_root(user_id)
     builtin_skills_root = Path(SKILLS_ROOT)
     has_builtin_skills = (builtin_skills_root / "main").is_dir()
-    mcp_server_ids = list(context.capabilities.mcp_server_ids) or None
+    mcp_server_ids = bound_mcp_ids or (list(context.capabilities.mcp_server_ids) or None)
 
     # 文件路径决定存储位置：/memories/ 写 PostgreSQL，/artifacts/ 留在图状态，
     # 其余路径落当前项目目录；命令执行始终走沙箱。
@@ -392,11 +446,15 @@ async def create_main_agent(
     try:
         from plugin_bus.runtime import get_plugin_runtime
 
-        plugin_tools = await get_plugin_runtime(user_id).tools_for_main_agent()
+        plugin_tools = await get_plugin_runtime(user_id).tools_for_main_agent(
+            plugin_ids=bound_plugin_ids or None
+        )
     except Exception:
         logger.warning("插件工具注入失败，本轮不加载插件", exc_info=True)
     # RAG 工具始终可用；无 Provider 时返回空结果，不阻断普通对话。
     rag_tools = create_rag_tools()
+    # 只读命令查询：Agent 也能查看用户在本系统内的资源信息。
+    command_tools = create_command_tools()
     # 宿主能力默认关闭；开启后每个工具内部都会 interrupt 等待人工审批。
     host_tools = build_host_tools()
     # 复杂任务先产出分工清单，再按波次并发委派。
@@ -425,6 +483,7 @@ async def create_main_agent(
         *plugin_tools,
         *async_tools,
         *rag_tools,
+        *command_tools,
         *get_basic_tools(),
         *host_tools,
         *planning_tools,
@@ -615,6 +674,10 @@ async def create_main_agent(
     full_system_prompt = (
         f"{role_prompt}\n\n{harness_policy}" if role_prompt else harness_policy
     )
+    # /skills 绑定：软注入技能摘要，不隐藏其它技能。
+    skill_section = _binding_skill_section(user_id, bound_skills)
+    if skill_section:
+        full_system_prompt = f"{full_system_prompt}\n\n{skill_section}"
 
     # 中间件顺序具有语义：before_* 按声明顺序运行，after_* 反序运行。
     return create_deep_agent(
@@ -657,7 +720,7 @@ async def create_main_agent(
             # after_agent 阶段反序执行，最后写回用户长期偏好。
             MemoryUpdateMiddleware(summary_model),
             # 插件提示词、hook 与工具拦截；放在最内层靠近模型与工具。
-            PluginHookMiddleware(),
+            PluginHookMiddleware(plugin_ids=bound_plugin_ids or None),
             # 时间感知放在最内层：上下文压缩会重写消息列表，渲染必须作用在
             # 最终发给模型的消息副本上，才能保留每条消息的时间属性。
             TimeAwarenessMiddleware(),

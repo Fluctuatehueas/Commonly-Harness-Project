@@ -1,0 +1,33 @@
+// 会话轨迹查询契约。只读，数据由 Python TrajectoryMiddleware 写入 PostgreSQL Store。
+syntax = "proto3";
+
+package agent;
+option csharp_namespace = "Agent.Proto";
+
+import "Agent.proto";
+
+message TrajectoryRun {
+  string run_id       = 1;
+  string started_at   = 2;
+  string ended_at     = 3;  // 未结束时为空
+  string status       = 4;  // done / running / interrupted
+  repeated TrajectoryEvent events = 5;
+  string summary_json = 6;  // model/tool/skill/delegation/hitl 次数、tokens、耗时
+}
+
+message GetTrajectoryRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+}
+
+message GetTrajectoryResponse {
+  string thread_id                = 1;
+  repeated TrajectoryRun runs     = 2;  // 按 started_at 升序
+  string latest_run_id            = 3;
+  int32  event_count              = 4;
+  string generated_at             = 5;
+}
+
+service TrajectoryService {
+  rpc GetTrajectory(GetTrajectoryRequest) returns (GetTrajectoryResponse);
+}

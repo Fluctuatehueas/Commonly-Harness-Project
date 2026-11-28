@@ -1,0 +1,51 @@
+// 会话工作区文件契约。当前 gRPC 链路使用无沙箱模式，
+// 文件读写落在 LangGraph 线程状态的 files 通道。
+syntax = "proto3";
+
+package agent;
+option csharp_namespace = "Agent.Proto";
+
+message FileEntry {
+  string path        = 1;
+  int64  size        = 2;
+  string modified_at = 3;
+}
+
+message ListThreadFilesRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+}
+
+message ListThreadFilesResponse {
+  string source            = 1;  // state / sandbox
+  repeated FileEntry files = 2;
+}
+
+message ReadThreadFileRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+  string path      = 3;
+}
+
+message ReadThreadFileResponse {
+  string path     = 1;
+  string content  = 2;
+  string encoding = 3;
+}
+
+message WriteThreadFileRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+  string path      = 3;
+  string content   = 4;
+}
+
+message WriteThreadFileResponse {
+  bool success = 1;
+}
+
+service FileService {
+  rpc ListThreadFiles(ListThreadFilesRequest) returns (ListThreadFilesResponse);
+  rpc ReadThreadFile(ReadThreadFileRequest) returns (ReadThreadFileResponse);
+  rpc WriteThreadFile(WriteThreadFileRequest) returns (WriteThreadFileResponse);
+}

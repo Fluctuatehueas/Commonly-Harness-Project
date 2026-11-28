@@ -50,6 +50,9 @@ export interface PluginMarketItem {
   like?: number
   downloadCount?: number
   installable?: boolean
+  importable?: boolean
+  npm_name?: string
+  npm_dist?: { tarball?: string; integrity?: string; shasum?: string; size?: number }
   unsupported?: boolean
   import_kind?: string
   unsupported_reason?: string
@@ -84,6 +87,9 @@ export interface PluginInstalledItem {
   name: string
   version: string
   description: string
+  author?: PluginAuthor
+  tag?: string[]
+  license?: string
   source: PluginSource | string
   enabled: boolean
   status: string

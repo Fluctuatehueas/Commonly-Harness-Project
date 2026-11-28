@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 插件市场：单页展示全部插件，卡片点开右侧可拖拽抽屉
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Compass, Search, Upload } from '@element-plus/icons-vue'
 import TopNav from '@/components/console/TopNav.vue'
@@ -13,6 +13,7 @@ import {
   fetchPluginJobs,
   fetchPlugins,
   fetchPluginUpdates,
+  importDshSkill,
   restartPlugin,
   startPluginInstall,
   togglePlugin,
@@ -52,6 +53,10 @@ const keyword = ref('')
 const capability = ref('')
 const source = ref('')
 const sort = ref<'popular' | 'latest' | 'name'>('popular')
+
+// 前端分页：目录一次拉取后在本地过滤排序，再按页渲染
+const page = ref(1)
+const pageSize = ref(10)
 
 const drawerOpen = ref(false)
 const active = ref<PluginCardModel | null>(null)
@@ -97,6 +102,9 @@ function mergedCards(): PluginCardModel[] {
       path: row.path,
       error: row.error,
       versions: row.versions,
+      author: row.author || { name: 'Local' },
+      tag: row.tag || [],
+      license: row.license || '',
     }
     const existing = map.get(row.plugin_id)
     if (existing) {
@@ -154,6 +162,21 @@ const cards = computed(() => {
   return list
 })
 
+const totalCards = computed(() => cards.value.length)
+const pagedCards = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return cards.value.slice(start, start + pageSize.value)
+})
+
+watch([keyword, capability, source, sort, pageSize], () => {
+  page.value = 1
+})
+
+watch(totalCards, (value) => {
+  const maxPage = Math.max(Math.ceil(value / pageSize.value), 1)
+  if (page.value > maxPage) page.value = maxPage
+})
+
 function flash(message: string, type: 'ok' | 'err' = 'ok') {
   if (type === 'err') ElMessage.error(message)
   else ElMessage.success(message)
@@ -170,11 +193,23 @@ function formatTime(iso: string): string {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
+async function loadCatalog(force = false) {
+  const first = await fetchPluginCatalog({ page: 1, page_size: 100, refresh: force })
+  if (first.pages <= 1) return first
+  // 目录可能超过单页上限：把剩余页一并取回，再交给本地分页
+  const rest = await Promise.all(
+    Array.from({ length: first.pages - 1 }, (_, index) =>
+      fetchPluginCatalog({ page: index + 2, page_size: 100 }),
+    ),
+  )
+  return { ...first, items: [first, ...rest].flatMap((page) => page.items) }
+}
+
 async function loadAll(force = false) {
   loading.value = true
   error.value = ''
   const [catalogResult, installedResult, updatesResult] = await Promise.allSettled([
-    fetchPluginCatalog({ page: 1, page_size: 100, refresh: force }),
+    loadCatalog(force),
     fetchPlugins(),
     fetchPluginUpdates(),
   ])
@@ -252,6 +287,17 @@ async function installItem(item: PluginCardModel) {
 
 function pickUpload() {
   uploadInput.value?.click()
+}
+
+async function importDshItem(item: PluginCardModel) {
+  try {
+    const result = await importDshSkill(item.plugin_id, item.version)
+    afterStartJob(result.job)
+    drawerOpen.value = false
+    flash(`已开始转译 ${item.name}，完成后可在技能页查看`)
+  } catch (err) {
+    flash((err as Error).message, 'err')
+  }
 }
 
 async function onUploadChange(event: Event) {
@@ -437,21 +483,35 @@ onBeforeUnmount(() => {
         <el-skeleton animated :rows="6" />
       </div>
 
-      <div v-else-if="cards.length" v-loading="loading" class="grid">
-        <PluginCard
-          v-for="item in cards"
-          :key="item.plugin_id"
-          :item="item"
-          :installed="Boolean(item.installed)"
-          :update-available="isUpdate(item)"
-          @detail="openDetail"
-          @install="installItem"
-          @toggle="onToggle"
-          @restart="onRestart"
-          @uninstall="onUninstall"
-          @update="onUpdate"
-        />
-      </div>
+      <template v-else-if="cards.length">
+        <div v-loading="loading" class="grid">
+          <PluginCard
+            v-for="item in pagedCards"
+            :key="item.plugin_id"
+            :item="item"
+            :installed="Boolean(item.installed)"
+            :update-available="isUpdate(item)"
+            @detail="openDetail"
+            @install="installItem"
+            @import-skill="importDshItem"
+            @toggle="onToggle"
+            @restart="onRestart"
+            @uninstall="onUninstall"
+            @update="onUpdate"
+          />
+        </div>
+
+        <div v-if="totalCards > pageSize" class="pager">
+          <el-pagination
+            v-model:current-page="page"
+            v-model:page-size="pageSize"
+            :page-sizes="[10, 20, 50]"
+            :total="totalCards"
+            layout="total, sizes, prev, pager, next, jumper"
+            background
+          />
+        </div>
+      </template>
 
       <el-empty v-else description="暂无可展示的插件" />
     </div>
@@ -462,6 +522,7 @@ onBeforeUnmount(() => {
       :installed="Boolean(active?.installed)"
       :update-available="active ? isUpdate(active) : false"
       @install="installItem"
+      @import-skill="importDshItem"
       @toggle="onToggle"
       @restart="onRestart"
       @uninstall="onUninstall"
@@ -565,6 +626,11 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 12px;
+}
+.pager {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 2px;
 }
 .loading-block {
   padding: 16px;

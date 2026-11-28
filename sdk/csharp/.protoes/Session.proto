@@ -1,0 +1,81 @@
+// 会话管理与会话历史契约。
+// 会话索引在 Python PostgreSQL Store 的 ("sessions", user_id) 命名空间；
+// 历史正文从 LangGraph checkpoint 恢复。C# 不直接访问数据库，只经本服务。
+syntax = "proto3";
+
+package agent;
+option csharp_namespace = "Agent.Proto";
+
+import "Agent.proto";
+
+message SessionInfo {
+  string thread_id             = 1;
+  string title                 = 2;  // 缺省为“新会话”
+  string created_at            = 3;  // ISO 8601 UTC
+  string updated_at            = 4;  // ISO 8601 UTC
+  int32  message_count         = 5;
+  bool   pinned                = 6;
+  string last_message_preview  = 7;
+  string usage_json            = 8;  // 会话累计 Token：input/output/total
+  repeated ChatMessage messages = 9; // 仅 include_messages=true 时填充
+}
+
+message ListSessionsRequest {
+  string user_id                     = 1;
+  bool   include_messages            = 2;  // 连接成功后一次性拉取全部历史时置 true
+  int32  messages_limit_per_session  = 3;  // 每个会话最多返回多少条；0 表示不限制
+  bool   include_usage               = 4;
+}
+
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;  // 置顶优先，其余按 updated_at 倒序
+}
+
+message GetSessionHistoryRequest {
+  string user_id           = 1;
+  string thread_id         = 2;
+  int32  limit             = 3;  // 最多返回多少条；0 表示不限制
+  string before_message_id = 4;  // 游标：只返回该消息之前的历史
+}
+
+message GetSessionHistoryResponse {
+  SessionInfo session           = 1;
+  repeated ChatMessage messages = 2;  // 按时间正序
+  string interrupt_json         = 3;  // 待恢复 HITL 中断，可空
+  string session_usage_json     = 4;
+}
+
+message CreateSessionRequest {
+  string user_id = 1;
+  string title   = 2;  // 可空，缺省“新会话”
+}
+
+message RenameSessionRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+  string title     = 3;
+}
+
+message SetSessionPinnedRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+  bool   pinned    = 3;
+}
+
+message DeleteSessionRequest {
+  string user_id   = 1;
+  string thread_id = 2;
+}
+
+message DeleteSessionResponse {
+  bool success = 1;
+}
+
+service SessionService {
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSessionHistory(GetSessionHistoryRequest) returns (GetSessionHistoryResponse);
+  rpc CreateSession(CreateSessionRequest) returns (SessionInfo);
+  rpc RenameSession(RenameSessionRequest) returns (SessionInfo);
+  rpc SetSessionPinned(SetSessionPinnedRequest) returns (SessionInfo);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+}

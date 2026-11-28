@@ -104,7 +104,7 @@ SDK 不负责：
 
 | 项 | 选择 | 理由 |
 | :-- | :-- | :-- |
-| 运行时 | .NET 8 LTS | 当前 LTS，Windows/Linux/macOS 一致 |
+| 运行时 | .NET 10（2026/11 决策，原计划 .NET 8 LTS） | 单目标；Windows/Linux/macOS 一致 |
 | JSON | `System.Text.Json` | 内置、Source Generator 可裁剪 |
 | 进程 | `System.Diagnostics.Process` + `StandardInput/Output` | 不引入第三方依赖 |
 | 异步 | `async` / `CancellationToken` / `IAsyncDisposable` | 与 stdio 长连接匹配 |
@@ -260,7 +260,7 @@ README.md
 ## 7. Java（预留，不实现）
 
 - JDK 21 + Jackson + `ProcessBuilder` 可行，但宿主侧没有 Java 运行环境保障。
-- 首批只保留 `src/sdk/java/README.md`，说明按 `docs/plugin_protocol.md` 自行接入。
+- 首批只保留 `src/sdk/java/README.md`，说明按 `docs/plugin_protocol.html` 自行接入。
 - 等 C# / TS SDK 与样例稳定后再评估。
 
 ---
@@ -275,12 +275,14 @@ README.md
 
 ## 9. 对外协议文档
 
-计划在 SDK 代码启动时新增 `docs/plugin_protocol.md`，内容从 [插件系统开发文档](插件系统开发文档.md) 第 4、5 节抽取并冻结：
+对外协议文档已落地为 `docs/plugin_protocol.html`（单文件自包含，取代原计划的 `docs/plugin_protocol.md`），内容从 [插件系统开发文档](插件系统开发文档.md) 第 4、5 节抽取并冻结：
 
 - 信封、方法表、错误码、超时与重试约定。
 - manifest 必填字段与版本规则。
 - host.* 白名单与权限映射。
 - stdio 帧格式与日志约定。
+- C# / Java / TypeScript / JavaScript / Python 五语言最小实现。
+- 「官方 SDK」章节占位，SDK 发布后直接在该 HTML 内补充。
 
 C# / Java 不依赖 SDK 也能按该文档接入。SDK 只是把协议封装成语言习惯的 API。
 
@@ -313,7 +315,7 @@ C# / Java 不依赖 SDK 也能按该文档接入。SDK 只是把协议封装成�
 
 ## 11. 实施顺序
 
-1. 冻结 `docs/plugin_protocol.md`。
+1. 冻结 `docs/plugin_protocol.html`。
 2. C# SDK 骨架：stdio 读取、分发、describe、tool.call、host.storage/log。
 3. TypeScript SDK 骨架：同上 + ESM 构建。
 4. 两个样例 + 宿主冒烟联调。
@@ -340,5 +342,31 @@ C# / Java 不依赖 SDK 也能按该文档接入。SDK 只是把协议封装成�
 
 - 新增 `plugin-development` SKILL：`src/agent/skills/main/plugin-development/`，含协议速查、stdio/inprocess 模板、`pack_plugin.py`、`smoke_plugin.py`；两个模板与打包脚本已实跑通过。
 - 新增可用内置插件 `text-toolkit`：`src/plugin_bus/sys_plugins/text-toolkit/`，提供 `text_stats`、`text_transform`、`find_replace` 三个工具，进程内运行、无额外权限。
-- 本文档完成 C# 与 TypeScript SDK 的目录规划、接口草案、测试与发布方案；SDK 代码与 `docs/plugin_protocol.md` 留到下一步实施。
+- 本文档完成 C# 与 TypeScript SDK 的目录规划、接口草案、测试与发布方案；SDK 代码留到下一步实施，对外协议文档已以 `docs/plugin_protocol.html` 交付。
 - 插件测试累计 69 项通过。
+
+---
+
+## 14. 完成记录（2026-11-28）C# SDK 设计定稿（含二次修订）
+
+决策：
+
+| 项 | 决策 | 理由 |
+| :-- | :-- | :-- |
+| 目标框架 | `net10.0` 单目标 | 用户指定；不引入多目标条件编译 |
+| 部署形态 | 框架依赖 + `dotnet Plugin.dll` | 单包跨平台；规避 32 MB 包上限与 Linux 沙箱验证 |
+| 接入形态 | A `stdio` 插件 + **B gRPC 契约关联** + C HTTP 轻量远程 | 二次修订：关联模式以 `src/protocals/.protoes` 为准，不是 HTTP JSON-RPC |
+| 契约归属 | **proto 由 SDK 携带**，NuGet `buildTransitive` 自动注入 | 业务工程不再配置 `HarnessProtoDir` 绝对路径 |
+| 能力范围 | 统一 `[HarnessTool]` + `ExternalProcessTool` 包装已有 exe | 一份元数据同时产出 describe 与 ToolDescriptor |
+| 包拆分 | `Harness.Plugin.Sdk` / `Harness.Plugin.Sdk.Grpc` / `Harness.Plugin.Sdk.Tools` | 核心零第三方依赖，gRPC 依赖隔离 |
+
+交付文档：
+
+- [CSharp插件SDK设计文档.md](CSharp插件SDK设计文档.md)：三种接入形态、模块分布、
+  插件协议与 gRPC 契约全量清单、契约治理、Python 对端通用性评估、发布与安全策略。
+- [CSharp插件SDK开发文档.md](CSharp插件SDK开发文档.md)：统一元数据层、形态 A 的
+  RpcPeer/Dispatcher/Host、形态 B 的 ToolService/审批/幂等/Kestrel/Chat 客户端、
+  形态 C、Python 适配层附录、测试与坑位清单。
+
+对应原文档 §5（C# SDK 调研）的接口草案已被上述两份文档取代；`src/sdk/csharp/README.md`
+已同步更新。代码实施尚未开始。

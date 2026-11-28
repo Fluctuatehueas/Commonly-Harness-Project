@@ -930,7 +930,19 @@ PLUGIN_HTTP_TIMEOUT_SECONDS = int(
     os.getenv("HARNESS_PLUGIN_HTTP_TIMEOUT_SECONDS", "10")
 )
 PLUGIN_DSH_ENABLED = _env_flag("HARNESS_PLUGIN_DSH_ENABLED", True)
+# 显式 URL 优先；为空时按 QUERY 拼镜像搜索地址，失败回退官方 registry。
 PLUGIN_DSH_CATALOG_URL = (os.getenv("HARNESS_PLUGIN_DSH_CATALOG_URL") or "").strip()
+PLUGIN_DSH_QUERY = (
+    os.getenv("HARNESS_PLUGIN_DSH_QUERY") or "awesome-dsh-plugin"
+).strip()
+PLUGIN_DSH_MIRROR_URL = (
+    os.getenv("HARNESS_PLUGIN_DSH_MIRROR_URL") or "https://registry.npmmirror.com"
+).strip().rstrip("/")
+PLUGIN_DSH_FALLBACK_URL = (
+    os.getenv("HARNESS_PLUGIN_DSH_FALLBACK_URL") or "https://registry.npmjs.org"
+).strip().rstrip("/")
+# 每次目录刷新最多补多少个 npm 包详情（拿 tarball 地址与完整性字段）。
+PLUGIN_DSH_ENRICH_LIMIT = int(os.getenv("HARNESS_PLUGIN_DSH_ENRICH_LIMIT", "20"))
 PLUGIN_VERSION_KEEP = int(os.getenv("HARNESS_PLUGIN_VERSION_KEEP", "2"))
 PLUGIN_CATALOG_CACHE_SECONDS = int(
     os.getenv("HARNESS_PLUGIN_CATALOG_CACHE_SECONDS", "600")

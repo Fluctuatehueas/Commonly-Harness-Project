@@ -13,6 +13,8 @@ from agent.backends.sandbox_proxy import SandboxBackendProxy
 
 SANDBOX_SKILLS_ROOT = "/skills"
 SANDBOX_MANIFEST_PATH = "/.myagent/skills-manifest.json"
+# 删除旧文件时单条命令最多带多少个路径，避免命令行过长。
+REMOVE_BATCH_SIZE = 50
 # 被sandbox_skill_management内部和这个同步器共用一个锁
 SKILL_PERSISTENCE_LOCK = RLock()
 
@@ -110,8 +112,7 @@ class SandboxSkillSynchronizer:
         return hashlib.sha256(content).hexdigest()
 
 
-    @staticmethod
-    def _read_manifest(backend: SandboxBackendProxy) -> dict[str, str]:
+    def _read_manifest(self, backend: SandboxBackendProxy) -> dict[str, str]:
         """
         只有确认文件不存在才视为首次同步；读取失败时保留旧追踪状态。
         """
@@ -161,15 +162,26 @@ class SandboxSkillSynchronizer:
         uploads = [(path, files[path]) for path in changed] # 找到变更的路径
         if uploads:
             self._upload_checked(backend, uploads) 
-        for path in removed:
-            result = backend.execute(f"rm -f -- {shlex.quote(path)}") # linux 榕溪执行强制删除
-            if result.exit_code != 0: 
-                raise RuntimeError(f"无法删除沙箱中的旧技能文件: {path}")
+        # 批量删除：一次命令清一批，避免几百个旧文件逐个 rm 导致长时间刷屏。
+        self._remove_paths(backend, removed)
         # manifest 是本次同步的提交标记，必须最后写入，避免失败时留下错误索引。
         self._upload_checked(backend, [
             (SANDBOX_MANIFEST_PATH, json.dumps(manifest, sort_keys=True).encode("utf-8")),
         ])
         return True
+
+    def _remove_paths(
+        self, backend: SandboxBackendProxy, removed: list[str]
+    ) -> None:
+        """按批删除沙箱中的旧技能文件；单批失败直接中止同步。"""
+        for start in range(0, len(removed), REMOVE_BATCH_SIZE):
+            batch = removed[start : start + REMOVE_BATCH_SIZE]
+            command = "rm -f -- " + " ".join(shlex.quote(path) for path in batch)
+            result = backend.execute(command)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"无法删除沙箱中的旧技能文件: {batch[0]} 等 {len(batch)} 个"
+                )
     @staticmethod
     def _upload_checked(backend: SandboxBackendProxy, files: list[tuple[str, bytes]]) -> None:
         """

@@ -22,6 +22,7 @@ STAGE_PROGRESS = {
     "extracting": 62,
     "installing": 75,
     "starting": 88,
+    "refreshing": 94,
     "done": 100,
     "error": 100,
 }

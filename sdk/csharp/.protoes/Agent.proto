@@ -1,0 +1,328 @@
+// ============================================================
+//  Common Harness 跨语言契约（唯一权威源）
+//  C# 与 Python 均从本文件生成桩代码，禁止手写对等类型。
+//  旧文件 BaseRule.proto 为早期草稿，不再编译。
+// ============================================================
+syntax = "proto3";
+
+package agent;
+option csharp_namespace = "Agent.Proto";
+
+// ============================================================
+//  枚举
+// ============================================================
+
+enum ChatMode {
+  CHAT_MODE_UNSPECIFIED = 0;
+  CHAT_MODE_CHAT        = 1;  // 纯聊天，禁止调用工具
+  CHAT_MODE_TASK        = 2;  // 任务模式，允许调用 C# 工具
+}
+
+enum MessageRole {
+  MESSAGE_ROLE_UNSPECIFIED = 0;
+  MESSAGE_ROLE_SYSTEM      = 1;
+  MESSAGE_ROLE_HUMAN       = 2;
+  MESSAGE_ROLE_AI          = 3;
+  MESSAGE_ROLE_TOOL        = 4;
+}
+
+enum ChatStatus {
+  CHAT_STATUS_UNSPECIFIED = 0;
+  CHAT_STATUS_OK          = 1;
+  CHAT_STATUS_INTERRUPTED = 2;
+  CHAT_STATUS_ERROR       = 3;
+  CHAT_STATUS_CANCELLED   = 4;
+}
+
+enum ToolStatus {
+  TOOL_STATUS_UNSPECIFIED    = 0;
+  TOOL_STATUS_OK             = 1;
+  TOOL_STATUS_ERROR          = 2;
+  TOOL_STATUS_DENIED         = 3;
+  TOOL_STATUS_NEEDS_APPROVAL = 4;
+  TOOL_STATUS_CANCELLED      = 5;
+}
+
+enum SandboxLevel {
+  SANDBOX_LEVEL_UNSPECIFIED    = 0;
+  SANDBOX_LEVEL_AUTO           = 1;  // 沙箱内，自动执行
+  SANDBOX_LEVEL_CONFIRM        = 2;  // 越界，需要确认
+  SANDBOX_LEVEL_ALWAYS_CONFIRM = 3;  // 破坏性，始终确认
+}
+
+enum ApprovalDecision {
+  APPROVAL_DECISION_UNSPECIFIED = 0;
+  APPROVAL_DECISION_APPROVE     = 1;
+  APPROVAL_DECISION_REJECT      = 2;
+  APPROVAL_DECISION_EDIT        = 3;
+}
+
+// ============================================================
+//  LangChain 风格消息
+// ============================================================
+
+message ToolCall {
+  string call_id        = 1;
+  string tool_name      = 2;
+  string arguments_json = 3;
+}
+
+message ChatMessage {
+  string message_id             = 1;
+  MessageRole role              = 2;
+  string content                = 3;
+  repeated ToolCall tool_calls  = 4;
+  string tool_call_id           = 5;
+  string name                   = 6;
+  string additional_kwargs_json = 7;
+  string created_at             = 8;  // ISO 8601 UTC
+}
+
+// ============================================================
+//  主对话通道：C# (Client) → Python (Server)，流式返回
+// ============================================================
+
+message ChatRequest {
+  string humanmsg            = 1;  // 既有字段，勿改号
+  string thread_id           = 2;  // 既有字段，勿改号；由 C# 生成
+  ChatMode mode              = 3;
+  string task_json           = 4;  // 任务模式的结构化任务描述，可空
+  string client_context_json = 5;  // C# 侧上下文快照，可空
+  repeated ChatMessage history = 6;  // 可选历史消息
+  string contract_version    = 7;  // 语义化版本
+  string user_id             = 8;  // 用户隔离键
+  string username            = 9;  // 展示名
+}
+
+message ResumeChatRequest {
+  string thread_id        = 1;
+  string resume_json      = 2;  // Command(resume=...) 的 JSON 载荷
+  string user_id          = 3;
+  string username         = 4;
+  string contract_version = 5;
+  ChatMode mode           = 6;
+}
+
+message ToolCallEvent {
+  string thread_id      = 1;  // 既有字段，勿改号
+  string tool_name      = 2;  // 既有字段，勿改号
+  string arguments_json = 3;  // 既有字段，勿改号
+  string call_id        = 4;
+  string run_id         = 5;
+  bool   is_partial     = 6;  // 新增：true 表示 arguments_json 是增量片段，客户端需按 call_id 累积
+}
+
+message ToolResultEvent {
+  string thread_id   = 1;  // 既有字段，勿改号
+  string tool_name   = 2;  // 既有字段，勿改号
+  string result_json = 3;  // 既有字段，勿改号
+  string call_id     = 4;
+  ToolStatus status  = 5;
+  string error_json  = 6;
+}
+
+message DoneEvent {
+  string msg            = 1;  // 既有字段，勿改号
+  string thread_id      = 2;
+  string finish_reason  = 3;
+  string usage_json     = 4;
+  ChatStatus status     = 5;
+}
+
+message ErrorEvent {
+  string code      = 1;
+  string message   = 2;
+  string hint      = 3;
+  bool   retryable = 4;
+}
+
+message ReasoningChunk {
+  string thread_id = 1;
+  string delta     = 2;  // 思考文本增量
+  string run_id    = 3;
+  string step_id   = 4;  // Planner 步骤 ID；主 Agent 为空
+}
+
+// ============================================================
+//  计划（TASK 模式 Plan-and-Execute 的结构化快照）
+// ============================================================
+
+message PlanStepInfo {
+  string step_id        = 1;
+  string domain         = 2;  // state/scene/bg/particle/shader/camera/anim/asset/vision/ui/utility
+  string goal           = 3;
+  repeated string depends_on     = 4;
+  repeated string expected_tools = 5;
+  string acceptance     = 6;
+  bool   is_visual_check = 7;
+  string status         = 8;  // pending/running/done/failed/skipped
+  string error          = 9;
+}
+
+message PlanEvent {
+  string plan_id      = 1;  // run_id:vN，跨快照稳定
+  string thread_id    = 2;
+  string run_id       = 3;
+  int32  version      = 4;
+  repeated PlanStepInfo steps = 5;  // 全量快照，不是增量
+  string replan_reason = 6;
+  string status       = 7;  // active / done
+  string created_at   = 8;  // ISO 8601 UTC
+}
+
+// ============================================================
+//  HITL：人工介入请求（补充信息 / 推荐选项 / 审批）
+// ============================================================
+
+message HitlOption {
+  string value       = 1;
+  string label       = 2;
+  string description = 3;
+  bool   recommended = 4;
+}
+
+message HitlField {
+  string name         = 1;
+  string label        = 2;
+  string type         = 3;  // text / textarea / number / boolean / select / multiselect
+  bool   required     = 4;
+  string default_json = 5;  // 默认值的 JSON 表示
+  string placeholder  = 6;
+  string description  = 7;
+  repeated HitlOption options = 8;  // type=select/multiselect 时使用
+}
+
+message HitlEvent {
+  string hitl_id            = 1;
+  string thread_id          = 2;
+  string kind               = 3;  // information / choice / mixed / approval / unknown
+  string title              = 4;
+  string description        = 5;
+  repeated HitlField fields = 6;
+  repeated HitlOption options = 7;
+  bool   allow_multiple     = 8;   // 推荐选项是否可多选
+  bool   allow_free_text    = 9;   // 是否允许补充自由文本
+  string submit_label       = 10;
+  string cancel_label       = 11;
+  string resume_schema_json = 12;  // ResumeChat.resume_json 的 JSON Schema
+  string metadata_json      = 13;
+}
+
+message TrajectoryEvent {
+  string event_id      = 1;
+  string run_id        = 2;
+  string thread_id     = 3;
+  string parent_id     = 4;
+  string type          = 5;  // run / model / tool / skill / delegation / hitl / plan / step / replan / vision / budget
+  string name          = 6;
+  string status        = 7;
+  string args_json     = 8;
+  string result_json   = 9;
+  string started_at    = 10;  // ISO 8601 UTC
+  string ended_at      = 11;
+  string metadata_json = 12;
+}
+
+message ChatChunk {
+  oneof payload {
+    string          chunk       = 1;  // 既有分支，勿改号；AI 文本增量
+    ToolCallEvent   tool_call   = 2;  // 既有分支，勿改号
+    ToolResultEvent tool_result = 3;  // 既有分支，勿改号
+    DoneEvent       done        = 4;  // 既有分支，勿改号
+    ChatMessage     message     = 5;  // 完整 LangChain 风格消息
+    TrajectoryEvent trajectory  = 6;  // 轨迹事件
+    ErrorEvent      error       = 7;  // 流内错误
+    ReasoningChunk  reasoning   = 8;  // 新增：模型思考增量
+    HitlEvent       hitl        = 9;  // 新增：人工介入请求
+    PlanEvent       plan        = 10; // 新增：计划全量快照
+  }
+}
+
+service ChatService {
+  rpc Chat(ChatRequest) returns (stream ChatChunk);
+  rpc ResumeChat(ResumeChatRequest) returns (stream ChatChunk);
+}
+
+// ============================================================
+//  工具通道：Python (Client) → C# (Server)
+// ============================================================
+
+message ToolDescriptor {
+  string name               = 1;
+  string display_name       = 2;
+  string description        = 3;
+  string domain             = 4;
+  string skill              = 5;
+  string args_schema_json   = 6;
+  string result_schema_json = 7;
+  SandboxLevel sandbox_level = 8;
+  bool   is_write           = 9;
+  bool   is_destructive     = 10;
+  bool   supports_edit_args = 11;
+  int32  timeout_ms         = 12;
+  string version            = 13;
+}
+
+message SkillDefinition {
+  string name            = 1;
+  string display_name    = 2;
+  string description     = 3;
+  string prompt_fragment = 4;
+  repeated ToolDescriptor tools = 5;
+  string metadata_json   = 6;
+}
+
+message ListToolsRequest {
+  string contract_version = 1;
+  string thread_id        = 2;
+}
+
+message ListToolsResponse {
+  string contract_version = 1;
+  repeated SkillDefinition skills = 2;
+}
+
+message ToolError {
+  string code      = 1;
+  string message   = 2;
+  string hint      = 3;
+  bool   retryable = 4;
+}
+
+message ToolCallRequest {
+  string tool_name        = 1;  // 既有字段，勿改号
+  string arguments_json   = 2;  // 既有字段，勿改号
+  string thread_id        = 3;
+  string call_id          = 4;
+  string run_id           = 5;
+  ChatMode mode           = 6;
+  string trace_id         = 7;
+  string contract_version = 8;
+}
+
+message ToolCallResult {
+  bool   success       = 1;  // 既有字段，保留兼容；等价于 status == TOOL_STATUS_OK
+  string result_json   = 2;  // 既有字段，勿改号
+  string error         = 3;  // 既有字段，保留兼容
+  ToolStatus status    = 4;
+  string approval_id   = 5;
+  string call_id       = 6;
+  repeated TrajectoryEvent trajectory = 7;
+  int64  duration_ms   = 8;
+  ToolError detail     = 9;
+}
+
+message ResolveApprovalRequest {
+  string approval_id           = 1;
+  ApprovalDecision decision    = 2;
+  string edited_arguments_json = 3;
+  string thread_id             = 4;
+  string call_id               = 5;
+  string contract_version      = 6;
+}
+
+service ToolService {
+  rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
+  rpc CallTool(ToolCallRequest) returns (ToolCallResult);
+  rpc ResolveApproval(ResolveApprovalRequest) returns (ToolCallResult);
+}

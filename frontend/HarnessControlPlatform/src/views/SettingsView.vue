@@ -25,6 +25,7 @@ import {
 import TopNav from '@/components/console/TopNav.vue'
 import InfoHint from '@/components/common/InfoHint.vue'
 import { useDisplayStore } from '@/stores/display'
+import { useCommandsStore } from '@/stores/commands'
 import { useSettingsStore } from '@/stores/settings'
 import { MODEL_CATALOG, formatContext } from '@/stores/models'
 import {
@@ -46,6 +47,7 @@ import {
 import type { IconName } from '@/components/console/icons'
 
 const display = useDisplayStore()
+const commands = useCommandsStore()
 const settings = useSettingsStore()
 const route = useRoute()
 
@@ -494,6 +496,17 @@ onMounted(() => {
         </header>
 
         <ul class="rows">
+          <li>
+            <el-icon class="icon"><ChatDotRound /></el-icon>
+            <span class="text">
+              <strong>命令模式</strong>
+              <span>输入 / 唤起命令补全；关闭后 / 作为普通字符发送</span>
+            </span>
+            <el-switch
+              :model-value="commands.modeEnabled"
+              @update:model-value="(v: string | number | boolean) => commands.setMode(Boolean(v))"
+            />
+          </li>
           <li v-for="row in ROWS" :key="String(row.key)">
             <el-icon class="icon"><component :is="ROW_ICONS[row.icon] || ChatDotRound" /></el-icon>
             <span class="text">

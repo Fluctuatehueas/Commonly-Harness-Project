@@ -264,8 +264,11 @@ class PluginRuntime:
     def installed_map(self) -> dict[str, InstalledPlugin]:
         return dict(self._installed)
 
-    async def tools_for_main_agent(self) -> list[BaseTool]:
+    async def tools_for_main_agent(
+        self, plugin_ids: list[str] | None = None
+    ) -> list[BaseTool]:
         await self.initialize()
+        selected = {str(item) for item in (plugin_ids or []) if str(item).strip()}
         tools = self.registry.tools_for_user(
             self.user_id, reserved_names=set(RESERVED_TOOL_NAMES)
         )
@@ -273,12 +276,14 @@ class PluginRuntime:
             tool
             for tool in tools
             if self._enabled.get(getattr(tool, "plugin_id", ""), True)
+            and (not selected or getattr(tool, "plugin_id", "") in selected)
         ]
         # 只要有启用插件声明 resource，就注入成对的资源工具。
         has_resources = any(
             self.registry.snapshot(self.user_id, plugin_id)
             and self.registry.snapshot(self.user_id, plugin_id).resources
             for plugin_id in self.enabled_plugin_ids()
+            if not selected or plugin_id in selected
         )
         if has_resources:
             tools.extend(
@@ -316,13 +321,17 @@ class PluginRuntime:
             logger.exception("插件工具调用异常: %s/%s", plugin_id, tool_name)
             return f"Error: 插件工具调用失败: {error}"
 
-    async def resources_overview(self) -> list[dict[str, Any]]:
+    async def resources_overview(
+        self, plugin_ids: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         await self.initialize()
+        selected = {str(item) for item in (plugin_ids or []) if str(item).strip()}
         catalog = self.registry.resource_catalog(self.user_id)
         return [
             item
             for item in catalog
             if self._enabled.get(str(item.get("plugin_id")), True)
+            and (not selected or str(item.get("plugin_id")) in selected)
         ]
 
     async def read_resource(self, plugin_id: str, uri: str) -> Any:
@@ -331,15 +340,19 @@ class PluginRuntime:
             raise PluginNotReady(f"插件已停用: {plugin_id}", plugin_id=plugin_id)
         return await self.manager.read_resource(plugin_id, uri)
 
-    async def prompt_section(self, message_text: str = "") -> str:
+    async def prompt_section(
+        self, message_text: str = "", plugin_ids: list[str] | None = None
+    ) -> str:
         """把插件提示词与资源目录拼成系统提示片段（≤2000 字符）。"""
         await self.initialize()
+        selected = {str(item) for item in (plugin_ids or []) if str(item).strip()}
         prompts = [
             item
             for item in self.registry.prompts_for_user(self.user_id, message_text)
             if self._enabled.get(str(item.get("plugin_id")), True)
+            and (not selected or str(item.get("plugin_id")) in selected)
         ]
-        resources = await self.resources_overview()
+        resources = await self.resources_overview(plugin_ids)
         lines: list[str] = []
         for item in prompts:
             content = str(item.get("content") or item.get("prompt") or "").strip()
@@ -386,6 +399,12 @@ class PluginRuntime:
                     "name": installed.manifest.name,
                     "version": installed.version,
                     "description": installed.manifest.description,
+                    "author": {
+                        "name": installed.manifest.author_name,
+                        "homepage": installed.manifest.author_homepage,
+                    },
+                    "tag": list(installed.manifest.tags),
+                    "license": installed.manifest.license,
                     "source": installed.source,
                     "enabled": self._enabled.get(plugin_id, True),
                     "status": status,
@@ -592,13 +611,21 @@ class PluginRuntime:
     # ---------- 内部 ----------
 
     async def invoke_hooks(
-        self, hook_name: str, payload: dict[str, Any], *, timeout: float = 3.0
+        self,
+        hook_name: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 3.0,
+        plugin_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         await self.initialize()
+        selected = {str(item) for item in (plugin_ids or []) if str(item).strip()}
         results: list[dict[str, Any]] = []
         for hook in self.registry.hooks_for_user(self.user_id, hook_name):
             plugin_id = str(hook.get("plugin_id") or "")
             if not self._enabled.get(plugin_id, True):
+                continue
+            if selected and plugin_id not in selected:
                 continue
             result = await self.manager.invoke_hook(
                 plugin_id, hook_name, payload, timeout=timeout

@@ -10,7 +10,14 @@ SRC = Path(__file__).resolve().parents[2] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from plugin_bus.catalog_dsh import map_entries, map_entry, normalize_plugin_id  # noqa: E402
+from plugin_bus.catalog_dsh import (  # noqa: E402
+    apply_detail,
+    map_entries,
+    map_entry,
+    normalize_plugin_id,
+    package_url,
+    search_url,
+)
 
 
 class DshCatalogTest(unittest.TestCase):
@@ -49,6 +56,90 @@ class DshCatalogTest(unittest.TestCase):
         self.assertTrue(item["unsupported"])
         self.assertFalse(item["installable"])
         self.assertIn("不支持", item["unsupported_reason"])
+
+    def test_search_and_package_url(self):
+        self.assertEqual(
+            search_url("https://registry.npmmirror.com/", "awesome-dsh-plugin", 10),
+            "https://registry.npmmirror.com/-/v1/search?text=awesome-dsh-plugin&size=10",
+        )
+        self.assertEqual(
+            package_url("https://registry.npmjs.org", "@scope/pkg", "1.0.0"),
+            "https://registry.npmjs.org/@scope/pkg/1.0.0",
+        )
+        self.assertEqual(
+            package_url("https://registry.npmjs.org", "plain-pkg"),
+            "https://registry.npmjs.org/plain-pkg",
+        )
+
+    def test_detail_enables_skill_import(self):
+        item = map_entry(
+            {
+                "package": {
+                    "name": "dsh-skill-a",
+                    "version": "1.0.0",
+                    "keywords": ["skill"],
+                }
+            }
+        )
+        assert item is not None
+        self.assertFalse(item["importable"])
+        ok = apply_detail(
+            item,
+            {
+                "dist": {
+                    "tarball": "https://registry.example.com/dsh-skill-a-1.0.0.tgz",
+                    "integrity": "sha512-abc",
+                    "shasum": "f" * 40,
+                    "unpackedSize": 2048,
+                }
+            },
+        )
+        self.assertTrue(ok)
+        self.assertTrue(item["importable"])
+        self.assertFalse(item["installable"])
+        self.assertEqual(
+            item["npm_dist"]["tarball"],
+            "https://registry.example.com/dsh-skill-a-1.0.0.tgz",
+        )
+
+    def test_unsupported_entry_never_importable(self):
+        item = map_entry(
+            {"name": "cordis-plugin", "version": "0.1.0", "description": "内核插件"}
+        )
+        assert item is not None
+        apply_detail(
+            item, {"dist": {"tarball": "https://registry.example.com/cordis.tgz"}}
+        )
+        self.assertFalse(item["importable"])
+
+    def test_author_from_maintainers_and_no_fake_name(self):
+        item = map_entry(
+            {
+                "package": {
+                    "name": "dsh-with-maintainer",
+                    "version": "1.0.0",
+                    "maintainers": [{"name": "alice", "email": "a@example.com"}],
+                }
+            }
+        )
+        assert item is not None
+        self.assertEqual(item["author"]["name"], "alice")
+
+        bare = map_entry({"name": "dsh-bare", "version": "1.0.0"})
+        assert bare is not None
+        self.assertEqual(bare["author"]["name"], "")
+
+    def test_detail_fills_missing_author(self):
+        item = map_entry({"name": "dsh-needs-author", "version": "1.0.0"})
+        assert item is not None
+        apply_detail(
+            item,
+            {
+                "author": {"name": "bob"},
+                "dist": {"tarball": "https://registry.example.com/bob.tgz"},
+            },
+        )
+        self.assertEqual(item["author"]["name"], "bob")
 
     def test_map_search_payload(self):
         items = map_entries(

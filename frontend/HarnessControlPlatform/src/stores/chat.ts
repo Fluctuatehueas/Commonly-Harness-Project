@@ -1561,7 +1561,16 @@ export const useChatStore = defineStore('chat', () => {
     return error.message
   }
 
-  function send(text: string, attachments: ContextFile[] = []) {
+  function send(
+    text: string,
+    attachments: ContextFile[] = [],
+    binding?: {
+      skills?: string[]
+      mcp_ids?: string[]
+      plugin_ids?: string[]
+      flow_id?: string
+    },
+  ) {
     if (sending.value) return
     if (!threadId.value) {
       // ChatView 正常会先建会话；演示模式或异常路径下用本地线程兜底
@@ -1595,6 +1604,12 @@ export const useChatStore = defineStore('chat', () => {
       void runDemo(state, key, message)
       return
     }
+    const hasBinding = Boolean(
+      binding &&
+        ((binding.skills && binding.skills.length) ||
+          (binding.mcp_ids && binding.mcp_ids.length) ||
+          (binding.plugin_ids && binding.plugin_ids.length)),
+    )
     void streamPost(
       '/chat/stream',
       {
@@ -1607,6 +1622,16 @@ export const useChatStore = defineStore('chat', () => {
         // 下次切回该会话时不会误恢复上一个组。
         group_id: selectedGroupId.value,
         attachments: attachments.map((item) => item.id),
+        ...(binding?.flow_id ? { flow_id: binding.flow_id } : {}),
+        ...(hasBinding
+          ? {
+              binding: {
+                skills: binding?.skills || [],
+                mcp_ids: binding?.mcp_ids || [],
+                plugin_ids: binding?.plugin_ids || [],
+              },
+            }
+          : {}),
       },
       state,
       key,
@@ -1697,6 +1722,18 @@ export const useChatStore = defineStore('chat', () => {
       content: text,
       at: Date.now(),
     })
+  }
+
+  /** 仅清空当前会话的本地展示，不删除后端历史。 */
+  function clearView() {
+    const key = threadId.value
+    const state = key ? threads.value[key] : undefined
+    if (state?.sending) return
+    if (state) {
+      state.messages = []
+      state.pendingInterrupt = null
+      state.retryBackup = null
+    }
   }
 
   // HITL 恢复：补充信息 / 审批决策
@@ -2100,6 +2137,7 @@ export const useChatStore = defineStore('chat', () => {
     retryLast,
     retryCountFor,
     addNote,
+    clearView,
     markSchedulerRunStatus,
   }
 })

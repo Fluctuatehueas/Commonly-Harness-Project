@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
-import { Close, Delete, Download, RefreshRight, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import {
+  Close,
+  Delete,
+  Download,
+  MagicStick,
+  RefreshRight,
+  VideoPause,
+  VideoPlay,
+} from '@element-plus/icons-vue'
 import type { PluginCardModel } from '@/types/plugins'
 
 const props = defineProps<{
@@ -12,6 +20,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:modelValue': [boolean]
   install: [PluginCardModel]
+  'import-skill': [PluginCardModel]
   toggle: [PluginCardModel, boolean]
   restart: [PluginCardModel]
   uninstall: [PluginCardModel]
@@ -26,6 +35,12 @@ let startWidth = 0
 const enabled = computed(() => Boolean(props.item?.enabled))
 const installable = computed(() => props.item?.installable !== false)
 const unsupported = computed(() => Boolean(props.item?.unsupported))
+const dshSkill = computed(
+  () =>
+    props.item?.source === 'dsh' &&
+    props.item?.import_kind === 'skill-import' &&
+    props.item?.importable !== false,
+)
 const capabilities = computed(() => props.item?.capabilities || [])
 const permissions = computed(() => props.item?.permissions || [])
 const uiSlots = computed(() => props.item?.ui_slots || props.item?.ui?.slots || [])
@@ -96,12 +111,23 @@ onBeforeUnmount(stopResize)
           <div class="drawer-body">
             <p class="desc">{{ item.description || item.summary || '暂无描述' }}</p>
 
+            <div v-if="(item.tag || []).length" class="tags">
+              <span v-for="tag in item.tag" :key="tag" class="tag">#{{ tag }}</span>
+            </div>
+
             <el-alert
               v-if="unsupported"
               type="warning"
               :closable="false"
               show-icon
               :title="item.unsupported_reason || '本系统不支持该市场条目'"
+            />
+            <el-alert
+              v-else-if="!installed && dshSkill"
+              type="info"
+              :closable="false"
+              show-icon
+              title="DSH 条目不能直接运行，可转译为本地技能后导入"
             />
             <el-alert
               v-else-if="!installed && !installable"
@@ -120,6 +146,10 @@ onBeforeUnmount(stopResize)
             />
 
             <section class="grid">
+              <div class="cell">
+                <span class="label">作者</span>
+                <span class="value">{{ item.author?.name || '-' }}</span>
+              </div>
               <div class="cell">
                 <span class="label">来源</span>
                 <span class="value">{{ sourceLabel }}</span>
@@ -246,6 +276,15 @@ onBeforeUnmount(stopResize)
             </template>
             <template v-else>
               <el-button
+                v-if="dshSkill"
+                type="primary"
+                :icon="MagicStick"
+                @click="emit('import-skill', item)"
+              >
+                转译为技能
+              </el-button>
+              <el-button
+                v-else
                 type="primary"
                 :icon="Download"
                 :disabled="!installable || unsupported"
@@ -340,6 +379,18 @@ onBeforeUnmount(stopResize)
   color: var(--text-2);
   line-height: 1.7;
   font-size: 12px;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+}
+.tag {
+  padding: 1px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(126, 154, 198, 0.08);
+  color: var(--text-2);
 }
 .grid {
   display: grid;

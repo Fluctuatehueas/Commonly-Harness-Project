@@ -25,6 +25,7 @@ from fastapi import HTTPException
 from langchain_core.messages import AIMessage
 
 from agent.backends.sandbox_manager import SandboxManager
+from agent.command_binding import binding_hash, normalize_binding
 from agent import config as agent_config
 from agent.config import (
     close_async_persistence,
@@ -193,6 +194,7 @@ class AgentLoader:
         thread_id: str,
         agent_id: str = "default",
         group_id: str = "",
+        binding: Any = None,
     ) -> Any:
         """获取用户所选 Agent 的图，并登记该用户访问过的会话。
 
@@ -216,6 +218,9 @@ class AgentLoader:
         if not agent_config.AGENT_TEAM_ENABLED:
             # 总开关关闭时忽略组，全部按独立 Agent 运行。
             resolved_group_id = ""
+        # 命令绑定只影响本轮：空绑定保持原有缓存行为。
+        binding_payload = normalize_binding(binding)
+        binding_key = binding_hash(binding_payload)
 
         # 用户级锁防止重复构建；沙箱探测和构图不会阻塞其他用户。
         async with self._user_locks.setdefault(user_id, asyncio.Lock()):
@@ -242,6 +247,8 @@ class AgentLoader:
             cache_key = (
                 f"{resolved_agent_id}:{resolved_group_id}:{integration_server_id}"
             )
+            if binding_key:
+                cache_key = f"{cache_key}:{binding_key}"
             agent = group.agents.get(cache_key)
             if agent is None:
                 from agent.agent_team.factory import (
@@ -273,8 +280,16 @@ class AgentLoader:
                     sandbox_backend=sandbox_backend,
                     integration_server_id=integration_server_id or None,
                     agent_context=context,
+                    command_binding=binding_payload,
                 )
                 group.agents[cache_key] = agent
+                if binding_key:
+                    if cache_key in group.bound_keys:
+                        group.bound_keys.remove(cache_key)
+                    group.bound_keys.append(cache_key)
+                    while len(group.bound_keys) > 8:
+                        stale = group.bound_keys.pop(0)
+                        group.agents.pop(stale, None)
             return agent
 
     async def reset_agents(self) -> None:

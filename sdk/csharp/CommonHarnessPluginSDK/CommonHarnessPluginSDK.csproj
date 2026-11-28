@@ -1,0 +1,32 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+	<!-- 跨语言契约：优先使用 SDK 目录自带的 .protoes，避免依赖外部仓库绝对路径 -->
+	<HarnessProtoDir Condition="'$(HarnessProtoDir)' == ''">$(MSBuildProjectDirectory)\..\.protoes</HarnessProtoDir>
+	<NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Folder Include="Protocols\" />
+  </ItemGroup>
+  <ItemGroup>
+	<!-- gRPC ToolService（C# 作为服务端）依赖 ASP.NET Core 共享框架；WPF 进程需安装 ASP.NET Core Runtime。 -->
+	<FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+  	<Protobuf Include="$(HarnessProtoDir)\Agent.proto" GrpcServices="Both" />
+  	<Protobuf Include="$(HarnessProtoDir)\Session.proto" GrpcServices="Both" />
+  	<Protobuf Include="$(HarnessProtoDir)\Trajectory.proto" GrpcServices="Both" />
+  	<Protobuf Include="$(HarnessProtoDir)\Harness.proto" GrpcServices="Both" />
+  	<Protobuf Include="$(HarnessProtoDir)\File.proto" GrpcServices="Both" />
+  </ItemGroup>
+  <ItemGroup>
+  	<PackageReference Include="Grpc.AspNetCore" Version="2.62.0" />
+  	<PackageReference Include="Grpc.Net.Client" Version="2.62.0" />
+  	<PackageReference Include="Google.Protobuf" Version="3.27.0" />
+  	<PackageReference Include="Grpc.Tools" Version="2.62.0" PrivateAssets="All" />
+  </ItemGroup>
+</Project>

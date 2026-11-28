@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Delete, Download, RefreshRight, VideoPause, VideoPlay, View } from '@element-plus/icons-vue'
+import {
+  Delete,
+  Download,
+  MagicStick,
+  RefreshRight,
+  VideoPause,
+  VideoPlay,
+  View,
+} from '@element-plus/icons-vue'
 import type { PluginCardModel } from '@/types/plugins'
 
 const props = defineProps<{
@@ -11,6 +19,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   detail: [PluginCardModel]
   install: [PluginCardModel]
+  'import-skill': [PluginCardModel]
   toggle: [PluginCardModel, boolean]
   restart: [PluginCardModel]
   uninstall: [PluginCardModel]
@@ -36,6 +45,13 @@ const sourceLabel = computed(() => {
 })
 const installable = computed(() => props.item.installable !== false)
 const unsupported = computed(() => Boolean(props.item.unsupported))
+// DSH 条目不能直接运行，带 SKILL.md 的包可转译为本地技能
+const dshSkill = computed(
+  () =>
+    props.item.source === 'dsh' &&
+    props.item.import_kind === 'skill-import' &&
+    props.item.importable !== false,
+)
 const enabled = computed(() => Boolean(props.item.enabled))
 const displayVersion = computed(
   () => props.item.installed_version || props.item.version,
@@ -67,6 +83,7 @@ const displayVersion = computed(
           <span v-if="installed" class="mono state" :class="{ on: enabled }">
             {{ enabled ? '已启用' : '已停用' }}
           </span>
+          <span v-if="item.author?.name" class="author">by {{ item.author.name }}</span>
         </div>
       </div>
       <el-button
@@ -79,6 +96,10 @@ const displayVersion = computed(
     </header>
 
     <p class="desc">{{ item.description || item.summary || '暂无描述' }}</p>
+
+    <div v-if="(item.tag || []).length" class="tags">
+      <span v-for="tag in item.tag" :key="tag" class="tag"># {{ tag }}</span>
+    </div>
 
     <div class="chips">
       <span v-for="cap in capabilities" :key="cap" class="cap" :class="`cap-${cap}`">
@@ -126,6 +147,16 @@ const displayVersion = computed(
       </template>
       <template v-else>
         <el-button
+          v-if="dshSkill"
+          size="small"
+          type="primary"
+          :icon="MagicStick"
+          @click="emit('import-skill', item)"
+        >
+          转译为技能
+        </el-button>
+        <el-button
+          v-else
           size="small"
           type="primary"
           :icon="Download"
@@ -215,6 +246,26 @@ const displayVersion = computed(
 }
 .state.on {
   color: var(--green);
+}
+.author {
+  color: var(--text-3);
+  font-size: 10px;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--text-3);
+}
+.tag {
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: rgba(126, 154, 198, 0.08);
+  color: var(--text-2);
+}
+.tag::first-letter {
+  color: var(--text-3);
 }
 .desc {
   margin: 0;

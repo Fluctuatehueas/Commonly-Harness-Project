@@ -46,6 +46,14 @@ class CatalogTest(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_config, "PLUGIN_REGISTRY_WHITELIST", []),
             patch.object(agent_config, "PLUGIN_DSH_ENABLED", False),
             patch.object(agent_config, "PLUGIN_DSH_CATALOG_URL", ""),
+            patch.object(agent_config, "PLUGIN_DSH_QUERY", "awesome-dsh-plugin"),
+            patch.object(
+                agent_config, "PLUGIN_DSH_MIRROR_URL", "https://registry.npmmirror.com"
+            ),
+            patch.object(
+                agent_config, "PLUGIN_DSH_FALLBACK_URL", "https://registry.npmjs.org"
+            ),
+            patch.object(agent_config, "PLUGIN_DSH_ENRICH_LIMIT", 20),
             patch.object(agent_config, "PLUGIN_MARKET_ENABLED", True),
             patch.object(agent_config, "PLUGIN_CATALOG_CACHE_SECONDS", 600),
         ]
@@ -154,6 +162,92 @@ class CatalogTest(unittest.IsolatedAsyncioTestCase):
         self.config.PLUGIN_REGISTRY_WHITELIST = ["allow-me"]
         result = await service.get(force=True)
         self.assertEqual([item["plugin_id"] for item in result.items], ["allow-me"])
+
+    async def test_dsh_mirror_search_and_detail(self):
+        search = {
+            "objects": [
+                {
+                    "package": {
+                        "name": "dsh-skill-a",
+                        "version": "1.0.0",
+                        "keywords": ["skill"],
+                    }
+                },
+                {
+                    "package": {
+                        "name": "cordis-b",
+                        "version": "2.0.0",
+                        "description": "内核插件",
+                    }
+                },
+            ]
+        }
+        detail = {
+            "dist": {
+                "tarball": "https://mirror.example/dsh-skill-a/-/dsh-skill-a-1.0.0.tgz",
+                "shasum": "a" * 40,
+            }
+        }
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            calls.append(url)
+            if "/-/v1/search" in url:
+                return httpx.Response(200, json=search)
+            if "dsh-skill-a/1.0.0" in url:
+                return httpx.Response(200, json=detail)
+            return httpx.Response(404)
+
+        service = CatalogService(transport=httpx.MockTransport(handler))
+        self.config.PLUGIN_DSH_ENABLED = True
+        self.config.PLUGIN_DSH_CATALOG_URL = ""
+        self.config.PLUGIN_DSH_MIRROR_URL = "https://mirror.example"
+        self.config.PLUGIN_DSH_FALLBACK_URL = ""
+        self.config.PLUGIN_DSH_QUERY = "awesome-dsh-plugin"
+        self.config.PLUGIN_DSH_ENRICH_LIMIT = 5
+
+        result = await service.get(force=True)
+        by_id = {item["plugin_id"]: item for item in result.items}
+        skill = by_id["dsh-dsh-skill-a"]
+        self.assertTrue(skill["importable"])
+        self.assertEqual(skill["import_kind"], "skill-import")
+        self.assertEqual(
+            skill["npm_dist"]["tarball"],
+            "https://mirror.example/dsh-skill-a/-/dsh-skill-a-1.0.0.tgz",
+        )
+        self.assertTrue(by_id["dsh-cordis-b"]["unsupported"])
+        self.assertFalse(by_id["dsh-cordis-b"]["importable"])
+        # 只对 SKILL 类条目拉包详情，Cordis 条目不补。
+        self.assertEqual(sum("cordis-b" in url for url in calls), 0)
+
+    async def test_dsh_falls_back_to_upstream(self):
+        search = {
+            "objects": [
+                {"package": {"name": "dsh-skill-x", "version": "1.0.0", "keywords": ["skill"]}}
+            ]
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "mirror.example" in url:
+                return httpx.Response(500)
+            if "/-/v1/search" in url:
+                return httpx.Response(200, json=search)
+            return httpx.Response(404)
+
+        service = CatalogService(transport=httpx.MockTransport(handler))
+        self.config.PLUGIN_DSH_ENABLED = True
+        self.config.PLUGIN_DSH_CATALOG_URL = ""
+        self.config.PLUGIN_DSH_MIRROR_URL = "https://mirror.example"
+        self.config.PLUGIN_DSH_FALLBACK_URL = "https://upstream.example"
+        self.config.PLUGIN_DSH_QUERY = "awesome-dsh-plugin"
+        self.config.PLUGIN_DSH_ENRICH_LIMIT = 5
+
+        result = await service.get(force=True)
+        ids = [item["plugin_id"] for item in result.items]
+        self.assertEqual(ids, ["dsh-dsh-skill-x"])
+        self.assertFalse(result.stale)
 
     async def test_market_disabled_only_private(self):
         private = {"plugins": [_entry("private-only", "1.0.0")]}

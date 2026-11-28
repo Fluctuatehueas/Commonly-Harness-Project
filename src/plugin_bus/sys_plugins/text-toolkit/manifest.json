@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "protocolVersion": "1.0",
   "description": "统计、转换与字面替换文本，适合写作、日志清洗和数据处理。",
-  "author": { "name": "Harness" },
+  "author": { "name": "Local" },
   "license": "MIT",
   "tag": ["文本", "内置工具"],
   "capabilities": ["tool"],

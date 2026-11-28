@@ -71,6 +71,7 @@ from api.agent_groups import router as agent_groups_router
 from api.agents import router as agents_router
 from api.async_tasks import extract_async_task_id
 from api.async_tasks import router as async_tasks_router
+from api.commands import router as commands_router
 from api.context import attachment_metadata, build_user_content
 from api.context import router as context_router
 from api.identity import UserIdentityMiddleware, effective_user_id
@@ -558,6 +559,26 @@ async def _resolve_group_id(
     return str((session or {}).get("group_id") or "").strip()
 
 
+async def _validated_binding(user_id: str, raw: Any) -> dict[str, list[str]] | None:
+    """归一化并校验命令绑定；不合法时整轮拒绝，不静默忽略。"""
+    from agent.command_binding import normalize_binding, validate_binding
+
+    binding = normalize_binding(raw)
+    if binding is None:
+        return None
+    problems = await validate_binding(user_id, binding)
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "COMMAND_BINDING_INVALID",
+                "message": "本轮绑定的资源不合法",
+                "items": problems,
+            },
+        )
+    return binding
+
+
 async def _run_chat_turn(
     request: ChatRequest,
     thread_id: str,
@@ -572,12 +593,16 @@ async def _run_chat_turn(
     group_id = await _resolve_group_id(
         request.user_id, thread_id, getattr(request, "group_id", None)
     )
+    binding = await _validated_binding(
+        request.user_id, getattr(request, "binding", None)
+    )
     agent = await agent_loader.get_agent_for_user(
         user_id=request.user_id,
         username=username,
         thread_id=thread_id,
         agent_id=agent_id,
         group_id=group_id,
+        binding=binding,
     )
     # thread_id 用于 checkpoint 恢复会话，user_id 和 username 用于 Agent 身份隔离。
     config = agent_loader.create_config(
@@ -1331,6 +1356,7 @@ async def _stream_response(
     is_resume: bool,
     retry_plan: RetryPlan | None = None,
     flow_turn: FlowTurn | None = None,
+    binding: dict[str, list[str]] | None = None,
 ) -> AsyncIterator[str]:
     """在整个 SSE 生命周期持有会话 guard，取消和异常时也释放。"""
     request.user_id = effective_user_id(request.user_id)
@@ -1345,6 +1371,7 @@ async def _stream_response(
                 is_resume=is_resume,
                 retry_plan=retry_plan,
                 flow_turn=flow_turn,
+                binding=binding,
             )) as response:
                 async for event in response:
                     yield event
@@ -1362,6 +1389,7 @@ async def _stream_response_unlocked(
     is_resume: bool,
     retry_plan: RetryPlan | None = None,
     flow_turn: FlowTurn | None = None,
+    binding: dict[str, list[str]] | None = None,
 ) -> AsyncIterator[str]:
     """流式发送 Agent 文本、工具和中断事件。
 
@@ -1464,6 +1492,7 @@ async def _stream_response_unlocked(
             thread_id=thread_id,
             agent_id=agent_id,
             group_id=group_id,
+            binding=binding,
         )
         config = agent_loader.create_config(
             thread_id=thread_id,
@@ -1960,6 +1989,10 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     turn_agent_id = await _resolve_agent_id(
         request.user_id, thread_id, getattr(request, "agent_id", None)
     )
+    # 命令绑定先校验：不合法时直接 422，不进入流式响应。
+    binding = await _validated_binding(
+        request.user_id, getattr(request, "binding", None)
+    )
     # 任务流路由：命中则把流程规范注入用户消息，仍由主 Agent 图执行。
     flow_turn = await _prepare_flow_turn(request)
     if flow_turn is not None:
@@ -1999,6 +2032,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             agent_input=agent_input,
             is_resume=False,
             flow_turn=flow_turn,
+            binding=binding,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -2152,6 +2186,7 @@ async def withdraw_chat(
 app.include_router(router)
 app.include_router(agents_router)
 app.include_router(agent_groups_router)
+app.include_router(commands_router)
 app.include_router(feedback_router)
 app.include_router(history_router)
 app.include_router(async_tasks_router)

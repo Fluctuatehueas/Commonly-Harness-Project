@@ -1,0 +1,129 @@
+// Harness 核心能力发现与配置契约。
+// 只暴露 Harness 自身的元信息；业务能力仍由 C# ToolService 提供。
+syntax = "proto3";
+
+package agent;
+option csharp_namespace = "Agent.Proto";
+
+message Capability {
+  string name    = 1;
+  bool   enabled = 2;
+  string detail  = 3;
+}
+
+message GetCapabilitiesRequest {
+  string user_id = 1;  // 用于返回该用户的会话数
+}
+
+message GetCapabilitiesResponse {
+  string contract_version        = 1;
+  string model_name              = 2;
+  bool   model_thinking_enabled  = 3;
+  bool   sandbox_enabled         = 4;
+  int32  python_tool_count       = 5;
+  int32  skill_count             = 6;
+  int32  subagent_count          = 7;
+  int32  mcp_server_count        = 8;
+  int32  session_count           = 9;
+  repeated Capability capabilities = 10;
+}
+
+message ModelSettings {
+  string model_name        = 1;
+  string base_url          = 2;
+  bool   has_api_key       = 3;  // 只返回是否已配置，不回传密钥
+  bool   thinking_enabled  = 4;
+}
+
+message GetModelSettingsRequest {}
+
+message UpdateModelSettingsRequest {
+  optional string model_name       = 1;
+  optional string base_url         = 2;
+  optional string api_key          = 3;
+  optional bool   thinking_enabled = 4;
+}
+
+message SkillSummary {
+  string name          = 1;
+  string display_name  = 2;
+  string description   = 3;
+  string path          = 4;
+  string metadata_json = 5;
+}
+
+message ListSkillsRequest {}
+
+message ListSkillsResponse {
+  repeated SkillSummary skills = 1;
+}
+
+message GetSkillRequest {
+  string name = 1;
+}
+
+message GetSkillResponse {
+  SkillSummary skill = 1;
+  string content     = 2;  // SKILL.md 原文
+}
+
+message SubagentSummary {
+  string name         = 1;
+  string description  = 2;
+  string path         = 3;
+  string config_json  = 4;
+  // 以下字段把子 Agent 的工具/技能/MCP 需求显式暴露给 C# 端，
+  // 便于 C# 提前确认需要注册哪些 [Tool]，而不必解析 config_json。
+  repeated string tools          = 5;  // 必需工具（缺失会导致 Python 构图失败）
+  repeated string optional_tools = 6;  // 可选工具（C# 注册后自动绑定，未注册则跳过）
+  repeated string mcp_servers    = 7;  // 引用的 MCP Server 名称
+  repeated string skills         = 8;  // 子 Agent 技能目录（/skills/subagents/...）
+  string          model          = 9;  // 模型别名：main / vision，空表示继承主模型
+}
+
+message ListSubagentsRequest {}
+
+message ListSubagentsResponse {
+  repeated SubagentSummary subagents = 1;
+}
+
+message McpServerSummary {
+  string name         = 1;
+  string transport    = 2;
+  string description  = 3;
+  string config_json  = 4;
+  bool   optional     = 5;  // 连接失败只告警、不阻断构图
+  bool   enabled      = 6;  // false 表示已声明但当前不加载
+  repeated string used_by_subagents = 7;  // 引用该 Server 的子 Agent 名称
+}
+
+message ListMcpServersRequest {}
+
+message ListMcpServersResponse {
+  repeated McpServerSummary servers = 1;
+}
+
+message ContextFormat {
+  string extension  = 1;
+  string kind       = 2;  // image / document / text
+  string mime_type  = 3;
+}
+
+message ListContextFormatsRequest {}
+
+message ListContextFormatsResponse {
+  repeated ContextFormat formats = 1;
+  int32 max_file_mb              = 2;
+  int32 max_files                = 3;
+}
+
+service HarnessService {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc GetModelSettings(GetModelSettingsRequest) returns (ModelSettings);
+  rpc UpdateModelSettings(UpdateModelSettingsRequest) returns (ModelSettings);
+  rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
+  rpc GetSkill(GetSkillRequest) returns (GetSkillResponse);
+  rpc ListSubagents(ListSubagentsRequest) returns (ListSubagentsResponse);
+  rpc ListMcpServers(ListMcpServersRequest) returns (ListMcpServersResponse);
+  rpc ListContextFormats(ListContextFormatsRequest) returns (ListContextFormatsResponse);
+}

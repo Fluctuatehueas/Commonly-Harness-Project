@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -51,6 +52,9 @@ class SourceSpec:
     name: str
     url: str
     kind: str  # http / local / dsh
+    # dsh 专用：registry 根地址与搜索失败后的回退源
+    base: str = ""
+    fallback: str = ""
 
 
 class CatalogService:
@@ -113,8 +117,24 @@ class CatalogService:
                 )
         if config.PLUGIN_REGISTRY_URL:
             specs.append(SourceSpec("private", config.PLUGIN_REGISTRY_URL, "http"))
-        if config.PLUGIN_DSH_ENABLED and config.PLUGIN_DSH_CATALOG_URL:
-            specs.append(SourceSpec("dsh", config.PLUGIN_DSH_CATALOG_URL, "dsh"))
+        if config.PLUGIN_DSH_ENABLED:
+            explicit = str(config.PLUGIN_DSH_CATALOG_URL or "").strip()
+            if explicit:
+                specs.append(
+                    SourceSpec("dsh", explicit, "dsh", base=_origin(explicit))
+                )
+            else:
+                mirror = str(config.PLUGIN_DSH_MIRROR_URL or "").rstrip("/")
+                fallback = str(config.PLUGIN_DSH_FALLBACK_URL or "").rstrip("/")
+                specs.append(
+                    SourceSpec(
+                        "dsh",
+                        catalog_dsh.search_url(mirror, config.PLUGIN_DSH_QUERY),
+                        "dsh",
+                        base=mirror,
+                        fallback=fallback,
+                    )
+                )
         return specs
 
     async def _refresh(self) -> CatalogResult:
@@ -209,6 +229,9 @@ class CatalogService:
     ) -> tuple[list[dict[str, Any]], bool, str, str]:
         """返回 (条目, stale, error, fetched_at)。不抛异常。"""
         try:
+            if spec.kind == "dsh":
+                entries = await self._fetch_dsh(spec)
+                return entries, False, "", _now_iso()
             if spec.kind == "local":
                 payload = json.loads(Path(spec.url).read_text(encoding="utf-8-sig"))
                 entries = self._extract(payload, spec.name)
@@ -243,6 +266,71 @@ class CatalogService:
                     str(cached.get("fetched_at") or ""),
                 )
             return [], True, f"{type(error).__name__}: {error}", ""
+
+    async def _fetch_dsh(
+        self, spec: SourceSpec
+    ) -> list[dict[str, Any]]:
+        """DSH 目录：搜索 → 逐条目补包详情，镜像失败回退官方源。"""
+        config = _config()
+        attempts: list[tuple[str, str]] = [(spec.url, spec.base)]
+        if spec.fallback:
+            attempts.append(
+                (
+                    catalog_dsh.search_url(
+                        spec.fallback, config.PLUGIN_DSH_QUERY
+                    ),
+                    spec.fallback,
+                )
+            )
+        failures: list[str] = []
+        for url, base in attempts:
+            if not url:
+                continue
+            try:
+                payload = await self._get_json(url)
+            except Exception as error:  # noqa: BLE001 - 单源失败继续下一个
+                failures.append(f"{base or url}: {error}")
+                continue
+            entries = catalog_dsh.map_entries(payload)
+            registries = [item for item in (base, spec.fallback) if item]
+            await self._enrich_dsh(entries, registries)
+            return entries
+        raise ValueError("DSH 目录不可用: " + " | ".join(failures))
+
+    async def _enrich_dsh(
+        self, entries: list[dict[str, Any]], registries: list[str]
+    ) -> None:
+        """给 SKILL 类条目补 tarball 与完整性字段；失败不影响条目展示。"""
+        if not registries:
+            return
+        limit = int(getattr(_config(), "PLUGIN_DSH_ENRICH_LIMIT", 20) or 0)
+        targets = [
+            item
+            for item in entries
+            if item.get("import_kind") == catalog_dsh.IMPORT_KIND_SKILL
+            and item.get("npm_name")
+        ][:limit]
+        if not targets:
+            return
+        semaphore = asyncio.Semaphore(6)
+
+        async def enrich(entry: dict[str, Any]) -> None:
+            async with semaphore:
+                for registry in registries:
+                    try:
+                        detail = await self._get_json(
+                            catalog_dsh.package_url(
+                                registry,
+                                str(entry.get("npm_name") or ""),
+                                str(entry.get("version") or ""),
+                            )
+                        )
+                    except Exception:  # noqa: BLE001 - 详情失败保持不可转译
+                        continue
+                    if catalog_dsh.apply_detail(entry, detail):
+                        return
+
+        await asyncio.gather(*(enrich(entry) for entry in targets))
 
     def _extract(self, payload: Any, source: str) -> list[dict[str, Any]]:
         if source == "dsh":
@@ -348,6 +436,14 @@ class CatalogService:
             os.replace(temporary, path)
         except OSError:
             logger.debug("写入插件目录缓存失败: %s", path, exc_info=True)
+
+
+def _origin(url: str) -> str:
+    """取 URL 的 scheme://host[:port]，用于从显式目录地址推导 registry 根。"""
+    parsed = urlparse(str(url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return str(url or "").rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _version_key(version: str) -> tuple[int, ...]:

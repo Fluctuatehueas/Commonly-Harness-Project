@@ -213,6 +213,19 @@ export async function fetchPluginAudit(
   return data.items
 }
 
+// DSH 条目转译为本地技能
+export async function importDshSkill(
+  pluginId: string,
+  version = '',
+): Promise<PluginStartInstallResult> {
+  return sendJson(
+    '/plugins/dsh/import',
+    'POST',
+    { plugin_id: pluginId, version },
+    '启动 DSH 转译失败',
+  )
+}
+
 export function pluginUiUrl(pluginId: string, entry: string): string {
   const clean = entry.replace(/^\/+/, '')
   return `${API_BASE}/plugins/${encodeURIComponent(pluginId)}/ui/${clean}`

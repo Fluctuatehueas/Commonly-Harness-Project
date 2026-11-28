@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from agent.identity import current_user_id
-from plugin_bus import installer, jobs, storage
+from plugin_bus import dsh_import, installer, jobs, storage
 from plugin_bus.errors import PluginError, PluginNotFound
 from plugin_bus.runtime import get_plugin_runtime
 
@@ -110,6 +110,11 @@ class ConfigRequest(BaseModel):
 
 
 class UpdateRequest(BaseModel):
+    version: str = Field("", max_length=32)
+
+
+class DshImportRequest(BaseModel):
+    plugin_id: str = Field(..., max_length=64)
     version: str = Field("", max_length=32)
 
 
@@ -231,26 +236,41 @@ async def list_updates() -> dict[str, Any]:
 # ============================================================
 
 
-async def _run_install_job(job_id: str, user_id: str, coroutine: Any) -> None:
+async def _run_install_job(
+    job_id: str,
+    user_id: str,
+    coroutine: Any,
+    *,
+    done_message: str = "安装完成",
+) -> None:
     try:
         item = await coroutine
         jobs.update_job(
             job_id,
             status="done",
             stage="done",
-            message="安装完成",
+            message=done_message,
             result=item,
         )
     except PluginError as error:
         jobs.fail_job(job_id, error.message)
+    except HTTPException as error:
+        jobs.fail_job(job_id, str(error.detail))
     except Exception as error:  # noqa: BLE001 - 后台任务必须写回任务表
         logger.exception("插件安装任务失败: %s", job_id)
         jobs.fail_job(job_id, f"安装失败: {error}")
 
 
-def _start_job(job: dict[str, Any], coroutine: Any) -> None:
+def _start_job(
+    job: dict[str, Any], coroutine: Any, *, done_message: str = "安装完成"
+) -> None:
     asyncio.create_task(
-        _run_install_job(job["job_id"], str(job["_user_id"]), coroutine),
+        _run_install_job(
+            job["job_id"],
+            str(job["_user_id"]),
+            coroutine,
+            done_message=done_message,
+        ),
         name=f"plugin-install-{job['job_id']}",
     )
 
@@ -344,10 +364,42 @@ async def upload_plugin(
     return {"job_id": job["job_id"], "job": jobs.get_job(user_id, job["job_id"])}
 
 
+@router.post("/dsh/import", status_code=202)
+async def import_dsh_skill(body: DshImportRequest) -> dict[str, Any]:
+    """把 DSH 市场里带 SKILL.md 的条目转译成当前用户的技能。"""
+    entry = await _catalog_entry(body.plugin_id, body.version)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="DSH 目录中没有该条目")
+    if str(entry.get("source") or "") != "dsh":
+        raise HTTPException(status_code=409, detail="该条目不是 DSH 来源")
+    if entry.get("import_kind") != "skill-import":
+        raise HTTPException(
+            status_code=409,
+            detail=entry.get("unsupported_reason") or "该条目不支持转译为技能",
+        )
+    if entry.get("importable") is False:
+        raise HTTPException(
+            status_code=409,
+            detail=entry.get("unsupported_reason") or "该条目缺少可下载的 npm 包",
+        )
+    user_id = current_user_id()
+    job = jobs.create_job(
+        "dsh-skill",
+        str(entry.get("name") or body.plugin_id),
+        user_id=user_id,
+        plugin_id=body.plugin_id,
+    )
+    _start_job(
+        job,
+        dsh_import.import_skill(user_id, entry, job_id=job["job_id"]),
+        done_message="转译完成",
+    )
+    return {"job_id": job["job_id"], "job": jobs.get_job(user_id, job["job_id"])}
+
+
 @router.get("/jobs")
 async def list_jobs() -> dict[str, Any]:
     return {"jobs": jobs.list_jobs(current_user_id())}
-
 
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str) -> dict[str, Any]:

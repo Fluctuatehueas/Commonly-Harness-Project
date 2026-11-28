@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Harness Plugin Protocol 1.0 · 非 SDK 接入指南</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --text: #1c2430;
+    --text-2: #4a5768;
+    --text-3: #7a8798;
+    --line: #e3e7ed;
+    --line-strong: #cfd6e0;
+    --accent: #2f6fed;
+    --accent-soft: #eaf1ff;
+    --green: #1f8a5b;
+    --amber: #b7791f;
+    --red: #c0392b;
+    --code-bg: #0f1724;
+    --code-text: #dbe4f0;
+    --mono: "JetBrains Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+    --sans: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.7;
+    font-size: 14px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.92em; background: #eef1f6; padding: 1px 5px; border-radius: 4px; }
+  pre code { background: none; padding: 0; font-size: 12.5px; }
+
+  .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 0; max-width: 1500px; margin: 0 auto; }
+
+  /* 侧边栏 */
+  aside.toc {
+    position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+    padding: 26px 16px 40px; border-right: 1px solid var(--line); background: var(--panel);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 18px; }
+  .brand-mark {
+    width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center;
+    background: var(--accent); color: #fff; font-weight: 700; font-size: 13px; letter-spacing: .5px;
+  }
+  .brand-title { font-weight: 650; font-size: 13.5px; line-height: 1.3; }
+  .brand-sub { display: block; color: var(--text-3); font-size: 11px; font-weight: 400; }
+  .toc h4 { margin: 18px 0 6px; font-size: 11px; letter-spacing: .08em; color: var(--text-3); text-transform: uppercase; }
+  .toc nav a {
+    display: block; padding: 5px 8px; margin: 1px 0; border-radius: 6px;
+    color: var(--text-2); font-size: 12.5px; border-left: 2px solid transparent;
+  }
+  .toc nav a:hover { background: #f1f4f9; text-decoration: none; }
+  .toc nav a.active { color: var(--accent); background: var(--accent-soft); border-left-color: var(--accent); font-weight: 600; }
+  .toc .meta { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--text-3); font-size: 11px; line-height: 1.8; }
+
+  /* 主体 */
+  main { padding: 34px 44px 90px; min-width: 0; }
+  .hero { padding-bottom: 26px; border-bottom: 1px solid var(--line); margin-bottom: 30px; }
+  .hero h1 { margin: 0 0 8px; font-size: 27px; letter-spacing: -.3px; }
+  .hero p { margin: 0; color: var(--text-2); max-width: 780px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .badge {
+    padding: 2px 10px; border-radius: 20px; border: 1px solid var(--line-strong);
+    font-size: 11.5px; color: var(--text-2); background: var(--panel); font-family: var(--mono);
+  }
+  .badge.on { border-color: #bfe0cf; background: #eef8f2; color: var(--green); }
+
+  section.doc { margin-bottom: 46px; scroll-margin-top: 20px; }
+  section.doc > h2 {
+    font-size: 20px; margin: 0 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px;
+  }
+  section.doc > h2 .no {
+    font-family: var(--mono); font-size: 12px; color: var(--accent);
+    background: var(--accent-soft); border-radius: 6px; padding: 2px 7px;
+  }
+  h3 { font-size: 15.5px; margin: 24px 0 8px; }
+  h4 { font-size: 13.5px; margin: 18px 0 6px; color: var(--text-2); }
+  p { margin: 8px 0; color: var(--text-2); }
+  li { color: var(--text-2); margin: 3px 0; }
+  ul, ol { padding-left: 22px; }
+
+  .note, .warn, .danger {
+    padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line);
+    border-left-width: 3px; margin: 12px 0; font-size: 13px; color: var(--text-2); background: var(--panel);
+  }
+  .note { border-left-color: var(--accent); }
+  .warn { border-left-color: var(--amber); }
+  .danger { border-left-color: var(--red); }
+
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 12.8px; background: var(--panel); }
+  th, td { text-align: left; padding: 7px 10px; border: 1px solid var(--line); vertical-align: top; }
+  th { background: #f1f4f9; font-weight: 620; color: var(--text-2); white-space: nowrap; }
+  td code { white-space: nowrap; }
+  .table-scroll { overflow-x: auto; }
+
+  /* 代码块 */
+  .code-wrap { position: relative; margin: 10px 0 16px; }
+  .code-wrap pre {
+    margin: 0; padding: 16px 18px; border-radius: 10px; overflow-x: auto;
+    background: var(--code-bg); color: var(--code-text); line-height: 1.65;
+  }
+  .copy-btn {
+    position: absolute; top: 8px; right: 8px; padding: 3px 9px; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); color: #c9d6e8;
+    font-size: 11px; cursor: pointer; opacity: 0; transition: opacity .15s;
+  }
+  .code-wrap:hover .copy-btn { opacity: 1; }
+  .copy-btn:hover { background: rgba(255,255,255,.16); }
+
+  /* 语言页签 */
+  .tabs { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); overflow: hidden; margin: 12px 0 18px; }
+  .tab-bar { display: flex; flex-wrap: wrap; gap: 2px; padding: 6px; border-bottom: 1px solid var(--line); background: #f7f9fc; }
+  .tab-btn {
+    border: 0; background: transparent; padding: 5px 12px; border-radius: 6px;
+    font-size: 12px; color: var(--text-2); cursor: pointer; font-family: var(--mono);
+  }
+  .tab-btn.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+  .pane .code-wrap { margin: 0; }
+  .pane .code-wrap pre { border-radius: 0; max-height: 520px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 14px 0; }
+  .card { padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+  .card b { display: block; font-size: 12.5px; margin-bottom: 3px; }
+  .card span { color: var(--text-3); font-size: 12px; }
+  .flow {
+    font-family: var(--mono); font-size: 12px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px; overflow-x: auto; color: var(--text-2); white-space: pre;
+  }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line-strong); color: var(--text-2); }
+  .tag.req { border-color: #f0c9c5; color: var(--red); background: #fdf1f0; }
+  .tag.ok { border-color: #bfe0cf; color: var(--green); background: #eef8f2; }
+
+  footer { margin-top: 30px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--text-3); font-size: 12px; }
+
+  @media (max-width: 980px) {
+    .layout { grid-template-columns: 1fr; }
+    aside.toc { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    aside.toc nav { columns: 2; }
+    main { padding: 24px 18px 70px; }
+  }
+  @media print {
+    aside.toc { display: none; }
+    .layout { grid-template-columns: 1fr; }
+    .copy-btn, .tab-bar { display: none; }
+    .pane { display: block; }
+    pre { white-space: pre-wrap; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="brand">
+      <div class="brand-mark">HP</div>
+      <div class="brand-title">Harness Plugin Protocol<span class="brand-sub">非 SDK 接入指南</span></div>
+    </div>
+    <h4>开始</h4>
+    <nav>
+      <a href="#overview">0 · 概览</a>
+      <a href="#quickstart">1 · 快速开始</a>
+      <a href="#manifest">2 · manifest 规范</a>
+      <a href="#transport">3 · 传输与帧格式</a>
+      <a href="#envelope">4 · JSON-RPC 信封</a>
+    </nav>
+    <h4>协议</h4>
+    <nav>
+      <a href="#bus-methods">5 · 总线调用插件</a>
+      <a href="#host-methods">6 · 插件回调宿主</a>
+      <a href="#capabilities">7 · 六类能力</a>
+      <a href="#errors">8 · 错误码</a>
+      <a href="#versions">9 · 版本协商</a>
+      <a href="#security">10 · 安全边界</a>
+    </nav>
+    <h4>实现</h4>
+    <nav>
+      <a href="#languages">11 · 五语言最小实现</a>
+      <a href="#sdk">12 · 官方 SDK（规划中）</a>
+      <a href="#pitfalls">13 · 常见坑点</a>
+      <a href="#appendix">14 · 速查附录</a>
+    </nav>
+    <div class="meta">
+      协议版本 <code>1.0</code><br />
+      宿主版本 <code>1.1.0</code><br />
+      更新日期 2026-11-28
+    </div>
+  </aside>
+
+  <main>
+    <header class="hero">
+      <h1>Harness 插件协议 1.0</h1>
+      <p>
+        本页是 Harness 插件系统的对外协议文档。按本页实现即可用任意语言接入，
+        <strong>不依赖任何 SDK</strong>：只要进程能读写 stdin/stdout，或者能提供 HTTP POST 端点。
+        后续 C# / TypeScript 官方 SDK 文档会追加到第 12 节，协议部分保持不变。
+      </p>
+      <div class="badges">
+        <span class="badge">Protocol 1.0</span>
+        <span class="badge">JSON-RPC 2.0</span>
+        <span class="badge">stdio / http / sandbox_stdio</span>
+        <span class="badge on">C# / Java / TS / JS / Python 均可</span>
+      </div>
+    </header>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="overview">
+      <h2><span class="no">00</span>概览</h2>
+      <p>
+        Harness 把插件当作「外设」：Agent 是 CPU，Harness 是主板，Plugin Bus 是外设总线。
+        插件通过统一协议接入，崩溃、超时或卸载只影响单个外设，不阻断对话主流程。
+      </p>
+      <div class="cards">
+        <div class="card"><b>握手</b><span>initialize → describe → 可用</span></div>
+        <div class="card"><b>调用</b><span>tool.call / resource.* / prompt.get / hook.invoke</span></div>
+        <div class="card"><b>反向</b><span>仅 host.storage / secret / log / progress</span></div>
+        <div class="card"><b>隔离</b><span>独立进程；不继承宿主环境变量</span></div>
+      </div>
+
+      <h3>一次完整生命周期</h3>
+      <div class="flow">总线                                     插件进程
+ |  spawn / POST                            |
+ |-- plugin.initialize --------------------&gt;|  校验 protocolVersion，保存 config
+ |&lt;------------------------- {"ok": true}  |
+ |-- plugin.describe ----------------------&gt;|  上报 capabilities
+ |&lt;------------------- {"capabilities":…} |
+ |                                         |
+ |   （能力写入注册表，工具注入 Agent）        |
+ |                                         |
+ |-- tool.call {name, arguments} ----------&gt;|  执行业务
+ |&lt;---------------------- {"content": "…"} |
+ |                                         |
+ |   （空闲 300s 回收 / 崩溃退避重启）         |</div>
+
+      <h3>三条硬边界</h3>
+      <ul>
+        <li>总线只做握手、权限、生命周期与路由，不理解插件业务。</li>
+        <li>插件只能看到 manifest 声明的能力与 <code>host.*</code> 白名单，不持有宿主对象。</li>
+        <li>任何插件故障都必须降级：工具调用返回结构化错误，hook 异常只跳过，UI 失败只影响该 slot。</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="quickstart">
+      <h2><span class="no">01</span>快速开始</h2>
+      <p>最小可运行插件只需要一个 <code>manifest.json</code> 和一个能按行读写 JSON 的入口程序。</p>
+
+      <h3>第 1 步：写 manifest.json</h3>
+      <p>把 manifest 放在插件包根目录，<code>runtime.command</code> 指向入口程序。</p>
+      <div class="code-wrap"><pre><code>{
+  "plugin_id": "echo-plugin",
+  "name": "回显插件",
+  "version": "1.0.0",
+  "protocolVersion": "1.0",
+  "description": "最小示例：把输入原样返回。",
+  "author": { "name": "Local" },
+  "license": "MIT",
+  "tag": ["示例"],
+  "source": "user",
+  "capabilities": ["tool"],
+  "runtime": {
+    "kind": "subprocess",
+    "language": "python",
+    "command": "python",
+    "args": ["plugin.py"]
+  },
+  "transport": { "kind": "stdio" },
+  "permissions": [],
+  "harnessVersion": { "min": "1.1.0", "max": "1.x" }
+}</code></pre></div>
+
+      <h3>第 2 步：实现 4 个方法</h3>
+      <p>
+        最少需要 <code>plugin.initialize</code>、<code>plugin.describe</code>、<code>plugin.health</code>、
+        <code>tool.call</code>。完整骨架见 <a href="#languages">第 11 节</a>。
+      </p>
+
+      <h3>第 3 步：本地自测</h3>
+      <p>直接向 stdin 灌一行握手请求，看 stdout 是否返回一行 JSON：</p>
+      <div class="tabs">
+        <div class="tab-bar">
+          <button class="tab-btn active" data-lang="ps">PowerShell</button>
+          <button class="tab-btn" data-lang="sh">Bash</button>
+        </div>
+        <div class="pane active" data-lang="ps">
+          <div class="code-wrap"><pre><code>'{"jsonrpc":"2.0","id":"1","method":"plugin.initialize","params":{}}' | python plugin.py</code></pre></div>
+        </div>
+        <div class="pane" data-lang="sh">
+          <div class="code-wrap"><pre><code>echo '{"jsonrpc":"2.0","id":"1","method":"plugin.initialize","params":{}}' | python plugin.py</code></pre></div>
+        </div>
+      </div>
+      <div class="note">
+        自测只验证帧格式。真正的握手会带 <code>protocolVersion</code>、<code>user_id</code>、
+        <code>permissions</code> 与 <code>config</code>，见 <a href="#bus-methods">第 5 节</a>。
+      </div>
+
+      <h3>第 4 步：打包</h3>
+      <p>把 manifest 与代码打成 ZIP，<strong>manifest.json 必须在包根目录</strong>（不能多套一层文件夹）：</p>
+      <div class="code-wrap"><pre><code>plugin.zip
+├── manifest.json
+├── plugin.py
+└── ui/            # 可选，声明 ui 能力时提供</code></pre></div>
+
+      <h3>第 5 步：安装</h3>
+      <p>控制台「插件 → 上传插件包」，或调用管理接口：</p>
+      <div class="code-wrap"><pre><code>POST /plugins/install/upload    multipart: file=plugin.zip
+POST /plugins/install           {"source":"url","url":"https://…/plugin.zip","sha256":"…"}</code></pre></div>
+      <p>安装是异步任务，返回 <code>job_id</code>；阶段依次为
+        <code>queued → downloading → scanning → sandbox_verifying → extracting → installing → starting → done</code>。</p>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="manifest">
+      <h2><span class="no">02</span>manifest 规范</h2>
+      <p>manifest 是插件对外的唯一描述：市场展示、安装校验、握手与能力注入都读它，不存在第二套字段。</p>
+
+      <h3>字段表</h3>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>字段</th><th>必填</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>plugin_id</code></td><td><span class="tag req">必填</span></td><td><code>^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$</code>，同一来源内唯一</td></tr>
+          <tr><td><code>name</code></td><td><span class="tag req">必填</span></td><td>展示名称</td></tr>
+          <tr><td><code>version</code></td><td><span class="tag req">必填</span></td><td>semver，如 <code>1.0.0</code></td></tr>
+          <tr><td><code>protocolVersion</code></td><td><span class="tag req">必填</span></td><td><code>MAJOR.MINOR</code>，当前只接受 <code>1.0</code></td></tr>
+          <tr><td><code>author.name</code></td><td><span class="tag req">必填</span></td><td>不允许匿名发布</td></tr>
+          <tr><td><code>capabilities</code></td><td><span class="tag req">必填</span></td><td>六类能力的子集，不能为空</td></tr>
+          <tr><td><code>runtime</code></td><td><span class="tag req">必填</span></td><td><code>kind</code> ∈ <code>subprocess</code> / <code>remote</code> / <code>inprocess</code>（仅内置）</td></tr>
+          <tr><td><code>transport</code></td><td>可选</td><td><code>stdio</code> / <code>http</code>；缺省按 runtime 推导</td></tr>
+          <tr><td><code>permissions</code></td><td>可选</td><td>未声明即无权限，不做隐式放行</td></tr>
+          <tr><td><code>description</code></td><td>可选</td><td>市场卡片摘要来源</td></tr>
+          <tr><td><code>license</code> / <code>tag</code> / <code>source</code></td><td>可选</td><td>展示与筛选字段</td></tr>
+          <tr><td><code>env</code></td><td>可选</td><td>运行环境要求，不负责安装依赖</td></tr>
+          <tr><td><code>ui.slots[]</code></td><td>声明 ui 时必填</td><td><code>{slot, title, entry}</code>，entry 为包内相对路径</td></tr>
+          <tr><td><code>harnessVersion</code></td><td>可选</td><td><code>{min, max}</code>，默认 <code>1.1.0 ~ 1.x</code></td></tr>
+          <tr><td><code>configSchema</code></td><td>可选</td><td>JSON Schema，前端通用渲染配置表单</td></tr>
+          <tr><td><code>dist</code></td><td>市场条目必填</td><td><code>{url, sha256, size}</code>；本地 ZIP 安装以实际包哈希为准</td></tr>
+        </tbody>
+      </table>
+      </div>
+
+      <h3>远程插件</h3>
+      <div class="code-wrap"><pre><code>{
+  "runtime": { "kind": "remote" },
+  "transport": { "kind": "http", "url": "https://example.com/plugin/rpc" }
+}</code></pre></div>
+
+      <h3>校验规则</h3>
+      <ul>
+        <li><code>version</code> 必须是 semver；<code>protocolVersion</code> 主版本必须为 1。</li>
+        <li>未知能力或未知权限直接拒绝安装，不做兼容猜测。</li>
+        <li>声明 <code>ui</code> 能力时必须同时提供 <code>ui.slots</code> 并声明 <code>ui</code> 权限。</li>
+        <li><code>runtime.kind=inprocess</code> 只允许系统内置插件；项目级插件强制沙箱运行。</li>
+        <li><code>harnessVersion</code> 不覆盖当前宿主版本时，安装阶段即拒绝。</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="transport">
+      <h2><span class="no">03</span>传输与帧格式</h2>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>传输</th><th>适用</th><th>要点</th></tr></thead>
+        <tbody>
+          <tr><td><code>stdio</code></td><td>本地子进程插件</td><td>一行一条 JSON；stdout 只走协议；stderr 落 <code>logs/stdio.log</code></td></tr>
+          <tr><td><code>http</code></td><td>远程服务接入</td><td>每次请求一个 POST，body 为 JSON-RPC 信封；可选 SSE 预留</td></tr>
+          <tr><td><code>sandbox_stdio</code></td><td>项目级 / 高风险插件</td><td>每次调用在沙箱内拉起一次性进程，不常驻、不心跳</td></tr>
+          <tr><td><code>inprocess</code></td><td>系统内置插件</td><td>宿主进程内调用，不对外开放</td></tr>
+        </tbody>
+      </table>
+      </div>
+
+      <h3>stdio 帧规则</h3>
+      <ul>
+        <li>UTF-8 编码，<strong>一行一条消息</strong>，以 <code>\n</code> 分隔；单行上限 8 MB。</li>
+        <li>stdout 只能写协议消息；日志一律写 stderr，否则会污染协议导致解析失败。</li>
+        <li>输出后立即 <code>flush</code>，否则宿主读不到响应，表现为调用超时。</li>
+        <li>宿主只透传白名单环境变量：<code>PATH</code>、<code>LANG</code>、<code>LC_ALL</code>、<code>TMPDIR</code>、<code>TEMP</code>、<code>TMP</code>、<code>SYSTEMROOT</code>，并设置 <code>PYTHONPATH=插件目录</code>、<code>PYTHONUNBUFFERED=1</code>。</li>
+        <li>工作目录固定为插件版本目录：<code>plugins/users/{uid}/{plugin_id}/versions/{version}/</code>。</li>
+        <li>进程退出时，在途请求统一返回 <code>PLUGIN_CRASHED</code>；插件应处理 stdin EOF 并自行退出。</li>
+      </ul>
+
+      <h3>http 传输规则</h3>
+      <ul>
+        <li>请求：<code>POST {transport.url}</code>，<code>Content-Type: application/json</code>，body 为完整 JSON-RPC 信封。</li>
+        <li>响应：JSON-RPC 信封；HTTP 非 2xx 视为 <code>PLUGIN_TOOL_FAILED</code>。</li>
+        <li>连接超时 15s，请求超时按方法分别为 5s~60s。</li>
+        <li>远程插件<strong>没有反向通道</strong>，<code>host.*</code> 不可用；需要外部凭据时用配置字段，不要试图读取宿主环境。</li>
+      </ul>
+
+      <h3>sandbox_stdio 规则</h3>
+      <ul>
+        <li>每次工具调用都会在沙箱内完成 <code>initialize → describe → tool.call → 退出</code>。</li>
+        <li>不保持内存状态；需要持久化的数据请放插件数据文件或调用时传入。</li>
+        <li>项目级插件目录：<code>&lt;project_root&gt;/.commonharness/plugins/{plugin_id}/</code>，只在沙箱内运行。</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="envelope">
+      <h2><span class="no">04</span>JSON-RPC 信封</h2>
+      <p>遵循 JSON-RPC 2.0。请求、成功响应、错误响应、通知四种形态：</p>
+      <div class="code-wrap"><pre><code>// 请求（总线 → 插件）
+{ "jsonrpc": "2.0", "id": "req-1", "method": "tool.call", "params": { "name": "echo", "arguments": { "text": "hi" } } }
+
+// 成功响应
+{ "jsonrpc": "2.0", "id": "req-1", "result": { "content": "hi" } }
+
+// 错误响应
+{ "jsonrpc": "2.0", "id": "req-1", "error": { "code": -32010, "message": "工具执行失败" } }
+
+// 通知（无 id，不需要响应）
+{ "jsonrpc": "2.0", "method": "host.log", "params": { "level": "info", "message": "ready" } }</code></pre></div>
+      <ul>
+        <li><code>id</code> 由宿主生成（32 位十六进制），插件必须原样回传；通知不带 <code>id</code>。</li>
+        <li>通知只用于 <code>host.log</code> / <code>host.progress</code> / <code>event.notify</code>，宿主不会回包。</li>
+        <li>请求 <code>params</code> 必须是对象；不是对象的请求按 <code>-32602</code> 拒绝。</li>
+        <li>插件收到的未知响应（无 <code>method</code>）直接忽略即可。</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="bus-methods">
+      <h2><span class="no">05</span>总线调用插件</h2>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>方法</th><th>用途</th><th>默认超时</th><th>失败策略</th></tr></thead>
+        <tbody>
+          <tr><td><code>plugin.initialize</code></td><td>握手</td><td>15s</td><td>拒绝启用，标记 unhealthy</td></tr>
+          <tr><td><code>plugin.describe</code></td><td>上报能力</td><td>15s</td><td>与 manifest 不一致则握手失败</td></tr>
+          <tr><td><code>plugin.health</code></td><td>健康探针（每 30s）</td><td>5s</td><td>连续失败计入 unhealthy</td></tr>
+          <tr><td><code>plugin.shutdown</code></td><td>优雅退出（协议预留）</td><td>5s</td><td>超时由宿主结束进程</td></tr>
+          <tr><td><code>tool.call</code></td><td>调用工具</td><td>60s</td><td>返回错误，不影响其他工具</td></tr>
+          <tr><td><code>resource.list</code></td><td>列举资源</td><td>15s</td><td>返回空并标记降级</td></tr>
+          <tr><td><code>resource.read</code></td><td>读取资源正文</td><td>30s</td><td>返回错误</td></tr>
+          <tr><td><code>prompt.get</code></td><td>取提示词片段</td><td>10s</td><td>跳过注入</td></tr>
+          <tr><td><code>hook.invoke</code></td><td>拦截点回调</td><td>3s</td><td>记录并跳过，不阻断</td></tr>
+          <tr><td><code>event.notify</code></td><td>总线推事件（通知）</td><td>不等待</td><td>忽略失败</td></tr>
+        </tbody>
+      </table>
+      </div>
+
+      <h3>plugin.initialize</h3>
+      <p>参数（宿主 → 插件）：</p>
+      <div class="code-wrap"><pre><code>{
+  "protocolVersion": "1.0",
+  "plugin_id": "echo-plugin",
+  "version": "1.0.0",
+  "user_id": "user-123",
+  "permissions": ["storage"],
+  "config": { "endpoint": "https://…" }
+}</code></pre></div>
+      <p>
+        <code>config</code> 是用户在插件详情页保存的非敏感配置。密钥通过 <code>host.secret.get</code> 获取，
+        不会出现在 initialize 里。返回任意 JSON 即可，建议 <code>{"ok": true}</code>；
+        宿主只关心是否成功与是否超时。
+      </p>
+
+      <h3>plugin.describe</h3>
+      <p>参数为空对象。返回值必须包含 <code>capabilities</code> 对象，其类型必须是 manifest 声明的子集：</p>
+      <div class="code-wrap"><pre><code>{
+  "plugin_id": "echo-plugin",
+  "protocolVersion": "1.0",
+  "version": "1.0.0",
+  "capabilities": {
+    "tool": [
+      {
+        "name": "echo",
+        "description": "把输入原样返回",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "text": { "type": "string", "description": "待回显的文本" } },
+          "required": ["text"]
+        }
+      }
+    ],
+    "resource": [
+      { "uri": "demo://readme", "name": "说明", "mimeType": "text/markdown" }
+    ],
+    "prompt": [
+      { "id": "style", "trigger": "keyword", "keywords": ["风格", "格式"] }
+    ],
+    "hook": [
+      { "name": "before_tool", "priority": 100 }
+    ],
+    "ui": [
+      { "slot": "chat.sidebar", "title": "回显面板", "entry": "ui/index.html" }
+    ]
+  }
+}</code></pre></div>
+      <ul>
+        <li>上报了 manifest 未声明的能力类型 → <code>PLUGIN_CAPABILITY_MISMATCH</code>，握手失败。</li>
+        <li>工具对外暴露名统一加前缀：<code>plugin__{plugin_id}__{name}</code>，避免与内置工具、MCP 冲突。</li>
+        <li><code>hook.name</code> 只能是 <code>before_model</code> / <code>after_model</code> / <code>before_tool</code> / <code>after_tool</code>；<code>priority</code> 越小越先执行，默认 100。</li>
+        <li><code>prompt.trigger</code> 支持 <code>always</code> / <code>keyword</code> / <code>capability</code>；提示词总长上限 2000 字符。</li>
+      </ul>
+
+      <h3>plugin.health</h3>
+      <p>参数为空对象；只要正常返回（任意 JSON）即视为健康。超时或异常计入失败次数。</p>
+
+      <h3>plugin.shutdown</h3>
+      <div class="note">
+        协议已定义该方法的语义（5s 内退出），但当前宿主停止插件时以关闭连接/结束进程为主，
+        不会保证先发 <code>plugin.shutdown</code>。请同时实现<strong>stdin EOF 退出</strong>兜底，
+        需要持久化的状态写入 <code>host.storage</code> 或插件数据文件。
+      </div>
+
+      <h3>tool.call</h3>
+      <p>参数：</p>
+      <div class="code-wrap"><pre><code>{ "name": "echo", "arguments": { "text": "hello" } }</code></pre></div>
+      <p>返回值（<code>content</code> 会被直接作为工具结果文本展示给 Agent）：</p>
+      <div class="code-wrap"><pre><code>{ "content": "hello" }
+或直接返回字符串："hello"
+或返回任意对象（宿主会 JSON 序列化）：{ "value": 42 }</code></pre></div>
+      <p>工具名只允许调用 describe 中声明过的工具；否则返回 <code>PLUGIN_PERMISSION_DENIED</code>。</p>
+
+      <h3>resource.list / resource.read</h3>
+      <div class="code-wrap"><pre><code>// resource.list 参数：{}
+// 返回：[{ "uri": "demo://readme", "name": "说明", "mimeType": "text/markdown" }]
+
+// resource.read 参数：
+{ "uri": "demo://readme" }
+// 返回：字符串或对象，由宿主交给 plugin_resource_read 工具</code></pre></div>
+
+      <h3>prompt.get</h3>
+      <div class="code-wrap"><pre><code>// 参数：{ "id": "style" }
+// 返回：提示词正文（字符串）</code></pre></div>
+
+      <h3>hook.invoke</h3>
+      <p>参数结构 <code>{ "hook": "&lt;name&gt;", "payload": { … } }</code>。各 hook 的 payload 与返回值：</p>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>hook</th><th>payload</th><th>返回值约定</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>before_model</code></td>
+            <td><code>{ messages: [{role, content}], system_prompt }</code>（各字段截断）</td>
+            <td>忽略返回值；只做观测或副作用</td>
+          </tr>
+          <tr>
+            <td><code>after_model</code></td>
+            <td><code>{ messages: [{role, content}] }</code>（最近 5 条）</td>
+            <td>忽略返回值</td>
+          </tr>
+          <tr>
+            <td><code>before_tool</code></td>
+            <td><code>{ tool, arguments }</code></td>
+            <td>可返回 <code>{"allow": false, "reason": "…"}</code> 拒绝执行</td>
+          </tr>
+          <tr>
+            <td><code>after_tool</code></td>
+            <td><code>{ tool, arguments, result }</code></td>
+            <td>可返回 <code>{"content": "改写后的结果"}</code></td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+      <p>hook 超时 3s，异常或超时只写轨迹并跳过，不影响主流程。</p>
+
+      <h3>event.notify</h3>
+      <p>
+        协议预留的通知方法，用于总线向插件推送配置变更、启停等事件（无 <code>id</code>）。
+        当前版本宿主不主动发送；插件收到未知通知应忽略而不是报错。
+      </p>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="host-methods">
+      <h2><span class="no">06</span>插件回调宿主（host.*）</h2>
+      <p>只开放四个命名空间，且必须在 manifest 声明对应权限；未声明即拒绝。</p>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>方法</th><th>所需权限</th><th>参数</th><th>返回</th></tr></thead>
+        <tbody>
+          <tr><td><code>host.storage.get</code></td><td><code>storage</code></td><td><code>{ "key": "…" }</code></td><td>任意 JSON 或 <code>null</code></td></tr>
+          <tr><td><code>host.storage.set</code></td><td><code>storage</code></td><td><code>{ "key": "…", "value": … }</code></td><td><code>{ "ok": true }</code></td></tr>
+          <tr><td><code>host.storage.list</code></td><td><code>storage</code></td><td><code>{}</code></td><td>键名数组</td></tr>
+          <tr><td><code>host.storage.delete</code></td><td><code>storage</code></td><td><code>{ "key": "…" }</code></td><td><code>{ "ok": true }</code></td></tr>
+          <tr><td><code>host.secret.get</code></td><td><code>secret</code></td><td><code>{ "name": "…" }</code></td><td>密钥明文（仅在本次连接内有效）</td></tr>
+          <tr><td><code>host.log</code></td><td>无</td><td><code>{ "level": "info", "message": "…" }</code></td><td><code>{}</code></td></tr>
+          <tr><td><code>host.progress</code></td><td>无</td><td><code>{ "current": 1, "total": 3, "message": "…" }</code></td><td><code>{ "ok": true }</code></td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>示例：插件请求宿主写入一个键值</p>
+      <div class="code-wrap"><pre><code>{ "jsonrpc": "2.0", "id": "p-1", "method": "host.storage.set",
+  "params": { "key": "counter", "value": 3 } }
+
+// 宿主响应
+{ "jsonrpc": "2.0", "id": "p-1", "result": { "ok": true } }</code></pre></div>
+      <ul>
+        <li><code>host.storage.*</code> 是插件私有数据目录下的单文件 JSON KV（<code>data/kv.json</code>），
+          不接受任意路径；key 为空会被拒绝。</li>
+        <li><code>host.secret.get</code> 读取的是用户级密钥环境变量
+          <code>HARNESS_PLUGIN_SECRET_{PLUGIN_ID}_{NAME}</code>；未配置返回错误。</li>
+        <li><code>host.log</code> 写入插件日志文件，单条消息截断 4000 字符；超过 5 MB 轮转。</li>
+        <li>超过 <code>host.*</code> 白名单的方法（例如读宿主文件、起进程、读环境变量）一律拒绝，没有例外。</li>
+      </ul>
+      <div class="warn">
+        <code>http</code> 与 <code>sandbox_stdio</code> 传输没有反向通道，<code>host.*</code> 调用会直接失败。
+        这类插件应把外部凭据放进配置字段，或在自身服务侧管理。
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="capabilities">
+      <h2><span class="no">07</span>六类能力</h2>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>能力</th><th>总线侧</th><th>Agent / 控制台如何看到</th></tr></thead>
+        <tbody>
+          <tr><td><code>tool</code></td><td><code>tool.call</code> 路由、超时、权限</td><td>注入主 Agent 工具清单，名称 <code>plugin__{plugin_id}__{name}</code></td></tr>
+          <tr><td><code>resource</code></td><td><code>resource.list</code> / <code>resource.read</code></td><td>资源目录进系统提示，正文通过 <code>plugin_resource_read</code> 读取</td></tr>
+          <tr><td><code>prompt</code></td><td><code>prompt.get</code></td><td>按 always / keyword / capability 注入系统提示</td></tr>
+          <tr><td><code>hook</code></td><td><code>hook.invoke</code></td><td>中间件拦截点，超时或异常降级</td></tr>
+          <tr><td><code>ui</code></td><td>静态资源路由 + slot 注册</td><td>控制台 slot 内沙箱 iframe，不进入主 bundle</td></tr>
+          <tr><td><code>integration</code></td><td>复用 tool / resource + 凭据</td><td>安装时逐条确认外部系统权限</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <h3>UI slot</h3>
+      <p>首批 slot：<code>chat.sidebar</code>、<code>chat.composer.after</code>、<code>console.plugin.detail</code>。约束：</p>
+      <ul>
+        <li>iframe 使用 <code>sandbox="allow-scripts allow-forms"</code>，不开放 <code>allow-same-origin</code>。</li>
+        <li>只接受白名单消息：<code>plugin:ready</code>、<code>plugin:resize</code>、<code>plugin:event</code>，并校验来源。</li>
+        <li>静态资源由 <code>GET /plugins/{id}/ui/{path}</code> 提供，只服务已启用插件，路径穿越拒绝。</li>
+        <li>slot 加载失败只显示「插件界面不可用」，不影响主页面。</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="errors">
+      <h2><span class="no">08</span>错误码</h2>
+      <p>JSON-RPC 标准码保留，业务错误使用 <code>-32001 ~ -32010</code>。</p>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>码</th><th>名称</th><th>含义</th><th>管理面 HTTP</th></tr></thead>
+        <tbody>
+          <tr><td>-32700</td><td><code>PLUGIN_PARSE_ERROR</code></td><td>消息不是合法 JSON</td><td>400</td></tr>
+          <tr><td>-32600</td><td><code>PLUGIN_INVALID_REQUEST</code></td><td>信封结构非法</td><td>400</td></tr>
+          <tr><td>-32601</td><td><code>PLUGIN_METHOD_NOT_FOUND</code></td><td>未知方法</td><td>404</td></tr>
+          <tr><td>-32602</td><td><code>PLUGIN_INVALID_PARAMS</code></td><td>参数类型或必填缺失</td><td>422</td></tr>
+          <tr><td>-32603</td><td><code>PLUGIN_INTERNAL_ERROR</code></td><td>插件内部异常</td><td>500</td></tr>
+          <tr><td>-32001</td><td><code>PLUGIN_NOT_FOUND</code></td><td>插件不存在</td><td>404</td></tr>
+          <tr><td>-32002</td><td><code>PLUGIN_NOT_READY</code></td><td>未握手、已停用或正在重启</td><td>503</td></tr>
+          <tr><td>-32003</td><td><code>PLUGIN_PERMISSION_DENIED</code></td><td>未声明权限或越权调用</td><td>403</td></tr>
+          <tr><td>-32004</td><td><code>PLUGIN_TIMEOUT</code></td><td>调用超时</td><td>504</td></tr>
+          <tr><td>-32005</td><td><code>PLUGIN_CAPABILITY_MISMATCH</code></td><td>describe 与 manifest 不一致</td><td>422</td></tr>
+          <tr><td>-32006</td><td><code>PLUGIN_PROTOCOL_VERSION_MISMATCH</code></td><td>协议主版本不兼容</td><td>422</td></tr>
+          <tr><td>-32007</td><td><code>PLUGIN_CRASHED</code></td><td>插件进程退出 / 连接断开</td><td>502</td></tr>
+          <tr><td>-32008</td><td><code>PLUGIN_UNHEALTHY</code></td><td>连续健康检查失败</td><td>503</td></tr>
+          <tr><td>-32009</td><td><code>PLUGIN_PACKAGE_INVALID</code></td><td>包结构、哈希或解压不安全</td><td>422</td></tr>
+          <tr><td>-32010</td><td><code>PLUGIN_TOOL_FAILED</code></td><td>工具执行失败</td><td>400 / 500</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>插件返回错误时只需给出 <code>code</code> 与 <code>message</code>，宿主会记录到轨迹与审计，不会把内部堆栈透给用户。</p>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="versions">
+      <h2><span class="no">09</span>版本协商</h2>
+      <ul>
+        <li><strong>协议版本</strong> <code>protocolVersion</code>：<code>MAJOR.MINOR</code>。主版本不同直接拒绝握手；
+          次版本只允许不高于总线支持的版本（当前支持 <code>1.0</code>）。</li>
+        <li><strong>插件版本</strong> <code>version</code>：semver，管功能迭代与更新回滚。</li>
+        <li><strong>宿主版本</strong> <code>harnessVersion</code>：<code>{min, max}</code>，<code>max</code> 支持 <code>1.x</code>。
+          不覆盖当前宿主时在安装阶段拒绝，不进入握手。</li>
+      </ul>
+      <div class="note">
+        两条版本轴互不替代：协议版本管「能不能通信」，插件版本管「功能是不是最新」。
+        协议不兼容时不要尝试兼容猜测，直接返回 <code>-32006</code>。
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="security">
+      <h2><span class="no">10</span>安全边界</h2>
+      <ul>
+        <li>宿主侧子进程是<strong>同等权限的独立进程</strong>，不是 OS 级隔离。v1.1 依靠「装前沙箱验证 + 运行时声明权限」收口。</li>
+        <li>不继承宿主环境变量，尤其不传递模型 API Key、数据库密码与宿主配置。</li>
+        <li>插件依赖不自动安装到宿主环境：依赖必须随包携带，或声明为沙箱依赖。</li>
+        <li>四道闸门：声明权限 → 静态扫描 → 沙箱试运行 → 用户确认。路径穿越、符号链接、危险调用会被标记或拒绝。</li>
+        <li>UI 只能在沙箱 iframe 内渲染，不开放同源，不允许直接操作主前端 DOM。</li>
+        <li>审计：安装、启停、重启、更新、卸载、验证、权限与配置变更都写入 <code>plugin_audit</code>。</li>
+      </ul>
+      <div class="danger">
+        不要把密钥写进 manifest 或代码。manifest 与配置只允许保留引用，
+        运行时通过 <code>host.secret.get</code> 获取；远程插件请自行管理凭据。
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="languages">
+      <h2><span class="no">11</span>五语言最小实现</h2>
+      <p>
+        以下骨架都实现同一个最小插件：一个 <code>echo</code> 工具，外加握手、健康检查与退出。
+        复制后补上自己的业务逻辑即可。共同约定：<strong>一行一条 JSON、stdout 只写协议、日志写 stderr</strong>。
+      </p>
+
+      <div class="tabs">
+        <div class="tab-bar">
+          <button class="tab-btn active" data-lang="py">Python</button>
+          <button class="tab-btn" data-lang="ts">TypeScript</button>
+          <button class="tab-btn" data-lang="js">JavaScript</button>
+          <button class="tab-btn" data-lang="cs">C#</button>
+          <button class="tab-btn" data-lang="java">Java</button>
+        </div>
+
+        <div class="pane active" data-lang="py">
+          <div class="code-wrap"><pre><code>import json
+import sys
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def describe():
+    return {
+        "capabilities": {
+            "tool": [
+                {
+                    "name": "echo",
+                    "description": "把输入原样返回",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                }
+            ]
+        }
+    }
+
+
+def handle(method, params):
+    if method == "plugin.initialize":
+        # params: protocolVersion / plugin_id / user_id / permissions / config
+        return {"ok": True}
+    if method == "plugin.describe":
+        return describe()
+    if method == "plugin.health":
+        return {"ok": True}
+    if method == "plugin.shutdown":
+        return {"ok": True}
+    if method == "tool.call":
+        if params.get("name") != "echo":
+            raise ValueError("unknown tool")
+        arguments = params.get("arguments") or {}
+        return {"content": str(arguments.get("text", ""))}
+    raise ValueError(f"unknown method: {method}")
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if "method" not in message:   # 忽略宿主返回的响应
+        continue
+    request_id = message.get("id")
+    try:
+        result = handle(message["method"], message.get("params") or {})
+        if request_id is not None:
+            send({"jsonrpc": "2.0", "id": request_id, "result": result})
+    except Exception as error:
+        print(f"tool failed: {error}", file=sys.stderr)
+        if request_id is not None:
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32010, "message": str(error)}})</code></pre></div>
+        </div>
+
+        <div class="pane" data-lang="ts">
+          <div class="code-wrap"><pre><code>import { createInterface } from 'node:readline'
+
+type Json = Record&lt;string, unknown&gt;
+
+function send(message: Json): void {
+  process.stdout.write(JSON.stringify(message) + '\n')
+}
+
+function describe(): Json {
+  return {
+    capabilities: {
+      tool: [
+        {
+          name: 'echo',
+          description: '把输入原样返回',
+          inputSchema: {
+            type: 'object',
+            properties: { text: { type: 'string' } },
+            required: ['text'],
+          },
+        },
+      ],
+    },
+  }
+}
+
+function handle(method: string, params: Json): unknown {
+  switch (method) {
+    case 'plugin.initialize':
+      return { ok: true }
+    case 'plugin.describe':
+      return describe()
+    case 'plugin.health':
+    case 'plugin.shutdown':
+      return { ok: true }
+    case 'tool.call': {
+      if (params.name !== 'echo') throw new Error('unknown tool')
+      const args = (params.arguments ?? {}) as Json
+      return { content: String(args.text ?? '') }
+    }
+    default:
+      throw new Error(`unknown method: ${method}`)
+  }
+}
+
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
+rl.on('line', (line) => {
+  if (!line.trim()) return
+  let message: Json
+  try {
+    message = JSON.parse(line) as Json
+  } catch {
+    return
+  }
+  if (typeof message.method !== 'string') return
+  const id = message.id
+  try {
+    const result = handle(message.method, (message.params ?? {}) as Json)
+    if (id !== undefined) send({ jsonrpc: '2.0', id, result })
+  } catch (error) {
+    console.error(String(error))
+    if (id !== undefined) {
+      send({ jsonrpc: '2.0', id, error: { code: -32010, message: String(error) } })
+    }
+  }
+})</code></pre></div>
+        </div>
+
+        <div class="pane" data-lang="js">
+          <div class="code-wrap"><pre><code>const readline = require('node:readline')
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + '\n')
+}
+
+function describe() {
+  return {
+    capabilities: {
+      tool: [
+        {
+          name: 'echo',
+          description: '把输入原样返回',
+          inputSchema: {
+            type: 'object',
+            properties: { text: { type: 'string' } },
+            required: ['text'],
+          },
+        },
+      ],
+    },
+  }
+}
+
+function handle(method, params) {
+  switch (method) {
+    case 'plugin.initialize':
+      return { ok: true }
+    case 'plugin.describe':
+      return describe()
+    case 'plugin.health':
+    case 'plugin.shutdown':
+      return { ok: true }
+    case 'tool.call': {
+      if (params.name !== 'echo') throw new Error('unknown tool')
+      const args = params.arguments || {}
+      return { content: String(args.text ?? '') }
+    }
+    default:
+      throw new Error(`unknown method: ${method}`)
+  }
+}
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+rl.on('line', (line) => {
+  if (!line.trim()) return
+  let message
+  try {
+    message = JSON.parse(line)
+  } catch {
+    return
+  }
+  if (typeof message.method !== 'string') return
+  const id = message.id
+  try {
+    const result = handle(message.method, message.params || {})
+    if (id !== undefined) send({ jsonrpc: '2.0', id, result })
+  } catch (error) {
+    console.error(String(error))
+    if (id !== undefined) {
+      send({ jsonrpc: '2.0', id, error: { code: -32010, message: String(error) } })
+    }
+  }
+})</code></pre></div>
+        </div>
+
+        <div class="pane" data-lang="cs">
+          <div class="code-wrap"><pre><code>using System;
+using System.Text.Json.Nodes;
+
+Console.InputEncoding = System.Text.Encoding.UTF8;
+Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+static void Send(JsonObject message)
+{
+    Console.Out.WriteLine(message.ToJsonString());
+    Console.Out.Flush();
+}
+
+static JsonObject Describe() =&gt; JsonNode.Parse("""
+{
+  "capabilities": {
+    "tool": [{
+      "name": "echo",
+      "description": "把输入原样返回",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "text": { "type": "string" } },
+        "required": ["text"]
+      }
+    }]
+  }
+}
+""")!.AsObject();
+
+static JsonNode Handle(string method, JsonObject parameters)
+{
+    switch (method)
+    {
+        case "plugin.initialize":
+            return new JsonObject { ["ok"] = true };
+        case "plugin.describe":
+            return Describe();
+        case "plugin.health":
+        case "plugin.shutdown":
+            return new JsonObject { ["ok"] = true };
+        case "tool.call":
+        {
+            if (parameters["name"]?.GetValue&lt;string&gt;() != "echo")
+                throw new InvalidOperationException("unknown tool");
+            var arguments = parameters["arguments"]?.AsObject() ?? new JsonObject();
+            return new JsonObject { ["content"] = arguments["text"]?.ToString() ?? "" };
+        }
+        default:
+            throw new InvalidOperationException($"unknown method: {method}");
+    }
+}
+
+while (Console.In.ReadLine() is { } line)
+{
+    if (string.IsNullOrWhiteSpace(line)) continue;
+    JsonObject message;
+    try { message = JsonNode.Parse(line)!.AsObject(); }
+    catch { continue; }
+    if (!message.ContainsKey("method")) continue;
+
+    var id = message["id"]?.DeepClone();
+    try
+    {
+        var result = Handle(
+            message["method"]!.GetValue&lt;string&gt;(),
+            message["params"]?.AsObject() ?? new JsonObject());
+        if (id is not null)
+            Send(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result });
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine(error);
+        if (id is not null)
+        {
+            Send(new JsonObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id,
+                ["error"] = new JsonObject { ["code"] = -32010, ["message"] = error.Message },
+            });
+        }
+    }
+}</code></pre></div>
+        </div>
+
+        <div class="pane" data-lang="java">
+          <div class="code-wrap"><pre><code>import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import org.json.JSONObject;
+
+public final class PluginMain {
+    public static void main(String[] args) throws Exception {
+        var reader = new BufferedReader(
+            new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        var out = new PrintWriter(
+            new OutputStreamWriter(System.out, StandardCharsets.UTF_8));
+
+        String line;
+        while ((line = reader.readLine()) != null) {
+            if (line.isBlank()) continue;
+            JSONObject message;
+            try { message = new JSONObject(line); }
+            catch (Exception ignored) { continue; }
+            if (!message.has("method")) continue;
+
+            Object id = message.opt("id");
+            try {
+                JSONObject params = message.optJSONObject("params");
+                JSONObject result = handle(message.getString("method"),
+                                            params == null ? new JSONObject() : params);
+                if (id != null) {
+                    out.println(new JSONObject()
+                        .put("jsonrpc", "2.0")
+                        .put("id", id)
+                        .put("result", result));
+                    out.flush();
+                }
+            } catch (Exception error) {
+                System.err.println(error.toString());
+                if (id != null) {
+                    out.println(new JSONObject()
+                        .put("jsonrpc", "2.0")
+                        .put("id", id)
+                        .put("error", new JSONObject()
+                            .put("code", -32010)
+                            .put("message", error.getMessage())));
+                    out.flush();
+                }
+            }
+        }
+    }
+
+    private static JSONObject handle(String method, JSONObject params) throws Exception {
+        switch (method) {
+            case "plugin.initialize":
+                return new JSONObject().put("ok", true);
+            case "plugin.describe":
+                return new JSONObject("""
+                    {"capabilities":{"tool":[{
+                      "name":"echo",
+                      "description":"把输入原样返回",
+                      "inputSchema":{"type":"object",
+                        "properties":{"text":{"type":"string"}},
+                        "required":["text"]}
+                    }]}}
+                    """);
+            case "plugin.health":
+            case "plugin.shutdown":
+                return new JSONObject().put("ok", true);
+            case "tool.call": {
+                if (!"echo".equals(params.optString("name")))
+                    throw new IllegalArgumentException("unknown tool");
+                JSONObject arguments = params.optJSONObject("arguments");
+                return new JSONObject().put("content",
+                    arguments == null ? "" : arguments.optString("text"));
+            }
+            default:
+                throw new IllegalArgumentException("unknown method: " + method);
+        }
+    }
+}</code></pre></div>
+          <div class="note">Java 示例使用 <code>org.json</code>；换 Jackson / Gson 只需改序列化，协议不变。</div>
+        </div>
+      </div>
+
+      <h3>打包与入口命令对照</h3>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>语言</th><th>runtime.command</th><th>runtime.args 示例</th></tr></thead>
+        <tbody>
+          <tr><td>Python</td><td><code>python</code></td><td><code>["plugin.py"]</code></td></tr>
+          <tr><td>Node.js</td><td><code>node</code></td><td><code>["dist/index.js"]</code></td></tr>
+          <tr><td>C#</td><td>发布后的可执行文件，或 <code>dotnet</code></td><td><code>["MyPlugin.dll"]</code></td></tr>
+          <tr><td>Java</td><td><code>java</code></td><td><code>["-jar", "plugin.jar"]</code></td></tr>
+        </tbody>
+      </table>
+      </div>
+      <div class="warn">
+        入口必须使用相对插件目录的路径。运行环境（Python / Node / .NET / JRE）需要由用户在宿主侧准备好，
+        插件依赖不会自动安装到宿主。
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="sdk">
+      <h2><span class="no">12</span>官方 SDK（规划中）</h2>
+      <p>
+        按当前节奏，先交付协议文档与各语言最小样例，再补官方 SDK。SDK 只封装握手、能力注册、
+        心跳、请求分发、错误映射与优雅退出，<strong>不替插件做业务</strong>。
+      </p>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>语言 / 包</th><th>状态</th><th>计划内容</th></tr></thead>
+        <tbody>
+          <tr><td>C# · <code>Harness.Plugin.Sdk</code></td><td><span class="tag">待补充</span></td><td><code>IHarnessPlugin</code>、<code>PluginHost.RunAsync</code>、<code>host.*</code> 客户端；.NET 8 LTS</td></tr>
+          <tr><td>TypeScript · <code>@harness/plugin-sdk</code></td><td><span class="tag">待补充</span></td><td><code>definePlugin</code>、<code>runStdioPlugin</code>；Node ≥ 20，ESM 主入口</td></tr>
+          <tr><td>Java</td><td><span class="tag">预留</span></td><td>暂不提供 SDK，按本页协议自行接入</td></tr>
+          <tr><td>Python</td><td><span class="tag ok">不需要</span></td><td>宿主即 Python；内置插件直接用 <code>handle(method, params)</code>，外置见第 11 节</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <div class="note">
+        本页会持续更新：SDK 发布后，各语言的安装方式、API 速查与迁移说明将直接补充在本节，
+        第 1~11 节的协议内容保持向后兼容。
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="pitfalls">
+      <h2><span class="no">13</span>常见坑点</h2>
+      <ol>
+        <li><strong>stdout 被打日志污染</strong>：任何 <code>print</code> / <code>console.log</code> 都会破坏协议帧。日志一律写 stderr。</li>
+        <li><strong>忘记 flush</strong>：缓冲导致宿主读不到响应，表现为「第一次调用必超时」。每次写完立即 flush。</li>
+        <li><strong>路径多套一层</strong>：ZIP 里必须是 <code>manifest.json</code> 在根，不要 <code>plugin/manifest.json</code>。</li>
+        <li><strong>describe 与 manifest 不一致</strong>：manifest 声明 <code>tool</code>，describe 却上报 <code>resource</code>，握手直接失败。</li>
+        <li><strong>协议版本写错</strong>：<code>protocolVersion</code> 只能是 <code>1.0</code>；<code>1.0.0</code> 会被判为格式非法。</li>
+        <li><strong>Windows 编码</strong>：C# / Java 要显式设 UTF-8，否则中文参数乱码。</li>
+        <li><strong>试图自动重试 tool.call</strong>：业务可能非幂等，SDK 与宿主都不会自动重试；只读的 <code>host.storage.get/list</code> 可重试一次。</li>
+        <li><strong>远程插件调用 host.*</strong>：HTTP 没有回调通道，必然失败。凭据请放配置字段。</li>
+        <li><strong>把大对象塞进工具结果</strong>：工具结果会进 Agent 上下文，建议只返回必要文本，复杂数据让插件自己落文件。</li>
+        <li><strong>项目级插件想常驻</strong>：项目级强制沙箱一次性进程，不保持内存状态。</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="doc" id="appendix">
+      <h2><span class="no">14</span>速查附录</h2>
+      <h3>方法速查</h3>
+      <div class="code-wrap"><pre><code>总线 → 插件：
+  plugin.initialize   plugin.describe   plugin.health   plugin.shutdown
+  tool.call           resource.list     resource.read   prompt.get
+  hook.invoke         event.notify
+
+插件 → 总线：
+  host.storage.get    host.storage.set  host.storage.list  host.storage.delete
+  host.secret.get     host.log          host.progress</code></pre></div>
+
+      <h3>权限速查</h3>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>权限</th><th>对应能力 / 拦截点</th></tr></thead>
+        <tbody>
+          <tr><td><code>storage</code></td><td><code>host.storage.*</code></td></tr>
+          <tr><td><code>secret</code></td><td><code>host.secret.get</code></td></tr>
+          <tr><td><code>net</code></td><td>远程 transport、integration 外部调用</td></tr>
+          <tr><td><code>process</code></td><td>插件内创建子进程（宿主仅记录告警）</td></tr>
+          <tr><td><code>fs:read</code> / <code>fs:write</code></td><td>插件目录外的读写请求</td></tr>
+          <tr><td><code>context:read</code></td><td>会话摘要与用户非敏感配置</td></tr>
+          <tr><td><code>ui</code></td><td>slot 注册与静态资源路由</td></tr>
+        </tbody>
+      </table>
+      </div>
+
+      <h3>超时速查</h3>
+      <div class="code-wrap"><pre><code>initialize 15s · describe 15s · health 5s · shutdown 5s
+tool.call 60s · resource.list 15s · resource.read 30s
+prompt.get 10s · hook.invoke 3s · event.notify 不等待</code></pre></div>
+
+      <h3>相关文档</h3>
+      <ul>
+        <li><code>docs/core_design/v1.1/插件系统开发文档.md</code>：总线、生命周期、存储、市场与安全闸门。</li>
+        <li><code>docs/core_design/v1.1/插件SDK调研与开发文档.md</code>：C# / TypeScript SDK 的调研与实施计划。</li>
+        <li><code>src/agent/skills/main/plugin-development/</code>：模板、冒烟脚本与打包脚本。</li>
+        <li><code>src/plugin_bus/protocol.py</code>：方法名、错误码与超时的代码事实源。</li>
+      </ul>
+    </section>
+
+    <footer>
+      Harness Plugin Protocol · 协议版本 1.0 · 文档随代码同步更新。发现协议与实现不一致时，以 <code>src/plugin_bus/protocol.py</code> 为准。
+    </footer>
+  </main>
+</div>
+
+<script>
+  // 语言页签
+  document.querySelectorAll('.tabs').forEach((tabs) => {
+    const buttons = tabs.querySelectorAll('.tab-btn')
+    const panes = tabs.querySelectorAll('.pane')
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => {
+        buttons.forEach((item) => item.classList.toggle('active', item === button))
+        panes.forEach((pane) =>
+          pane.classList.toggle('active', pane.dataset.lang === button.dataset.lang),
+        )
+      })
+    })
+  })
+
+  // 代码复制
+  document.querySelectorAll('.code-wrap').forEach((wrap) => {
+    const button = document.createElement('button')
+    button.className = 'copy-btn'
+    button.textContent = '复制'
+    button.addEventListener('click', async () => {
+      const code = wrap.querySelector('code')
+      if (!code) return
+      try {
+        await navigator.clipboard.writeText(code.textContent)
+        button.textContent = '已复制'
+      } catch {
+        button.textContent = '复制失败'
+      }
+      setTimeout(() => (button.textContent = '复制'), 1200)
+    })
+    wrap.appendChild(button)
+  })
+
+  // 目录高亮
+  const links = Array.from(document.querySelectorAll('aside.toc nav a'))
+  const sections = links
+    .map((link) => document.querySelector(link.getAttribute('href')))
+    .filter(Boolean)
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return
+        links.forEach((link) =>
+          link.classList.toggle(
+            'active',
+            link.getAttribute('href') === '#' + entry.target.id,
+          ),
+        )
+      })
+    },
+    { rootMargin: '-15% 0px -70% 0px', threshold: 0 },
+  )
+  sections.forEach((section) => observer.observe(section))
+</script>
+</body>
+</html>

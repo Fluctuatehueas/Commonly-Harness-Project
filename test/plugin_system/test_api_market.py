@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 if str(SRC) not in sys.path:
@@ -111,6 +111,46 @@ class PluginApiReadOnlyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as context:
             await api_plugins.get_plugin("missing-plugin")
         self.assertEqual(context.exception.status_code, 404)
+
+    async def test_dsh_import_rejects_non_dsh_entry(self):
+        from fastapi import HTTPException
+
+        entry = {
+            "source": "local",
+            "plugin_id": "demo-plugin",
+            "version": "1.0.0",
+            "import_kind": "skill-import",
+            "importable": True,
+        }
+        with patch.object(api_plugins, "_catalog_entry", AsyncMock(return_value=entry)):
+            with self.assertRaises(HTTPException) as context:
+                await api_plugins.import_dsh_skill(
+                    api_plugins.DshImportRequest(plugin_id="demo-plugin")
+                )
+        self.assertEqual(context.exception.status_code, 409)
+
+    async def test_dsh_import_starts_job(self):
+        entry = {
+            "source": "dsh",
+            "plugin_id": "dsh-demo-skill",
+            "name": "dsh-demo-skill",
+            "version": "1.0.0",
+            "import_kind": "skill-import",
+            "importable": True,
+            "npm_dist": {"tarball": "https://registry.example.com/demo.tgz"},
+        }
+
+        async def fake_import(user_id: str, item: dict, *, job_id: str = "") -> dict:
+            return {"skill": {"name": "dsh-demo-skill"}}
+
+        with patch.object(
+            api_plugins, "_catalog_entry", AsyncMock(return_value=entry)
+        ), patch.object(api_plugins.dsh_import, "import_skill", side_effect=fake_import):
+            result = await api_plugins.import_dsh_skill(
+                api_plugins.DshImportRequest(plugin_id="dsh-demo-skill")
+            )
+        self.assertTrue(result["job_id"])
+        self.assertEqual(result["job"]["kind"], "dsh-skill")
 
 
 if __name__ == "__main__":

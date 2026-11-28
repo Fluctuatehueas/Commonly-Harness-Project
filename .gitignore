@@ -75,3 +75,17 @@ useless/*
 
 # 本地交付文档（不入库）
 /项目部署说明书.docx
+
+# .NET / C# 构建产物与 IDE 缓存（sdk/csharp 等）
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.csproj.user
+TestResults/
+*.nupkg
+*.snupkg
+

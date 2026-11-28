@@ -53,8 +53,12 @@ class PluginHookMiddleware(AgentMiddleware):
 
     name = "plugin_hooks"
 
-    def __init__(self) -> None:
+    def __init__(self, plugin_ids: list[str] | None = None) -> None:
         super().__init__()
+        # /plugin 绑定：只调度本轮选中的插件；空表示全部启用插件。
+        self.plugin_ids = [
+            str(item).strip() for item in (plugin_ids or []) if str(item).strip()
+        ]
 
     @staticmethod
     def _runtime() -> Any:
@@ -66,7 +70,8 @@ class PluginHookMiddleware(AgentMiddleware):
     async def _prompt_section(self, request: ModelRequest) -> str:
         try:
             return await self._runtime().prompt_section(
-                _last_human_text(list(request.messages or []))
+                _last_human_text(list(request.messages or [])),
+                plugin_ids=self.plugin_ids or None,
             )
         except Exception:
             logger.debug("插件提示词注入失败", exc_info=True)
@@ -94,7 +99,9 @@ class PluginHookMiddleware(AgentMiddleware):
             else "",
         }
         try:
-            await self._runtime().invoke_hooks("before_model", payload)
+            await self._runtime().invoke_hooks(
+                "before_model", payload, plugin_ids=self.plugin_ids or None
+            )
         except Exception:
             logger.debug("before_model hook 调用失败", exc_info=True)
 
@@ -109,7 +116,9 @@ class PluginHookMiddleware(AgentMiddleware):
             ]
         }
         try:
-            await self._runtime().invoke_hooks("after_model", payload)
+            await self._runtime().invoke_hooks(
+                "after_model", payload, plugin_ids=self.plugin_ids or None
+            )
         except Exception:
             logger.debug("after_model hook 调用失败", exc_info=True)
 
@@ -153,7 +162,9 @@ class PluginHookMiddleware(AgentMiddleware):
         runtime = self._runtime()
         try:
             decisions = await runtime.invoke_hooks(
-                "before_tool", {"tool": name, "arguments": arguments}
+                "before_tool",
+                {"tool": name, "arguments": arguments},
+                plugin_ids=self.plugin_ids or None,
             )
         except Exception:
             decisions = []
@@ -173,6 +184,7 @@ class PluginHookMiddleware(AgentMiddleware):
             patches = await runtime.invoke_hooks(
                 "after_tool",
                 {"tool": name, "arguments": arguments, "result": text[:2000]},
+                plugin_ids=self.plugin_ids or None,
             )
         except Exception:
             patches = []

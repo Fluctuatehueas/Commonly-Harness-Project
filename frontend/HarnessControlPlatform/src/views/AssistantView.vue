@@ -1,13 +1,19 @@
-<script setup lang="ts">
+﻿﻿﻿﻿<script setup lang="ts">
 // 悬浮助手面板：独立不透明窗口，系统级拖拽与缩放交给 Electron。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { InputInstance } from 'element-plus'
 import {
   ArrowUpBold,
   Document,
   Plus,
 } from '@element-plus/icons-vue'
+import CommandComposer from '@/components/chat/CommandComposer.vue'
+import CommandTerminal from '@/components/chat/CommandTerminal.vue'
+import BindingBar, { type BindingChip } from '@/components/chat/BindingBar.vue'
+import { parseInput } from '@/commands/parser'
+import type { ParsedInput } from '@/types/commands'
+import { useCommandRunner } from '@/commands/runner'
+import { useCommandsStore } from '@/stores/commands'
 import AppIcon from '@/components/console/AppIcon.vue'
 import SessionPanel from '@/components/chat/SessionPanel.vue'
 import FilePanel from '@/components/chat/FilePanel.vue'
@@ -179,7 +185,7 @@ async function createSession(): Promise<void> {
   }
   await nextTick()
   scrollBottom()
-  void inputEl.value?.focus()
+  void composerEl.value?.focus()
 }
 
 async function createIntegrationSession(serverId: string): Promise<void> {
@@ -393,7 +399,8 @@ async function onDrop(event: DragEvent): Promise<void> {
 // ---------- 发送 ----------
 const draft = ref('')
 const modesOpen = ref(false)
-const inputEl = ref<InputInstance | null>(null)
+const composerEl = ref<InstanceType<typeof CommandComposer> | null>(null)
+const commands = useCommandsStore()
 const scroller = ref<HTMLElement | null>(null)
 const stickToBottom = ref(true)
 
@@ -413,10 +420,41 @@ function onScroll(): void {
 async function submit(): Promise<void> {
   if (archivedActive.value) return
   if (chat.sending || chat.compacting) return
-  if (!draft.value.trim() && pendingFiles.value.length === 0) return
+  const source = draft.value
+  if (!source.trim() && pendingFiles.value.length === 0) return
   if (backendOnline.value === false) {
     ElMessage.error('后端离线，暂时无法发送')
     return
+  }
+  if (!commands.catalog.length) await commands.loadCatalog()
+  const parsed: ParsedInput = commands.modeEnabled
+    ? parseInput(source, commands.commandNames)
+    : { commands: [], rest: source }
+  if (parsed.error) {
+    commands.showTerminal({
+      ok: false,
+      command: 'parse',
+      kind: 'text',
+      title: '命令解析失败',
+      text: parsed.error,
+      columns: [],
+      rows: [],
+      warnings: [],
+      meta: {},
+    })
+    return
+  }
+  const hasCommands = parsed.commands.length > 0
+  const text = hasCommands ? parsed.rest : source
+  if (hasCommands) {
+    draft.value = ''
+    composerEl.value?.clear()
+    const outcome = await runner.run(parsed.commands)
+    if (outcome === 'stop') {
+      composerEl.value?.setValue(draft.value)
+      return
+    }
+    if (!text.trim() && pendingFiles.value.length === 0) return
   }
   if (!chat.threadId) {
     const id = await sessions.createSession(
@@ -433,12 +471,14 @@ async function submit(): Promise<void> {
     chat.activateThread(id)
     void files.prime(id)
   }
-  const text = draft.value
   const attachments = [...pendingFiles.value]
   draft.value = ''
+  composerEl.value?.clear()
   pendingFiles.value = []
   uploadError.value = ''
-  chat.send(text, attachments)
+  const binding = chat.threadId ? commands.requestBinding(chat.threadId) : undefined
+  chat.send(text, attachments, binding)
+  if (chat.threadId) commands.clearBinding(chat.threadId)
   try {
     if (chat.threadId) {
       sessions.bindRouting(chat.threadId, chat.selectedAgentId, chat.selectedGroupId)
@@ -450,6 +490,149 @@ async function submit(): Promise<void> {
   await nextTick()
   scrollBottom()
 }
+
+// ---------- 命令系统 ----------
+const bindingChips = computed<BindingChip[]>(() => {
+  if (!chat.threadId) return []
+  const binding = commands.bindingFor(chat.threadId)
+  const chips: BindingChip[] = []
+  if (binding.agentName || binding.agentId) {
+    chips.push({ key: 'agent', label: 'Agent', value: binding.agentName || binding.agentId })
+  }
+  if (binding.groupName || binding.groupId) {
+    chips.push({ key: 'group', label: '组', value: binding.groupName || binding.groupId })
+  }
+  if (binding.flowName || binding.flowId) {
+    chips.push({ key: 'taskflow', label: '任务流', value: binding.flowName || binding.flowId })
+  }
+  binding.skills.forEach((value) => chips.push({ key: `skill:${value}`, label: '技能', value }))
+  binding.mcp_ids.forEach((value) => chips.push({ key: `mcp:${value}`, label: 'MCP', value }))
+  binding.plugin_ids.forEach((value) => chips.push({ key: `plugin:${value}`, label: '插件', value }))
+  return chips
+})
+
+function removeBinding(key: string) {
+  const threadId = chat.threadId
+  if (!threadId) return
+  const binding = commands.bindingFor(threadId)
+  if (key === 'agent') commands.patchBinding(threadId, { agentId: '', agentName: '' })
+  else if (key === 'group') commands.patchBinding(threadId, { groupId: '', groupName: '' })
+  else if (key === 'taskflow') commands.patchBinding(threadId, { flowId: '', flowName: '' })
+  else if (key.startsWith('skill:')) {
+    commands.patchBinding(threadId, { skills: binding.skills.filter((item) => item !== key.slice(6)) })
+  } else if (key.startsWith('mcp:')) {
+    commands.patchBinding(threadId, { mcp_ids: binding.mcp_ids.filter((item) => item !== key.slice(4)) })
+  } else if (key.startsWith('plugin:')) {
+    commands.patchBinding(threadId, {
+      plugin_ids: binding.plugin_ids.filter((item) => item !== key.slice(7)),
+    })
+  }
+}
+
+function lastAssistantMessage(): ChatMsg | null {
+  return (
+    [...chat.messages].reverse().find((item) => item.kind === 'assistant' && item.content) ||
+    null
+  )
+}
+
+function exportSession(format: 'md' | 'json') {
+  const threadId = chat.threadId
+  if (!threadId) {
+    ElMessage.warning('当前没有会话')
+    return
+  }
+  const rows = chat.messages.filter((item) => item.kind === 'user' || item.kind === 'assistant')
+  const content =
+    format === 'json'
+      ? JSON.stringify(
+          rows.map((item) => ({
+            role: item.kind,
+            content: item.content || '',
+            at: item.at || null,
+          })),
+          null,
+          2,
+        )
+      : rows
+          .map((item) => `${item.kind === 'user' ? '用户' : '助手'}：${item.content || ''}`)
+          .join('\n\n')
+  const blob = new Blob([content], {
+    type: `${format === 'json' ? 'application/json' : 'text/markdown'};charset=utf-8`,
+  })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `session-${threadId.slice(0, 8)}.${format}`
+  link.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success('已导出当前会话')
+}
+
+const runner = useCommandRunner({
+  deleteSession: async (threadId: string) => {
+    await sessions.removeSession(threadId)
+    if (chat.threadId === threadId) chat.newChat()
+  },
+  withdraw: async () => {
+    const turn = turns.value[turns.value.length - 1]
+    if (!turn || !canWithdraw(turn, turns.value.length - 1)) return false
+    await withdrawLatest(turn, turns.value.length - 1)
+    return true
+  },
+  newSession: async () => {
+    const id = await sessions.createSession(
+      undefined,
+      undefined,
+      chat.selectedAgentId || agents.defaultAgentId,
+      undefined,
+    )
+    if (!id) return
+    sessions.activeThreadId = id
+    chat.activateThread(id)
+    void files.prime(id)
+  },
+  clearView: () => chat.clearView(),
+  rename: (title: string) =>
+    chat.threadId ? sessions.renameSession(chat.threadId, title) : Promise.resolve(false),
+  pin: (pinned: boolean) =>
+    chat.threadId ? sessions.setPinned(chat.threadId, pinned) : Promise.resolve(false),
+  archive: async () => {
+    const threadId = chat.threadId
+    if (!threadId) return false
+    const ok = await sessions.setArchived(threadId, true)
+    if (ok) chat.newChat()
+    return ok
+  },
+  selectAgent: (name: string, team?: string) => {
+    const target =
+      name === 'default'
+        ? agents.defaultAgentId
+        : agents.items.find((item) => item.id === name)?.id ||
+          agents.items.find((item) => item.name === name)?.id
+    if (!target) return false
+    chat.selectedAgentId = target
+    if (team) {
+      const group =
+        agents.groups.find((item) => item.group_id === team) ||
+        agents.groups.find((item) => item.name === team)
+      chat.selectedGroupId = group?.group_id || ''
+    } else {
+      chat.selectedGroupId = ''
+    }
+    return true
+  },
+  copyLastAnswer: async () => {
+    const message = lastAssistantMessage()
+    if (!message) return false
+    await copyMessage(message)
+    return true
+  },
+  exportSession,
+  showResult: (payload) => {
+    commands.showTerminal(payload)
+  },
+})
 
 function toggleThinking(value: boolean): void {
   void settings.setThinking(value)
@@ -803,7 +986,7 @@ async function withdrawLatest(turn: TurnView, index: number) {
     const restored = draft.value.trim()
     draft.value = restored ? `${withdrawn}\n\n${restored}` : withdrawn
     await nextTick()
-    inputEl.value?.focus()
+    composerEl.value?.focus()
     void sessions.refresh()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '撤回失败')
@@ -1335,6 +1518,12 @@ onBeforeUnmount(() => {
       <footer v-if="!archivedActive" class="composer">
         <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
 
+        <BindingBar
+          v-if="bindingChips.length"
+          :items="bindingChips"
+          @remove="removeBinding"
+        />
+
         <div class="composer-shell" @paste="onClipboardPaste">
           <div v-if="pendingFiles.length" class="pending-row">
             <span v-for="att in pendingFiles" :key="att.id" class="pending-chip">
@@ -1352,16 +1541,12 @@ onBeforeUnmount(() => {
             </span>
           </div>
 
-          <el-input
-            ref="inputEl"
+          <CommandComposer
+            ref="composerEl"
             v-model="draft"
-            class="chat-input"
-            type="textarea"
-            :autosize="{ minRows: 1, maxRows: 5 }"
-            resize="none"
-            placeholder="输入消息，可附图片 / 文档；Enter 发送"
             :disabled="chat.sending || chat.compacting"
-            @keydown.enter.exact.prevent="submit"
+            placeholder="输入消息，/ 唤起命令；Enter 发送"
+            @submit="submit"
           />
 
           <div class="composer-tools">
@@ -1481,6 +1666,8 @@ onBeforeUnmount(() => {
       :title="mediaTitle"
       :filename="mediaFilename"
     />
+
+    <CommandTerminal variant="panel" />
   </div>
 </template>
 
@@ -2502,3 +2689,4 @@ onBeforeUnmount(() => {
   transform: translateY(-4px);
 }
 </style>
+
